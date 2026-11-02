@@ -1,3 +1,5 @@
+> **Tek Innov8rs Fall 2026:** this is a snapshot of a 2019 project, left as-is on purpose. Start with [ACTIVITY.md](ACTIVITY.md).
+
 # Scooter Reservation API
 
 ## Introduction
