@@ -50,24 +50,36 @@ curl -s localhost:8080/view_all_available
 - Host and port are hard-coded to `localhost:8080` in `app.py`. Making them configurable
   through env is **coming in PLAN PR 3**.
 - Run from the repo root. `app.py` opens `scooter_db.json` relative to the current directory.
-- Production-style server (the Procfile command):
+- Production-style server: the Procfile runs plain `gunicorn app:app`. gunicorn binds
+  `127.0.0.1:8000` by default, but if `PORT` is set in the environment it binds
+  `0.0.0.0:$PORT`, which means every network interface. For local use, be explicit:
   `.venv/bin/gunicorn --bind 127.0.0.1:8000 app:app`.
   gunicorn 26 also creates a control socket at `~/.gunicorn/gunicorn.ctl`, outside the repo.
   Add `--no-control-socket` if you don't want that. Deploy readiness is PLAN PR 19.
+- Server logs: the Flask dev server prints request lines (`"GET /search?... 200"`) to
+  **stderr**; only its banner goes to stdout. gunicorn logs **no** requests unless you run
+  it with `--access-logfile -`, which sends them to stdout. Neither log is persisted.
 
 ### Stopping a background dev server (macOS)
 
 On macOS the venv's interpreter shows in `ps` as
 `.../Python.app/Contents/MacOS/Python app.py`, with a capital `P`. As a result,
 `pkill -f "python app.py"` matches nothing and the server keeps holding the port, so the
-next `make run` fails with "Address already in use". Kill it by PID instead:
+next `make run` fails with "Address already in use".
+
+Prefer running the server in the foreground and stopping it with Ctrl+C. If you have to
+stop a background server, kill it by PID, but **check first that it's yours**. Other
+agents or the user may be running their own servers on the same port, and the
+first PID holding the port may not be the one you started.
 
 ```sh
-lsof -nP -iTCP:8080 -sTCP:LISTEN               # see what holds the port
-kill $(lsof -tnP -iTCP:8080 -sTCP:LISTEN)      # stop it (use :8000 for gunicorn)
+lsof -nP -iTCP:8080 -sTCP:LISTEN     # which PID holds the port (use :8000 for gunicorn)
+ps -o pid,lstart,command -p <pid>    # is it `... Python app.py` / gunicorn, started by you?
+lsof -a -d cwd -p <pid>              # is its working directory this checkout?
+kill <pid>                           # only if both checks say it's yours
 ```
 
-In the foreground, Ctrl+C works.
+Never run a blind `kill $(lsof -t ...)`.
 
 ## Test
 
@@ -82,8 +94,9 @@ as the single command, and CI runs it in PLAN PR 5. pytest is already installed 
   ends, so any manual testing changes it. **Don't commit changes to it.** To restore it:
   `git restore scooter_db.json`.
 - **Request records** (what each request did and how it ended) are **coming in PLAN
-  PR 9**, with a query CLI in PLAN PR 10. There are no records today. The only trace of a
-  request is the server's stdout access log, which isn't persisted.
+  PR 9**, with a query CLI in PLAN PR 10. There are no persisted records today. The only trace of
+  a request is the server log: the dev server prints request lines to **stderr**, and
+  gunicorn logs none unless run with `--access-logfile -` (see Run).
 - **Payment gateway ledger:** coming in PLAN PR 13. Today `payment_gateway()` in `app.py`
   always succeeds and always returns the same `txn_id`.
 
@@ -91,7 +104,7 @@ as the single command, and CI runs it in PLAN PR 5. pytest is already installed 
 
 | Path | What it is |
 |---|---|
-| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`) and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `write_db`, `Scooter`). |
+| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`) and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `write_db`, `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). |
 | `scooter_db.json` | Live JSON database, mutated by the app (see above). |
 | `README.md` | API contract: endpoints, params, responses. |
 | `ACTIVITY.md` | The activity brief and Required outcomes 0–7. |

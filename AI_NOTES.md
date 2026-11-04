@@ -28,18 +28,20 @@ strongest entries.
 - **What changed:** the plan was retargeted to Python 3.15. PR #2 shipped
   `.python-version` = 3.15 and a Makefile that checks the venv's version.
 
-### 2. "Fix what breaks on Flask 3 / turn debug off"
+### 2. "Turn debug off", plus a whole PR for unchecked breakage
 - **Where:** PLAN.md PR 2, first draft (PR #1).
-- **What the AI claimed:** upgrading would break the app on Flask 3, and debug mode was on
-  and had to be turned off.
-- **Reality:** every endpoint works unchanged on Flask 3.1 / Werkzeug 3.1 / geopy 2.5, and
-  `app.debug` was already `False`. The claim came from trusting a stale
-  `# TODO: Turn debug flag off` comment in `app.py`.
+- **What the AI claimed:** the first draft's PR 2 was "`fix`: app runs on modern stack". It
+  said to "Fix anything that breaks on Flask 3 / geopy 2", which was hedged, and to "Turn
+  debug off", which was stated as a task.
+- **Reality:** debug was never on: `app.debug` is `False`, and `app.run()` doesn't pass
+  `debug=True`. That task came from trusting a stale `# TODO: Turn debug flag off` comment
+  in `app.py`. A whole PR was planned around breakage nobody had checked for. Every
+  endpoint works unchanged on Flask 3.1 / Werkzeug 3.1 / geopy 2.5.
 - **How it was caught:** the reviewer ran every README endpoint on the latest stack and
   checked `app.debug`.
-- **What changed:** that PR was rescoped to config-from-env work (now PLAN PR 3). PR #2
-  re-verified every endpoint on Python 3.15, both through the Flask dev server and through
-  gunicorn.
+- **What changed:** that PR was rescoped in PLAN.md to config-from-env work (now PLAN
+  PR 3). PR #2 re-verified every endpoint on Python 3.15, both through the Flask dev server
+  and through gunicorn.
 
 ### 3. "Deterministic outcome per idempotency key" + "retry with the same key" is safe
 - **Where:** PLAN.md payment design (PRs 13/14/15), first revision of PR #1.
@@ -51,9 +53,10 @@ strongest entries.
   forbids exactly that.
 - **How it was caught:** the reviewer traced PRs 13, 14 and 15 against each other instead
   of reading each one on its own.
-- **What changed:** the attempt number was added to the outcome function (seed, key,
-  attempt). Reconcile gained a terminal rule: after N attempts or T minutes with no charge,
-  the ride ends with an outstanding balance.
+- **What changed:** PLAN.md was revised. The planned outcome function now takes the
+  attempt number (seed, key, attempt), and the planned reconcile has a terminal rule: after
+  N attempts or T minutes with no charge, the ride ends with an outstanding balance. None
+  of this is built yet; it lands in PLAN PRs 13–15.
 
 ### 4. Bash deny patterns "enforce" no network and no push to master
 - **Where:** PLAN.md agent-boundaries PR (now PLAN PR 6), first draft (PR #1).
@@ -63,9 +66,10 @@ strongest entries.
   `python -c 'import urllib...'` reaches the network, and `git push origin HEAD:master`
   dodges a `git push origin master` pattern.
 - **How it was caught:** the adversarial review of the plan.
-- **What changed:** enforcement moved to the harness **sandbox** (OS-level filesystem and
-  network limits) plus GitHub **branch protection** on `master` (H2). Deny patterns are now
-  only a first line.
+- **What changed:** the plan now relies on the harness **sandbox** (OS-level filesystem
+  and network limits, PLAN PR 6) plus GitHub **branch protection** on `master` (H2) for
+  enforcement. Deny patterns are planned as only a first line. Neither control is in place
+  yet: PR 6 hasn't landed, and branch protection is still waiting on a human (H2).
 
 ### 5. "Decline → ride stays open" is safe for Outcome 3
 - **Where:** PLAN.md human decision H3, first draft (PR #1).
@@ -74,6 +78,33 @@ strongest entries.
 - **Reality:** if the rider walks away after the decline, nothing ever ends the ride, so
   the scooter stays reserved forever, which Outcome 3 explicitly forbids.
 - **How it was caught:** the adversarial review of the plan.
-- **What changed:** the H3 default is now "end the ride, free the scooter, take no charge,
-  record an outstanding balance". Keeping the ride open with an expiry is listed as the
-  alternative.
+- **What changed:** PLAN.md's H3 default is now "end the ride, free the scooter, take no
+  charge, record an outstanding balance". Keeping the ride open with an expiry is listed as
+  the alternative. The policy is implemented in PLAN PR 14; it doesn't exist in code yet.
+
+### 6. Request traces are "in the server's stdout access log"
+- **Where:** AGENTS.md "Where data lives", first version (PR #3).
+- **What the AI claimed:** the only trace of a request today is the server's stdout access
+  log.
+- **Reality:** the Flask dev server prints only its banner to stdout; its request lines go
+  to **stderr**. gunicorn writes **no** request log at all by default; you need
+  `--access-logfile -`. A cold agent told to check stdout would have found nothing.
+- **How it was caught:** the reviewer ran each server with stdout and stderr captured
+  separately. The writer reproduced it: 0 request lines on either stream from default
+  gunicorn, and request lines only on stderr from `python app.py`.
+- **What changed:** AGENTS.md now says where each server logs requests, and how to turn
+  gunicorn's access log on.
+
+### 7. This log overstated past claims and described planned guardrails as already in place
+- **Where:** AI_NOTES.md, first version (PR #3), entries 2–5.
+- **What the AI claimed:** entry 2 said the plan had claimed "upgrading would break the
+  app"; the plan had actually hedged ("fix anything that breaks"). Entries 3–5 described
+  the sandbox, branch protection and the reconcile terminal rule in the present tense, as
+  if they existed. They were only plan edits.
+- **Reality:** a log of AI mistakes was itself dramatising the mistakes and overstating
+  the fixes. That's the same kind of confident inaccuracy it exists to record.
+- **How it was caught:** the reviewer compared each entry with the original PLAN.md wording
+  (commit `10b5b2f` in PR #1) and with what was actually merged.
+- **What changed:** the entries were reworded to quote what was written and to say what
+  only changed in the plan. Lesson: the log needs review too. Check each entry against the
+  source text, not against memory of it.
