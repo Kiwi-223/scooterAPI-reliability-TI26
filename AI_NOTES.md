@@ -96,9 +96,9 @@ strongest entries.
   gunicorn's access log on.
 
 ### 7. This log overstated past claims and described planned guardrails as already in place
-- **Where:** AI_NOTES.md, first version (PR #3), entries 2–5.
+- **Where:** AI_NOTES.md, first version (PR #3), entries 2–4.
 - **What the AI claimed:** entry 2 said the plan had claimed "upgrading would break the
-  app"; the plan had actually hedged ("fix anything that breaks"). Entries 3–5 described
+  app"; the plan had actually hedged ("fix anything that breaks"). Entries 3–4 described
   the sandbox, branch protection and the reconcile terminal rule in the present tense, as
   if they existed. They were only plan edits.
 - **Reality:** a log of AI mistakes was itself dramatising the mistakes and overstating

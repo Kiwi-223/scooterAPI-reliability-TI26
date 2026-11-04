@@ -1,9 +1,19 @@
 from flask import Flask, render_template, request, redirect, url_for, make_response
 from geopy.distance import distance as geodesic
-import json, werkzeug
+import json, os, werkzeug
 from http import HTTPStatus
 
 app=Flask(__name__)
+
+# Configuration from environment variables (unset or empty -> README default)
+DEFAULT_DB_PATH = 'scooter_db.json'
+DEFAULT_HOST = 'localhost'
+DEFAULT_PORT = 8080
+
+def get_db_path():
+	# Read on every call so a changed SCOOTER_DB_PATH takes effect without re-importing.
+	# A relative path is resolved against the current working directory, as before.
+	return os.environ.get('SCOOTER_DB_PATH') or DEFAULT_DB_PATH
 
 # root
 @app.route('/')
@@ -187,7 +197,8 @@ def calculate_cost(distance):
 
 		
 def init_db():
-	db_json = open('scooter_db.json', 'r').read()
+	with open(get_db_path(), 'r') as db_file:
+		db_json = db_file.read()
 	db_list = json.loads(db_json)
 	# populate Scooter objects for easier access later
 	db = []
@@ -214,7 +225,8 @@ def write_db(db):
 	# serialize Scooter objects 
 	db_list = convert_db_to_dictlist(db)
 	db_json = json.dumps(db_list)
-	open('scooter_db.json', 'w').write(db_json)
+	with open(get_db_path(), 'w') as db_file:
+		db_file.write(db_json)
 	return True
 		
 # class scooter for internal use
@@ -241,5 +253,6 @@ def convert_db_to_dictlist(db):
 
 
 if __name__== "__main__":
-	# TODO: Turn debug flag off for production system
-	app.run('localhost', 8080)
+	host = os.environ.get('HOST') or DEFAULT_HOST
+	port = int(os.environ.get('PORT') or DEFAULT_PORT)
+	app.run(host, port)	# debug stays off (Flask's default)
