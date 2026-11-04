@@ -47,9 +47,28 @@ make run          # .venv/bin/python app.py -> http://localhost:8080 (Flask dev 
 curl -s localhost:8080/view_all_available
 ```
 
-- Host and port are hard-coded to `localhost:8080` in `app.py`. Making them configurable
-  through env is **coming in PLAN PR 3**.
-- Run from the repo root. `app.py` opens `scooter_db.json` relative to the current directory.
+- Run from the repo root. The default DB path `scooter_db.json` is relative, and relative
+  paths are resolved against the **current working directory**, not against `app.py`.
+
+### Configuration (environment variables)
+
+If a variable is unset or empty, the README default applies, and behaviour is exactly as
+before.
+
+| Variable | Default | Used by | Notes |
+|---|---|---|---|
+| `SCOOTER_DB_PATH` | `scooter_db.json` | `app.py` on every DB read/write, under both the dev server and gunicorn | Read on **every request**, so changing `os.environ` in a test takes effect without re-importing `app`. A relative path is resolved against the cwd. The file must already exist; the app doesn't create it. |
+| `HOST` | `localhost` | `python app.py` / `make run` only | gunicorn ignores it; use `--bind`. |
+| `PORT` | `8080` | `python app.py` / `make run` | Must be an integer. **gunicorn reads `PORT` too**: with no `--bind` it then listens on `0.0.0.0:$PORT` (see below). |
+
+```sh
+# Run against a scratch copy of the DB so the real scooter_db.json is never touched:
+cp scooter_db.json /tmp/scooter_scratch.json
+SCOOTER_DB_PATH=/tmp/scooter_scratch.json PORT=8099 make run
+```
+
+`HOST` is a common name. zsh and bash don't export it by default, but some shells (e.g.
+tcsh) and CI images do. If `make run` binds somewhere unexpected, check `env | grep HOST`.
 - Production-style server: the Procfile runs plain `gunicorn app:app`. gunicorn binds
   `127.0.0.1:8000` by default, but if `PORT` is set in the environment it binds
   `0.0.0.0:$PORT`, which means every network interface. For local use, be explicit:
@@ -128,8 +147,10 @@ These exist today and are scheduled in PLAN.md. Don't "fix" them outside their P
 - If the payment gateway ever returned a failure, `/reservation/end` would crash with a
   `KeyError` and return an HTML 500 (PLAN PR 13). `txn_id` is an int, although the README
   says it's a string.
-- The DB read/write isn't locked, so concurrent requests can lose updates (PLAN PR 11).
-  File handles aren't closed (PLAN PR 3).
+- The DB read/write isn't locked, and the write isn't atomic, so concurrent requests can
+  lose updates (PLAN PR 11).
+- A missing or corrupt DB file (including a wrong `SCOOTER_DB_PATH`) gives an HTML 500.
+  A `storage_error` failure kind is **coming in PLAN PR 7**.
 
 ## Failure kinds
 
