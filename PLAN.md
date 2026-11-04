@@ -16,16 +16,23 @@ changes it, and add a line to the [Change log](#change-log).
 |---|---|
 | One problem per PR | Each PR fixes one focused problem. No direct commits to `master`. |
 | Target repo | PRs open against **`Kiwi-223/scooterAPI-reliability-TI26:master`** (this fork), never the upstream `KaranErry/scooterAPI-reliability`. Always pass `--repo Kiwi-223/scooterAPI-reliability-TI26 --base master`. |
-| Branch names | `stage-<N>/<short-slug>` (e.g. `stage-1/upgrade-deps`). |
-| Writer agent | Implements the PR: code, tests and docs (`AGENTS.md`, this plan's status table), then pushes and opens the PR. |
-| Reviewer agent | Acts as an adversary. Checks out the PR in a separate worktree, runs the tests, tries to break the change and checks it against ACTIVITY.md. Posts a review comment that ends in a verdict: `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
+| Branch names | `stage-<N>/<short-slug>` (e.g. `stage-1/upgrade-deps`). PR 0 used `docs/plan` before this rule existed. |
+| Writer agent | Implements the PR: code, tests and docs, then pushes and opens the PR. Every PR marks its own row ✅ in this file, because it only lands once merged. From PR 2 on, every PR keeps `AGENTS.md` accurate. |
+| Reviewer agent | Acts as an adversary. Checks out the PR in a separate worktree, runs the tests, tries to break the change (including mutating code to see whether the tests catch it) and checks it against ACTIVITY.md. Posts a PR comment that ends in `VERDICT: APPROVE` or `VERDICT: REQUEST_CHANGES`. |
 | Merge | Only after `VERDICT: APPROVE` and green tests/CI. Squash-merge, then delete the branch. |
-| Formal approval | GitHub does not let a PR author approve their own PR. Both agents act as the same account (`Kiwi-223`), so the reviewer's verdict goes in a PR comment and is not a formal "Approve" review. See [Human decisions](#human-decisions). |
-| AI mistakes | When the reviewer catches the writer being confidently wrong, it gets logged for `AI_NOTES.md` (Outcome 7). |
+| Formal approval | GitHub does not let a PR author approve their own PR. Both agents act as the same account (`Kiwi-223`), so the verdict goes in a comment and is not a formal "Approve" review. See H1. |
+| AI mistakes | Every time the reviewer catches the writer, or the plan, being confidently wrong, it gets logged in `AI_NOTES.md` (Outcome 7) in that PR or the next one. |
 
-**Toolchain chosen:** Python 3.14 (current stable on this machine), `venv` + `pip`
-with pinned `requirements*.txt`, `pytest`, and a `Makefile` so every common task is one
-command. No extra installer (like uv) is needed, which keeps setup simple for a cold agent.
+**Toolchain:** Python **3.15** (current stable, 3.15.2, released 2026-10-09), `venv` +
+`pip`. `requirements.in` lists the top-level dependencies, and the fully resolved
+`requirements.txt` lock pins every transitive dependency. The same split applies to the dev
+deps. `pytest`, plus a `Makefile` so every common task is one command
+(`make setup | run | test | lock | …`). No extra installer is required, which keeps setup
+simple for a cold agent.
+
+**Storage:** keep the JSON file DB (the README's stated stack). A file lock covers each
+whole read, check and write, so concurrent workers stay consistent. Request records are
+append-only JSON Lines (see H8).
 
 ---
 
@@ -34,78 +41,86 @@ command. No extra installer (like uv) is needed, which keeps setup simple for a 
 Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blocked on human
 
 ### Stage 0: Plan
-| # | PR | Outcome | Status |
-|---|---|---|---|
-| 0 | `docs`: add this PLAN.md | n/a | 🟡 |
+| # | PR | Status |
+|---|---|---|
+| 0 | `docs`: add this PLAN.md | ✅ |
 
-### Stage 1: It runs on a current toolchain (Outcome 0)
+### Stage 1: It runs, is testable and has guardrails (Outcomes 0, 5, 6)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 1 | `build`: upgrade dependencies | Pin current Flask / Werkzeug / geopy / gunicorn. Drop unused pins (`tornado`, `tabulate`, `requests`, `six`, …). Add `.python-version` (3.14) and stop ignoring it in `.gitignore`. Add `requirements-dev.txt`. | ⬜ |
-| 2 | `fix`: app runs on modern stack | Fix anything that breaks on Flask 3 / geopy 2. Read host/port/DB path from env with the README defaults (`localhost:8080`, `scooter_db.json`). Close file handles. Turn debug off. Manually check every README endpoint. | ⬜ |
-| 3 | `test`: pytest harness + baseline tests | Fixture with an isolated temp DB (never touches the real `scooter_db.json`). Happy path plus existing validation errors for every README endpoint. `Makefile` with `setup`, `run`, `test`. | ⬜ |
-| 4 | `ci`: GitHub Actions runs tests | Run `make test` on every PR and on push to `master`. | ⬜ |
-| 5 | `docs`: AGENTS.md onboarding + README refresh | Zero-context guide: setup, run, test, where data lives, repo map. README: replace the dead Heroku URL and outdated local-setup steps. | ⬜ |
+| 1 | `build`: Python 3.15 + current dependencies, fully locked | Pin the latest stable Flask / Werkzeug / geopy / gunicorn. Drop unused pins (`tornado`, `tabulate`, `requests`, `six`, …). `requirements.in` → locked `requirements.txt`, plus a dev equivalent. `.python-version` = 3.15, no longer ignored in `.gitignore`. `Makefile` with `setup`, `run` and `lock`. Verify every README endpoint on the new stack. | ⬜ |
+| 2 | `docs`: agent onboarding skeleton + README refresh | `AGENTS.md` for a zero-context reader covering setup, run, repo map and where data lives. `CLAUDE.md` that imports `@AGENTS.md`. An `AI_NOTES.md` skeleton seeded with the plan-review catches. README: remove the dead Heroku URL and update the local-setup steps. | ⬜ |
+| 3 | `refactor`: configurable DB path / host / port | Read them from env (`SCOOTER_DB_PATH`, `HOST`, `PORT`) with the README defaults (`scooter_db.json`, `localhost:8080`). Close file handles. This is a prerequisite for isolated tests. | ⬜ |
+| 4 | `test`: pytest harness + baseline tests | Fixture with isolated temp data (DB and, later, records). It never touches the real files. Happy path plus the existing validation errors for every README endpoint. `make test` is the single command. | ⬜ |
+| 5 | `ci`: GitHub Actions runs `make test` | On every PR and on push to `master`, on Python 3.15. | ⬜ |
+| 6 | `chore`: agent boundaries (Outcome 6) | Checked-in `.claude/settings.json`: harness **sandbox** turned on (OS-level filesystem and network limits, so a pattern deny can't be bypassed with `python -c`). Permissions: allow, ask and deny lists. Edits to `.claude/**` and `.github/**` need approval. Ask before any `git push` / `gh pr merge`, and deny force-push. Branch protection is the real control on `master` (H2). AGENTS.md "Agent boundaries" section covers blast radius, permissions, isolation (branch/worktree), reversibility (squash PRs, revert) and budget (concrete caps such as headless `--max-turns` / `--max-budget-usd`, checked against current Claude Code docs). | ⬜ |
 
 ### Stage 2: Failures have names (Outcome 2)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 6 | `feat`: stable failure kinds | A fixed enum of failure kinds with stable string ids (e.g. `missing_param`, `invalid_coordinate`, `scooter_not_found`, `scooter_already_reserved`, `no_active_reservation`, `payment_declined`, …). Every error response carries `"error": {"kind": ...}`. `msg` stays for README compatibility. Kinds are documented. Tests cover each kind. | ⬜ |
+| 7 | `feat`: stable failure kinds + JSON error envelope | A fixed registry of kinds with stable string ids (`missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `scooter_already_reserved`, `no_active_reservation`, `route_not_found`, `method_not_allowed`, `storage_error`, `internal_error`, …). **Every** error, including Flask's own 404/405/500 pages, returns JSON with `msg` (kept for README compatibility) and `"error": {"kind": ...}`. A test enumerates the registry and exercises every kind. Kinds are documented in AGENTS.md. | ⬜ |
+| 8 | `fix`: validate `radius` | Reject negative, non-finite (`inf`, `nan`) or missing radius with a named kind (`invalid_radius`). | ⬜ |
 
 ### Stage 3: Every request leaves a record (Outcome 1)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 7 | `feat`: persisted request/event records | Each request gets a `request_id`, which is also returned as the `X-Request-ID` header. Records are append-only JSON Lines under `data/` and persist across restarts. Each record holds: what was asked (method, path, params), the decisions made (e.g. scooter found / already reserved / payment result), how it ended (status, failure kind, duration) and `scooter_id`. A small query module lets you follow one request or one scooter end-to-end and count failure kinds by time window. Tests included. | ⬜ |
+| 9 | `feat`: persisted request records | Every request gets a `request_id`, returned as the `X-Request-ID` header. Each request appends one JSON line to `data/records.jsonl` (configurable path, git-ignored, survives restarts). A record holds: UTC ISO-8601 timestamp, git commit, method, path, params, `scooter_id`, the decisions made, scooter state **before and after**, the DB write result, the payment result once Stage 4 lands, status, failure kind and duration. Tests isolate the log. Log rotation is noted as future work. | ⬜ |
+| 10 | `feat`: records query CLI | `python -m …records` / `make records ARGS=…` with recent failures, failure counts by kind since a time, scooter history and request trace. This is the fallback that works without MCP approval, and the MCP server in Stage 5 reuses the same module. | ⬜ |
 
-### Stage 4: Payment can fail without corrupting state (Outcome 3)
+### Stage 4: State stays consistent and payment can fail safely (Outcome 3)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 8 | `fix`: atomic, locked DB writes | Write to a temp file, then `os.replace`, under a file lock, so a crash mid-write or two concurrent workers can't corrupt `scooter_db.json`. Tests included. | ⬜ |
-| 9 | `feat`: simulated payment gateway with reproducible faults | Replace the always-succeeds stub with a fake gateway that can `succeed`, `decline`, `timeout` or `error`. Faults can be reproduced on demand through config/env or a request header, with a fixed seed for random mode. Each fault maps to a failure kind and is recorded. | ⬜ |
-| 10 | `fix`: no bad state when payment fails | End-ride is all-or-nothing. A failed payment never frees a scooter without a charge and never charges for a ride that didn't end. Charges use an idempotency key per reservation, so a retry after a timeout is charged once. There is a way to reconcile or resolve a ride stuck in an unknown payment state. Tests prove each failure path leaves consistent state. | ⬜ |
+| 11 | `fix`: transactional DB access | A file lock covers each whole read, check and write. The write goes to a temp file, then `os.replace`. A concurrency test with two simultaneous reservations checks that exactly one wins. | ⬜ |
+| 12 | `feat`: persisted reservation state | Each scooter carries an active reservation (`reservation_id`, `started_at`, `payment_state`, idempotency key) saved with the scooter. Existing `scooter_db.json` files keep loading. | ⬜ |
+| 13 | `feat`: simulated payment gateway with reproducible faults | Fake gateway outcomes: `success`, `decline`, `timeout_not_charged`, `timeout_charged` and `error`. A ledger keyed by idempotency key supports looking up a charge. Each outcome is a deterministic function of (seed, idempotency key), so replays don't depend on worker or request order. Configured by env. A per-request override header works only when `ENABLE_FAULT_INJECTION=1`. Fixes the current `KeyError` → HTML 500 when payment fails. `txn_id` becomes a string, as the README documents. Each outcome maps to a failure kind and is recorded. | ⬜ |
+| 14 | `fix`: all-or-nothing end-ride | Save `payment_pending` and the idempotency key **before** calling the gateway. Success: free the scooter, set its location and store the `txn_id`. Decline: H3 policy. Timeout or error: the ride stays pending, and a retry with the same key is charged at most once. Tests prove the invariants for every fault: no charge without an ended ride, and no ended ride without a charge or a recorded outstanding balance. | ⬜ |
+| 15 | `feat`: reconcile stuck rides | `make reconcile` (and later an MCP tool) settles pending payments through the gateway ledger lookup and applies the H3 policy to abandoned reservations, so no scooter stays stuck forever. Tests included. | ⬜ |
 
 ### Stage 5: Agents can ask the system questions (Outcome 4)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 11 | `feat`: MCP server | An MCP server (official `mcp` Python SDK) over the recorded data and state. Tools: `recent_failures`, `failure_counts` (by kind, time window), `scooter_history`, `request_trace`, `scooter_state`, `run_tests`. Registered in a checked-in `.mcp.json` and documented in AGENTS.md. Tests included. | ⬜ |
+| 16 | `feat`: MCP server | Built on the official `mcp` Python SDK and reusing the PR 10 query module. Tools: `recent_failures`, `failure_counts`, `scooter_history`, `request_trace`, `scooter_state`, `run_tests` and `replay_fault`. Registered in a checked-in `.mcp.json`. AGENTS.md documents it and the CLI fallback. Tests included. | ⬜ |
 
-### Stage 6: The agent has boundaries (Outcome 6)
+### Stage 6: Cold-agent readiness (acceptance test)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 12 | `chore`: agent permission config | Checked-in `.claude/settings.json`. Allow: `make`/pytest/read-only git. Ask: `git push`, `gh pr` writes. Deny: force-push, pushes to `master`, `rm -rf`, reading `.env`/secrets, editing `.claude/` itself, and network calls except localhost. An AGENTS.md "Agent boundaries" section covers blast radius, permissions, isolation (branches/worktrees), reversibility and budget. | ⬜ |
+| 17 | `docs`/`tooling`: debugging playbook + reproducible scenarios | A fresh checkout has no records, so `make scenario NAME=…` drives realistic traffic and faults against an isolated instance to produce evidence. AGENTS.md "Debugging a symptom" playbook: reproduce, then query records, then compare scooter state before and after, then write a failing test. | ⬜ |
 
 ### Stage 7: What the AI got wrong (Outcome 7)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 13 | `docs`: AI_NOTES.md | Short, honest entries taken from real reviewer catches during this plan. Each says what was wrong, how it was caught and what changed. | ⬜ |
+| 18 | `docs`: curate AI_NOTES.md | Entries are added throughout. This PR picks the strongest three or more and makes sure each one says what was wrong, how it was caught and what changed. | ⬜ |
 
 ### Stage 8: Ready to deploy later (not deployed)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 14 | `chore`: deploy readiness | Procfile binds gunicorn to `$PORT`. Add a health endpoint. Update `app.json`. README "Deploying" notes, including the limits of a JSON-file DB on an ephemeral filesystem. **No deploy.** | ⬜ |
+| 19 | `chore`: deploy readiness | Explicit gunicorn `--bind 0.0.0.0:$PORT` in the Procfile. `/health` endpoint. Updated `app.json`. README "Deploying" notes, including the limits of a JSON-file DB and log on an ephemeral filesystem (H5). **No deploy.** | ⬜ |
 
 ### Stage 9: Verification (no PR unless gaps are found)
 | # | Step | Status |
 |---|---|---|
-| 15 | Cold-agent rehearsal: plant a bug on a throwaway local branch (never pushed), give a fresh agent only a one-line symptom, and check that it finds the root cause with evidence from recorded data and writes a failing test. Gaps found become new PRs here. | ⬜ |
+| 20 | Cold-agent rehearsal: plant a bug on a throwaway local branch (never pushed), give a fresh agent only a one-line symptom, and check that it finds the root cause with evidence from recorded data and writes a failing test. Gaps found become new PRs here. | ⬜ |
 
 ---
 
 ## Human decisions
 
-These need a person, and the defaults below are what the agents will do unless told
-otherwise.
+These need a person. The agents use the default shown unless told otherwise.
 
 | # | Decision | Default the agents will use |
 |---|---|---|
-| H1 | **Formal PR approval.** One GitHub account can't approve its own PRs. | The reviewer posts a verdict comment. The orchestrator merges on `VERDICT: APPROVE`. For real approvals, add a second account or a GitHub App reviewer. |
-| H2 | **Branch protection on `master`** (require a PR and passing CI). This is a repo setting. | Not changed by agents. Recommended that you turn it on after PR 4 (CI) lands. |
-| H3 | **Payment-decline policy.** When a card is declined at end-of-ride, does the ride stay open (scooter stays reserved; the rider retries with a different payment) or end with an outstanding balance? | The ride stays open and nothing is charged, so it can be retried. A ride in an *unknown* state (timeout) is reconciled through the idempotency key, so no scooter is stuck forever. |
-| H4 | **State-changing `GET` endpoints.** `/reservation/start` and `/reservation/end` are GETs in the README. | Keep them as GET to match the README contract, and note it. Moving to POST would be a breaking change. |
-| H5 | **Deploy target & persistence.** Heroku's filesystem is ephemeral, so the JSON DB and event log would reset on every dyno restart. | Not solved now (no deploy). Documented in PR 14. |
-| H6 | **Event-log contents.** Records include ride coordinates (location data). | Stored locally and git-ignored, with no retention policy yet. |
+| H1 | **Formal PR approval.** One GitHub account can't approve its own PRs. | The reviewer posts a verdict comment, and the orchestrator merges on `VERDICT: APPROVE`. For real approvals, add a second account or a GitHub App reviewer. |
+| H2 | **Branch protection on `master`** (require a PR and passing CI, block force-push). This is the real push control for Outcome 6 and a repo setting agents won't change. | Not changed by agents. **Recommended: turn it on once PR 5 (CI) lands.** |
+| H3 | **Payment-decline policy.** | When a card is *definitively declined* at end-of-ride: the ride ends, the scooter is freed at its end location, **no charge** is taken, and an *outstanding balance* is recorded against the reservation. Timeouts and errors stay pending until a retry or `reconcile` settles them, and the idempotency key means they're charged at most once. No scooter is stuck forever. Alternative: keep the ride open after a decline and auto-release it after an expiry. |
+| H4 | **State-changing `GET` endpoints** (`/reservation/start`, `/reservation/end`). | Keep them as GET to match the README contract, and note it. POST would be a breaking change. |
+| H5 | **Deploy target & persistence.** Heroku's filesystem is ephemeral. | Not solved now (no deploy). Documented in PR 19. |
+| H6 | **Record contents.** Records include ride coordinates (location data). | Stored locally and git-ignored, with no retention policy yet. |
+| H7 | **Status codes for payment failures.** The README documents only 422 for errors. | Decline → **422** (matches the README). Gateway timeout or error → **503**. The `error.kind` always says which. |
+| H8 | **Storage engine.** | Keep the JSON file plus a file lock (README stack). SQLite is the noted alternative if concurrency needs grow. |
+| H9 | **Demo-day data.** Will the cold agent find pre-recorded data, or must it reproduce the bug? | Plan for both: records accumulate during any use, and `make scenario` (PR 17) can regenerate evidence from a clean checkout. |
 
 ---
 
 ## Change log
 - 2026-11-04: Initial plan.
+- 2026-11-04: Revised after the adversarial review of PR #1. Python 3.14 → 3.15. Fully locked deps. Onboarding docs (AGENTS.md/CLAUDE.md/AI_NOTES.md) created early. Boundaries moved to Stage 1 and given sandbox enforcement. Failure kinds cover framework errors. Radius validation added. Records gained before/after state, a CLI fallback and isolation in tests. The payment work is split into transactional DB, persisted reservation state, gateway, all-or-nothing end-ride and reconcile. H3 default changed to "end ride + outstanding balance". Added H7–H9 and a cold-agent readiness stage.
