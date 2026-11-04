@@ -12,13 +12,18 @@ The implementation of this app uses Python/Flask, with JSON as the database. The
 
 #### On the web
 
-The API is live at https://scooter-reservation.herokuapp.com
+The app is not currently deployed. The old Heroku URL from 2019 no longer works.
 
 #### On local dev environment
 
+Requires Python 3.15 and `make`.
+
 * Clone the repository
-* Run `python3 app.py`
+* Run `make setup` to create `.venv` and install the locked dependencies
+* Run `make run` to start the app
 * App will run on http://localhost:8080
+
+See [AGENTS.md](AGENTS.md) for full onboarding: dependencies, data files, the repo map and workflow.
 
 ## API Endpoints
 
