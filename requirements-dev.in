@@ -1,0 +1,6 @@
+# Top-level dev/test dependencies. Edit this file, then run `make lock`
+# to regenerate the fully pinned requirements-dev.txt (never edit that by hand).
+# Constrain shared transitive deps to the same versions as the runtime lock.
+-c requirements.txt
+pip-tools>=7.6.2
+pytest>=9.2.0
