@@ -49,7 +49,7 @@ Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blo
 | # | PR | Scope | Status |
 |---|---|---|---|
 | 1 | `build`: Python 3.15 + current dependencies, fully locked | Pin the latest stable Flask / Werkzeug / geopy / gunicorn. Drop unused pins (`tornado`, `tabulate`, `requests`, `six`, …). `requirements.in` → locked `requirements.txt`, plus a dev equivalent. `.python-version` = 3.15, no longer ignored in `.gitignore`. `Makefile` with `setup`, `run` and `lock`. Verify every README endpoint on the new stack. | ✅ |
-| 2 | `docs`: agent onboarding skeleton + README refresh | `AGENTS.md` for a zero-context reader covering setup, run, repo map and where data lives. `CLAUDE.md` that imports `@AGENTS.md`. An `AI_NOTES.md` skeleton seeded with the plan-review catches. README: remove the dead Heroku URL and update the local-setup steps. | ⬜ |
+| 2 | `docs`: agent onboarding skeleton + README refresh | `AGENTS.md` for a zero-context reader covering setup, run, repo map and where data lives. `CLAUDE.md` that imports `@AGENTS.md`. An `AI_NOTES.md` skeleton seeded with the plan-review catches. README: remove the dead Heroku URL and update the local-setup steps. | ✅ |
 | 3 | `refactor`: configurable DB path / host / port | Read them from env (`SCOOTER_DB_PATH`, `HOST`, `PORT`) with the README defaults (`scooter_db.json`, `localhost:8080`). Close file handles. This is a prerequisite for isolated tests. | ⬜ |
 | 4 | `test`: pytest harness + baseline tests | Fixture with isolated temp data (DB and, later, records). It never touches the real files. Happy path plus the existing validation errors for every README endpoint. `make test` is the single command. | ⬜ |
 | 5 | `ci`: GitHub Actions runs `make test` | On every PR and on push to `master`, on Python 3.15. | ⬜ |
@@ -94,7 +94,7 @@ Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blo
 ### Stage 8: Ready to deploy later (not deployed)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 19 | `chore`: deploy readiness | Explicit gunicorn `--bind 0.0.0.0:$PORT` in the Procfile. `/health` endpoint. Updated `app.json`. README "Deploying" notes, including the limits of a JSON-file DB and log on an ephemeral filesystem (H5). **No deploy.** | ⬜ |
+| 19 | `chore`: deploy readiness | Explicit gunicorn `--bind 0.0.0.0:$PORT` in the Procfile. `/health` endpoint. Updated `app.json`. README "Deploying" notes, including the limits of a JSON-file DB and log on an ephemeral filesystem (H5). gunicorn 26 control socket (`--no-control-socket` or configure its path). Confirm Heroku supports Python 3.15 before any deploy. Consider `pip-sync` in `make setup` so the venv exactly matches the lock. **No deploy.** | ⬜ |
 
 ### Stage 9: Verification (no PR unless gaps are found)
 | # | Step | Status |
@@ -125,3 +125,4 @@ These need a person. The agents use the default shown unless told otherwise.
 - 2026-11-04: Initial plan.
 - 2026-11-04: Revised after the adversarial review of PR #1. Python 3.14 → 3.15. Fully locked deps. Onboarding docs (AGENTS.md/CLAUDE.md/AI_NOTES.md) created early. Boundaries moved to Stage 1 and given sandbox enforcement. Failure kinds cover framework errors. Radius validation added. Records gained before/after state, a CLI fallback and isolation in tests. The payment work is split into transactional DB, persisted reservation state, gateway, all-or-nothing end-ride and reconcile. H3 default changed to "end ride + outstanding balance". Added H7–H9 and a cold-agent readiness stage.
 - 2026-11-04: Second review. Gateway outcome now also depends on the attempt number. The ledger is persisted. Reconcile has a terminal rule (N attempts / T minutes → outstanding balance). H7 decline body says the ride ended; timeouts 504, errors 502. Added the sandbox network allowlist, the `make agent` budget wrapper, `git_dirty`, atomic log lines, the mcp 2.x API note and MCP enablement.
+- 2026-11-04: PR 2. PR 19's scope gained three findings from PR 1 (#2): the gunicorn 26 control socket (`~/.gunicorn/gunicorn.ctl` by default), confirming Heroku supports Python 3.15 before any deploy, and `pip-sync` in `make setup` so the venv exactly matches the lock.
