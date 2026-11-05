@@ -108,3 +108,26 @@ strongest entries.
 - **What changed:** the entries were reworded to quote what was written and to say what
   only changed in the plan. Lesson: the log needs review too. Check each entry against the
   source text, not against memory of it.
+
+### 8. A known-bug test that "asserts the fixed behaviour" passed for the wrong reason
+- **Where:** `tests/test_known_bugs.py::test_failed_payment_returns_json_error`, first
+  version (PR #5).
+- **What the AI claimed:** the xfail test pinned the payment-failure bug (PLAN PR 13) by
+  asserting the fixed behaviour: end-ride after a failed payment returns JSON, not a 500.
+- **Reality:** the assertions were loose, only "JSON and not 500". The reviewer's mutation
+  "start doesn't persist the reservation" made the test **XPASS**: end returned the
+  ordinary "no reservation" 422 without ever calling the gateway. That response is JSON and
+  isn't a 500, so the test passed while the payment path never ran. Once PR 13 removed the
+  xfail marker, that regression would have gone unnoticed.
+- **How it was caught:** the reviewer's mutation testing. Strict xfail turned the
+  unexpected pass into a failure this time. The writer's own mutation run had marked the
+  same mutation "caught" without checking *why* that test failed.
+- **What changed:** the test now asserts each step:
+  - start returned 200, and the reservation was persisted
+  - the gateway was actually called exactly once
+  - the response isn't the no-reservation message and carries no `txn_id`
+  - the scooter is either still reserved where it was, or freed at the end location, never
+    half-written, and other scooters are untouched
+
+  AGENTS.md now has the rule. Lesson: known-bug tests need specific assertions, not just
+  "no 500". When a mutation is caught, check which assertion caught it.
