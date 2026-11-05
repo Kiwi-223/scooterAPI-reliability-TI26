@@ -12,7 +12,7 @@ PIP_COMPILE := CUSTOM_COMPILE_COMMAND="make lock" $(BIN)/pip-compile --quiet \
 	--allow-unsafe --generate-hashes --strip-extras
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run test lock
+.PHONY: help setup run test lock agent
 
 help: ## List available targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*## ' $(MAKEFILE_LIST) | \
@@ -33,6 +33,11 @@ run: $(STAMP) ## Run the app on http://localhost:8080
 
 test: $(STAMP) ## Run the test suite (pass pytest options with ARGS="-k search -x")
 	$(BIN)/python -m pytest $(ARGS)
+
+# TASK, BUDGET_USD, TIMEOUT_MIN, WORKTREE and DRY_RUN given on the make command line reach
+# the script through the environment, so the task text needs no extra quoting here.
+agent: ## Headless Claude task with spend + time caps: make agent TASK="..." [BUDGET_USD=2 TIMEOUT_MIN=20 DRY_RUN=1]
+	@scripts/agent.sh
 
 lock: $(STAMP) ## Regenerate requirements*.txt from requirements*.in (add UPGRADE=1 to bump versions)
 	$(PIP_COMPILE) $(if $(UPGRADE),--upgrade) -o requirements.txt requirements.in
