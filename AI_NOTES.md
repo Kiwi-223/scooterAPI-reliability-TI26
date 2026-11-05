@@ -131,3 +131,41 @@ strongest entries.
 
   AGENTS.md now has the rule. Lesson: known-bug tests need specific assertions, not just
   "no 500". When a mutation is caught, check which assertion caught it.
+
+### 9. The reviewer's probe "contradicted" AGENTS.md, but the probe was wrong
+- **Where:** re-review of PR #5, checking AGENTS.md's Flask 3 `TESTING` / 500-handler table.
+- **What the AI claimed:** the reviewer agent's own probe seemed to show that the
+  **`500`-registered** handler returns HTML, not JSON, with `TESTING=False`. That would
+  contradict the "JSON 500" cell in AGENTS.md's table.
+- **Reality:** the doc was right. Flask passes a `500` handler an `InternalServerError`, not
+  the original exception, and the probe's handler returned every `HTTPException`
+  unchanged. `InternalServerError` is itself an `HTTPException` (`issubclass` is `True`),
+  so the handler handed back Flask's HTML page. The probe's `Exception` handler gave JSON
+  with `TESTING` on and off.
+
+  The writer re-checked on Flask 3.1.3, with an unhandled `KeyError` and a handler that
+  passes `HTTPException` through:
+
+  | Handler registered for | `TESTING=True` | `TESTING=False` |
+  |---|---|---|
+  | `500` | `KeyError` raised; handler not called | HTML 500 (handler got `InternalServerError`) |
+  | `Exception` | JSON 500 (handler got `KeyError`) | JSON 500 (handler got `KeyError`) |
+
+  An `Exception` handler of that shape still returns HTML for an explicit `abort(500)`,
+  with `TESTING` on or off:
+
+  | Route | Response |
+  |---|---|
+  | raises `KeyError` | JSON 500 |
+  | calls `abort(500)` | HTML 500 |
+- **How it was caught:** the reviewer re-checked its own probe before posting, fixed the
+  pass-through condition, re-ran it, and got the result AGENTS.md documents. No false
+  finding was posted.
+- **What changed:** nothing in the docs. Lesson: the reviewer can be confidently wrong too.
+  Before you call something a bug, check that the probe tests what you think it tests.
+  This also matters for PLAN PR 7: a JSON `internal_error` handler that passes
+  `HTTPException` through must not let `InternalServerError` through as HTML.
+- **This entry was itself first written wrong.** The first version (PR #6) said the
+  `Exception` handler was the one returning HTML. It was written from a paraphrase of the
+  review, not from the probe's recorded output, and the reviewer caught it. Lesson:
+  fact-check log entries against recorded output, not against someone's summary of it.

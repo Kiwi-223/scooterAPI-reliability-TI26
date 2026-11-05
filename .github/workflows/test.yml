@@ -1,0 +1,46 @@
+# Runs the test suite (`make test`) on every pull request and on every push to master.
+# Actions are pinned to full commit SHAs (resolved with `gh api repos/<action>/git/ref/tags/<tag>`);
+# the comment names the release each SHA belongs to. To update, resolve the new tag's SHA the same way.
+name: tests
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run per PR (or per branch for pushes). A new push to a PR cancels its superseded run;
+  # runs on master are never cancelled, so every merged commit gets a result.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: py
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: .python-version
+          # Without this, "3.15" resolves to whatever 3.15.x the runner image has cached
+          # (observed: 3.15.1 while 3.15.2 was current). Use the latest 3.15 patch instead.
+          check-latest: true
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: make test
+        env:
+          # Exact interpreter setup-python installed; the Makefile's `make setup` builds .venv from it
+          # and asserts it is Python 3.15.
+          PYTHON_BIN: ${{ steps.py.outputs.python-path }}
+        run: make test PYTHON="$PYTHON_BIN"
