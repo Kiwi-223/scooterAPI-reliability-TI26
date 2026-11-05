@@ -3,7 +3,7 @@
 - `db_path` (autouse): copies the seed DB into the test's tmp_path and points
   SCOOTER_DB_PATH at it. app.py reads SCOOTER_DB_PATH on every DB access, so this
   works no matter when `app` was imported.
-- `client`: a Flask test client for app.py.
+- `client`: a Flask test client for app.py, with TESTING=True for that test only.
 - `read_db`: returns the current contents of the test's DB file (to assert on what
   the app actually persisted).
 - `_guard_real_db` (autouse): fails the test if the live scooter_db.json changes.
@@ -51,9 +51,12 @@ def read_db(db_path):
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     import app as app_module
-    app_module.app.config["TESTING"] = True  # exceptions propagate to the test with a traceback
+    # TESTING=True makes unhandled exceptions propagate into the test with a traceback.
+    # setitem restores the old value after each test; a test can override it with its own
+    # monkeypatch.setitem(app.app.config, "TESTING", False) to see a real 500 response.
+    monkeypatch.setitem(app_module.app.config, "TESTING", True)
     return app_module.app.test_client()
 
 

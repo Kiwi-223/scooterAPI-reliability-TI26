@@ -124,8 +124,23 @@ The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). 
   `scooter_db.json` changed while it ran. Never point `SCOOTER_DB_PATH` at the real file in
   a test.
 - **Fixtures for new tests:**
-  - `client`: a Flask test client with `TESTING=True`, so exceptions propagate into the
-    test as tracebacks instead of becoming HTML 500s.
+  - `client`: a Flask test client. It sets `TESTING=True` for that test only, through
+    `monkeypatch.setitem(app.app.config, "TESTING", True)`, so unhandled exceptions
+    propagate into the test as tracebacks instead of becoming HTML 500s. To see the real
+    500 response, override it inside the test with
+    `monkeypatch.setitem(app.app.config, "TESTING", False)`.
+  - **Flask 3 gotcha, relevant to PLAN PR 7:** in testing mode, Flask re-raises an
+    unhandled exception **before** any handler registered for `500` /
+    `InternalServerError` runs. A handler registered for `Exception` does still run.
+    Verified on Flask 3.1.3:
+
+    | Handler registered for | `TESTING=True` | `TESTING=False` |
+    |---|---|---|
+    | `500` | exception reaches the test | JSON 500 |
+    | `Exception` | JSON 500 | JSON 500 |
+
+    So a JSON `internal_error` handler must be registered for `Exception` (letting
+    `HTTPException` through), or its tests must turn `TESTING` off.
   - `get_json(url, status)`: asserts the status code and a JSON content type, then returns
     the parsed body.
   - `read_db()`: returns what the app actually persisted, as `{id: scooter}`.
@@ -136,6 +151,10 @@ The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). 
   asserts the *fixed* behaviour, names its PLAN PR in `reason`, and uses `raises=` to pin
   how it fails today. When a PR fixes a bug, its test XPASSes, which fails the run. That PR
   must then delete the `xfail` marker and tighten the assertion to the final contract.
+  **Assert specifically, not just "no 500".** Check each precondition (for example, that
+  start returned 200), that the code path you mean actually ran (for example, a spy on the
+  gateway), and the persisted state. Otherwise an unrelated regression can make the test
+  pass for the wrong reason (see AI_NOTES #8).
 - **To reproduce a bug as a failing test:** add a normal test (not an xfail) that uses
   `client` or `get_json` plus `read_db`, and assert on both the response and the persisted
   state.

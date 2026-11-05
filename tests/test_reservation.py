@@ -41,6 +41,12 @@ def test_start_unknown_id(get_json, read_db, sid):
     assert read_db() == before
 
 
+def test_start_id_is_matched_exactly(get_json, read_db):
+    # "18 " (stray whitespace) is not "18": ids are not trimmed or normalised.
+    assert get_json("/reservation/start?id=18%20", 422) == {"msg": not_found("18 ")}
+    assert read_db()["18"]["is_reserved"] is False
+
+
 def test_start_missing_id(get_json):
     assert get_json("/reservation/start", 422) == {"msg": MISSING_PARAMS}
 
@@ -80,6 +86,11 @@ def test_end_twice_is_rejected(get_json, read_db):
     get_json("/reservation/end?id=18&lat=23.01&lng=19.01", 200)
     assert get_json("/reservation/end?id=18&lat=5&lng=5", 422) == {"msg": no_reservation("18")}
     assert read_db()["18"]["lat"] == 23.01  # second call did not move it
+
+
+def test_end_id_is_matched_exactly(get_json, read_db):
+    assert get_json("/reservation/end?id=33%20&lat=0&lng=0", 422) == {"msg": not_found("33 ")}
+    assert read_db()["33"]["is_reserved"] is True
 
 
 def test_end_unknown_id(get_json):
