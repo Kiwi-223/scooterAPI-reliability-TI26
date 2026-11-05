@@ -30,6 +30,9 @@ jobs:
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version-file: .python-version
+          # Without this, "3.15" resolves to whatever 3.15.x the runner image has cached
+          # (observed: 3.15.1 while 3.15.2 was current). Use the latest 3.15 patch instead.
+          check-latest: true
           cache: pip
           cache-dependency-path: |
             requirements.txt

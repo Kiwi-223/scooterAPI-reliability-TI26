@@ -165,7 +165,8 @@ GitHub Actions runs `.github/workflows/test.yml` (workflow name **tests**, job *
 every pull request and on every push to `master`.
 
 - **What it does:** checks out the repo and installs the Python version in
-  `.python-version` (3.15) with `actions/setup-python`. It then runs
+  `.python-version` (3.15) with `actions/setup-python`, using `check-latest: true` so it
+  gets the newest 3.15.x patch rather than the runner's cached one. It then runs
   `make test PYTHON=<that interpreter>`, which runs `make setup` (hash-locked install) and
   then pytest. **It's the same command you run locally.** pip's download cache is keyed on
   `requirements*.txt`.
