@@ -37,7 +37,8 @@ make help         # lists every target
   `make lock UPGRADE=1` bumps every pin to the latest allowed version.
 - `make setup` only reinstalls when a lock file changes (it uses a stamp file,
   `.venv/.installed`). It installs on top of the existing venv. To get a venv that exactly
-  matches the lock, run `rm -rf .venv && make setup`.
+  matches the lock, run `make clean && make setup`. `make clean` removes `.venv`. Agents
+  can't run a raw `rm -rf`: it's a deny rule (see Agent boundaries).
 - `.venv/` is git-ignored.
 
 ## Run
@@ -169,8 +170,8 @@ every pull request and on every push to `master`.
   `.python-version` (3.15) with `actions/setup-python`, using `check-latest: true` so it
   gets the newest 3.15.x patch rather than the runner's cached one. It then runs
   `make test PYTHON=<that interpreter>`, which runs `make setup` (hash-locked install) and
-  then pytest. **It's the same command you run locally.** pip's download cache is keyed on
-  `requirements*.txt`.
+  then pytest, and then `make check-settings`. **These are the same commands you run
+  locally.** pip's download cache is keyed on `requirements*.txt`.
 - **Settings:** `ubuntu-24.04`, `timeout-minutes: 10`, and `permissions: contents: read`.
   Checkout uses `persist-credentials: false`, so the job holds no write token.
 - **Superseded runs:** a newer push to the same PR cancels the older run. Runs on `master`
@@ -219,9 +220,10 @@ every pull request and on every push to `master`.
 | `PLAN.md` | The authoritative staged plan: PR table, human decisions, change log. |
 | `AGENTS.md` | This file. `CLAUDE.md` just imports it. |
 | `AI_NOTES.md` | Log of where the AI was confidently wrong and how it was caught (Outcome 7). |
-| `Makefile` | `setup`, `run`, `test`, `lock`, `agent` and `help`. More targets (`records`, `reconcile`, `scenario`) arrive with later PLAN PRs. |
+| `Makefile` | `setup`, `run`, `test`, `check-settings`, `lock`, `agent`, `clean` and `help`. More targets (`records`, `reconcile`, `scenario`) arrive with later PLAN PRs. |
 | `.claude/settings.json` | Claude Code sandbox and permission rules for this repo (see Agent boundaries). |
-| `scripts/agent.sh` | Headless `claude -p` wrapper with spend and wall-clock caps (`make agent`). |
+| `scripts/agent.sh` | Headless `claude -p` wrapper with spend, turn and wall-clock caps (`make agent`). |
+| `scripts/check_settings.py`, `schemas/` | `make check-settings`: validates `.claude/settings.json` against the vendored Claude Code settings schema. |
 | `tests/`, `pytest.ini` | The pytest suite and its config (see Test). |
 | `.github/workflows/test.yml` | CI: runs `make test` on PRs and on pushes to `master` (see CI). |
 | `requirements.in` / `requirements.txt` | Direct runtime deps / hash-locked full runtime set. |
@@ -266,13 +268,31 @@ The boundaries live in three places:
 - **`.claude/settings.json`**: committed, project scope, the Claude Code sandbox plus
   permission rules. It applies to every Claude Code session whose working directory is the
   repo root, including worktrees of this repo.
-- **`scripts/agent.sh` / `make agent`**: the budget and time wrapper for headless runs.
+- **`scripts/agent.sh` / `make agent`**: the budget, turn and time wrapper for headless
+  runs.
 - **GitHub settings that only a human can change:** branch protection (H2).
 
 The settings use only keys documented at <https://code.claude.com/docs> (settings
-reference, permissions, sandboxing) for Claude Code 2.1.310. `claude doctor`, run in the
-repo root, reports no invalid entries. Check it again after editing:
-`claude doctor | grep -iA3 "invalid\|warning"`.
+reference, permissions, sandboxing) for Claude Code 2.1.310.
+
+**Validate after every edit with `make check-settings`.** CI runs it too.
+
+- **What it checks:** `.claude/settings.json` against the SchemaStore Claude Code settings
+  schema, vendored at `schemas/claude-code-settings.schema.json`. The source URL, fetch
+  date and sha256 are in `scripts/check_settings.py`. The script also makes the top level
+  strict. It fails on:
+  - an unknown or misspelled key at any level that matters (top level, `permissions`,
+    `sandbox`, `sandbox.network`, `sandbox.filesystem`)
+  - a wrong type or enum value
+  - a permission rule that doesn't fit the rule pattern, such as an unknown tool name or
+    an unbalanced parenthesis
+- **Tests:** `tests/test_settings_schema.py` plants each of those mistakes and checks that
+  they're rejected.
+- **`claude doctor` is not a validator.** It reports malformed JSON, wrong value types and
+  some rule errors. It stays **silent on unknown keys** (for example a misspelled sandbox
+  key) and on many malformed rules (AI_NOTES #11).
+- **Stale schema:** SchemaStore can lag behind new CLI releases. If the check rejects a key
+  that the docs document, re-fetch the schema and update the date and hash in the script.
 
 > **Honesty first:** permission rules match the command *text*. They're a speed bump for
 > the usual spelling of a command, not a security boundary. The sandbox is OS-enforced
@@ -369,6 +389,10 @@ sandbox.
 
 - pip can't write its cache under `~/Library/Caches`. It warns and carries on.
 - gunicorn needs `--no-control-socket`; see Run.
+- **Unverified:** whether a harness scratchpad directory outside the checkout (for example
+  under `/private/tmp/claude-<uid>/`) is writable from sandboxed Bash. Only the checkout
+  and `$TMPDIR` are documented as writable. Claude's Write tool isn't sandboxed and isn't
+  affected.
 
 ### Isolation
 
@@ -388,7 +412,7 @@ sandbox.
 | A bad change on a branch | Push a fix commit. Never force-push. |
 | A bad merge on `master` | `git revert <sha>` in a new PR. Squash merges make that one commit. |
 | A mutated live DB | `git restore scooter_db.json` |
-| A broken venv | `rm -rf .venv && make setup` |
+| A broken venv | `make clean && make setup` |
 | A broken agent worktree | `git worktree remove .claude/worktrees/<name>` |
 
 Things that **can't** be undone from here: a force-push to `master` (prevented only by H2),
@@ -398,27 +422,35 @@ a leaked token (rotate it on GitHub), and money already spent.
 
 ```sh
 make agent TASK="Find why scooter 18 stays reserved; write a failing test" \
-           BUDGET_USD=2 TIMEOUT_MIN=20     # defaults: 2 USD, 20 min
+           BUDGET_USD=2 MAX_TURNS=40 TIMEOUT_MIN=20   # the defaults
 make agent TASK="..." DRY_RUN=1            # print the exact claude command; no API call
 scripts/agent.sh --help
 ```
 
-- **The command it runs:** `claude -p "<task>" --max-budget-usd <B> --permission-mode
-  acceptEdits --permission-prompts none --allowed-tools <make setup/test, read-only git,
-  git add/commit>` (plus `--worktree <name>` if you set `WORKTREE`).
+- **The command it runs:** `claude -p "<task>" --max-budget-usd <B> --max-turns <N>
+  --permission-mode acceptEdits --permission-prompts none --allowed-tools <make
+  setup/test, read-only git, git add/commit>` (plus `--worktree <name>` if you set
+  `WORKTREE`).
+- **`WORKTREE` names:** letters, digits, `.`, `_` and `-`, starting with a letter or digit.
+  `..`, a leading `.` and any `/` are rejected.
 - **Effect:** edits inside the repo are accepted. Anything that would prompt is denied,
   because nobody is watching: `git push`, `gh pr create`, unsandboxed retries, hosts outside
   the allowlist.
 - **Wall clock:** a portable watchdog, needed because macOS has no `timeout(1)`. It sends
   TERM to the agent's whole process group after `TIMEOUT_MIN`, and KILL 15 s later. The
-  script then exits with **124**.
-- **No turn cap:** `--max-turns` isn't listed in `claude --help` for this version, so the
-  limits are money and time.
+  script then exits with **124**. Limitation: a process the agent started in its *own*
+  process group or session, such as a daemonised server or anything run via `setsid`,
+  isn't in that group and may survive. Check `ps` after a timeout.
+- **Turn cap:** `MAX_TURNS`, passed to `--max-turns`. That flag is **hidden from
+  `claude --help`** but is supported: it's in the [CLI reference](https://code.claude.com/docs/en/cli-reference),
+  and the 2.1.310 binary defines it as "Maximum number of agentic turns in non-interactive
+  mode" (AI_NOTES #10).
 - **Task text:** pass it through `TASK=`. With `make`, a `$` in the task is expanded by
   make, so write `$$` or call `scripts/agent.sh "<task>"` directly. A task can't start
   with `-`.
 - **Verified without any API call:** `--help`, `DRY_RUN=1`, rejection of a bad budget,
-  timeout, worktree name or task, and the watchdog. The watchdog was tested with a fake
+  turn count, timeout, worktree name (including `..`, `.` and `a/b`) or task, and the
+  watchdog. The watchdog was tested with a fake
   `claude` on `PATH`: a normal exit passed its status through, a hang gave 124 after 60 s,
   and a process ignoring TERM was KILLed and gave 124. No processes were left over.
   **A real paid run hasn't been made.**

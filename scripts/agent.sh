@@ -8,13 +8,16 @@
 #   TASK          the prompt (or pass it as the first argument)
 #   BUDGET_USD    spend cap passed to --max-budget-usd          (default: 2)
 #   TIMEOUT_MIN   wall-clock limit in minutes                   (default: 20)
+#   MAX_TURNS     cap on agentic turns, passed to --max-turns   (default: 40)
 #   WORKTREE      run in an isolated git worktree of this name  (default: unset = this checkout)
 #   DRY_RUN=1     print the claude command instead of running it (no API call, no spend)
 #
 # Exit status: claude's own, or 124 if the wall-clock limit stopped it (same as GNU timeout).
 #
-# Only flags listed by `claude --help` (Claude Code 2.1.310) are used. There is no turn cap:
-# `--max-turns` is not in `claude --help`, so the budget and the clock are the limits.
+# Three independent limits: money (--max-budget-usd), turns (--max-turns) and wall-clock time
+# (the watchdog below). `--max-turns` is hidden from `claude --help` but is a supported,
+# documented print-mode flag (https://code.claude.com/docs/en/cli-reference, and defined in the
+# 2.1.310 binary as "Maximum number of agentic turns in non-interactive mode").
 set -euo pipefail
 
 usage() { sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -24,6 +27,7 @@ case "${1:-}" in -h|--help) usage; exit 0 ;; esac
 TASK="${1:-${TASK:-}}"
 BUDGET_USD="${BUDGET_USD:-2}"
 TIMEOUT_MIN="${TIMEOUT_MIN:-20}"
+MAX_TURNS="${MAX_TURNS:-40}"
 WORKTREE="${WORKTREE:-}"
 
 die() { echo "agent.sh: $*" >&2; exit 2; }
@@ -32,10 +36,15 @@ die() { echo "agent.sh: $*" >&2; exit 2; }
 [[ "$BUDGET_USD" =~ ^[0-9]+([.][0-9]+)?$ ]] && [[ ! "$BUDGET_USD" =~ ^0+([.]0+)?$ ]] \
   || die "BUDGET_USD must be a positive number, got '$BUDGET_USD'"
 [[ "$TIMEOUT_MIN" =~ ^[1-9][0-9]*$ ]] || die "TIMEOUT_MIN must be a positive whole number of minutes, got '$TIMEOUT_MIN'"
-[[ -z "$WORKTREE" || "$WORKTREE" =~ ^[A-Za-z0-9._-]+$ ]] || die "WORKTREE must be a simple name ([A-Za-z0-9._-]), got '$WORKTREE'"
+[[ "$MAX_TURNS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TURNS must be a positive whole number, got '$MAX_TURNS'"
+# A worktree name becomes a directory under .claude/worktrees/: letters, digits, '.', '_', '-',
+# starting with a letter or digit, so '.', '..' and anything with '/' are rejected.
+[[ -z "$WORKTREE" || ( "$WORKTREE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ && "$WORKTREE" != *..* ) ]] \
+  || die "WORKTREE must be a simple name (letters, digits, . _ -; no leading '.', no '..'), got '$WORKTREE'"
 
 cmd=(claude -p "$TASK"
   --max-budget-usd "$BUDGET_USD"
+  --max-turns "$MAX_TURNS"
   # Edits inside the repo are accepted; any call that would need a human prompt is denied
   # (nobody is watching), so `ask` rules in .claude/settings.json (git push, gh pr create, ...)
   # become hard denials in this mode.
@@ -50,7 +59,7 @@ cmd=(claude -p "$TASK"
 [[ -n "$WORKTREE" ]] && cmd+=(--worktree "$WORKTREE")
 
 if [[ "${DRY_RUN:-}" == "1" ]]; then
-  printf 'agent.sh: budget $%s, wall clock %s min%s\n' "$BUDGET_USD" "$TIMEOUT_MIN" "${WORKTREE:+, worktree $WORKTREE}"
+  printf 'agent.sh: budget $%s, %s turns, wall clock %s min%s\n' "$BUDGET_USD" "$MAX_TURNS" "$TIMEOUT_MIN" "${WORKTREE:+, worktree $WORKTREE}"
   printf '%q ' "${cmd[@]}"; echo
   exit 0
 fi
@@ -68,7 +77,9 @@ agent_pid=$!
 set +m
 
 # Portable watchdog: macOS has no `timeout(1)`. TERM the agent's process group, then KILL it
-# 15 s later.
+# 15 s later. Limitation: a process the agent started in a *new* process group or session
+# (e.g. via setsid, or a daemonising server) is not in that group and may survive; check with
+# `ps` after a timeout.
 (
   trap 'kill "$sleeper" 2>/dev/null; exit 0' TERM
   sleep "$secs" & sleeper=$!

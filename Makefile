@@ -12,11 +12,11 @@ PIP_COMPILE := CUSTOM_COMPILE_COMMAND="make lock" $(BIN)/pip-compile --quiet \
 	--allow-unsafe --generate-hashes --strip-extras
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run test lock agent
+.PHONY: help setup run test check-settings lock agent clean
 
 help: ## List available targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*## ' $(MAKEFILE_LIST) | \
-		awk 'BEGIN {FS = ":.*## "} {printf "  make %-8s %s\n", $$1, $$2}'
+		awk 'BEGIN {FS = ":.*## "} {printf "  make %-15s %s\n", $$1, $$2}'
 
 setup: $(STAMP) ## Create .venv (Python 3.15) and install the locked runtime + dev deps
 
@@ -34,11 +34,17 @@ run: $(STAMP) ## Run the app on http://localhost:8080
 test: $(STAMP) ## Run the test suite (pass pytest options with ARGS="-k search -x")
 	$(BIN)/python -m pytest $(ARGS)
 
-# TASK, BUDGET_USD, TIMEOUT_MIN, WORKTREE and DRY_RUN given on the make command line reach
+check-settings: $(STAMP) ## Validate .claude/settings.json against the vendored Claude Code settings schema
+	$(BIN)/python scripts/check_settings.py
+
+# TASK, BUDGET_USD, MAX_TURNS, TIMEOUT_MIN, WORKTREE and DRY_RUN given on the make command line reach
 # the script through the environment, so the task text needs no extra quoting here.
-agent: ## Headless Claude task with spend + time caps: make agent TASK="..." [BUDGET_USD=2 TIMEOUT_MIN=20 DRY_RUN=1]
+agent: ## Headless Claude task with spend/turn/time caps: make agent TASK="..." [BUDGET_USD=2 MAX_TURNS=40 TIMEOUT_MIN=20 DRY_RUN=1]
 	@scripts/agent.sh
 
 lock: $(STAMP) ## Regenerate requirements*.txt from requirements*.in (add UPGRADE=1 to bump versions)
 	$(PIP_COMPILE) $(if $(UPGRADE),--upgrade) -o requirements.txt requirements.in
 	$(PIP_COMPILE) $(if $(UPGRADE),--upgrade) -o requirements-dev.txt requirements-dev.in
+
+clean: ## Remove .venv (the next make setup/test rebuilds it from the locks)
+	rm -rf $(VENV)
