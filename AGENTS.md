@@ -185,7 +185,13 @@ every pull request and on every push to `master`.
   - `gh run list --repo Kiwi-223/scooterAPI-reliability-TI26 --workflow tests` lists runs.
   - `gh run view <id> --log-failed --repo Kiwi-223/scooterAPI-reliability-TI26` shows the
     logs of failed steps.
-- **Branch protection** that *requires* this check before merging is a human decision (H2)
+- **CI's patch version can change without a commit.** Because of `check-latest: true`, CI's
+  Python patch version (3.15.x) moves when a new 3.15 patch is released, with no commit in
+  this repo. That's intentional: CI tests on the latest stable 3.15. If CI breaks with no
+  related change, compare the "Successfully set up CPython (3.15.x)" line in the run log with
+  the last green run's.
+- **Branch protection** that *requires* this check (the required-check name is **`test`**,
+  the job name) before merging is a human decision (H2)
   and isn't set by agents.
 
 ## Where data lives
