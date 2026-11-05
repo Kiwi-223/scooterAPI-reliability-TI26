@@ -12,7 +12,7 @@ PIP_COMPILE := CUSTOM_COMPILE_COMMAND="make lock" $(BIN)/pip-compile --quiet \
 	--allow-unsafe --generate-hashes --strip-extras
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run lock
+.PHONY: help setup run test lock
 
 help: ## List available targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*## ' $(MAKEFILE_LIST) | \
@@ -30,6 +30,9 @@ $(STAMP): requirements.txt requirements-dev.txt
 
 run: $(STAMP) ## Run the app on http://localhost:8080
 	$(BIN)/python app.py
+
+test: $(STAMP) ## Run the test suite (pass pytest options with ARGS="-k search -x")
+	$(BIN)/python -m pytest $(ARGS)
 
 lock: $(STAMP) ## Regenerate requirements*.txt from requirements*.in (add UPGRADE=1 to bump versions)
 	$(PIP_COMPILE) $(if $(UPGRADE),--upgrade) -o requirements.txt requirements.in

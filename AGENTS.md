@@ -63,8 +63,8 @@ before.
 
 ```sh
 # Run against a scratch copy of the DB so the real scooter_db.json is never touched:
-cp scooter_db.json /tmp/scooter_scratch.json
-SCOOTER_DB_PATH=/tmp/scooter_scratch.json PORT=8099 make run
+SCRATCH_DB=$(mktemp) && cp scooter_db.json "$SCRATCH_DB"
+SCOOTER_DB_PATH="$SCRATCH_DB" PORT=8099 make run
 ```
 
 `HOST` is a common name. zsh and bash don't export it by default, but some shells (e.g.
@@ -102,9 +102,43 @@ Never run a blind `kill $(lsof -t ...)`.
 
 ## Test
 
-**Coming in PLAN PR 4.** It adds a pytest harness with isolated temp data and `make test`
-as the single command, and CI runs it in PLAN PR 5. pytest is already installed by
-`make setup`, but there are no tests yet.
+```sh
+make test                          # the single command: runs setup if needed, then pytest
+make test ARGS="-k search -x"      # pass any pytest options through ARGS
+```
+
+The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). CI that runs
+`make test` is **coming in PLAN PR 5**.
+
+- **Layout:** tests live in `tests/`, and the pytest config is `pytest.ini`.
+  - `tests/conftest.py` has the fixtures.
+  - `tests/seed_db.json` is the test-owned seed data: 5 scooters, and `33` starts reserved.
+  - `tests/messages.py` holds the exact `msg` strings the API returns today.
+  - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
+    `test_known_bugs.py`.
+- **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
+  each test's `tmp_path` and points `SCOOTER_DB_PATH` at that copy with
+  `monkeypatch.setenv`. Every test therefore starts from the same data, whatever state the
+  live `scooter_db.json` is in.
+- **Guard:** the autouse `_guard_real_db` fixture fails a test if the live
+  `scooter_db.json` changed while it ran. Never point `SCOOTER_DB_PATH` at the real file in
+  a test.
+- **Fixtures for new tests:**
+  - `client`: a Flask test client with `TESTING=True`, so exceptions propagate into the
+    test as tracebacks instead of becoming HTML 500s.
+  - `get_json(url, status)`: asserts the status code and a JSON content type, then returns
+    the parsed body.
+  - `read_db()`: returns what the app actually persisted, as `{id: scooter}`.
+- **Strictness:** `pytest.ini` sets `strict = true` and `filterwarnings = error`. Unknown
+  markers and config keys are errors, an xfail that unexpectedly passes **fails** the run,
+  and any warning fails the test, including a leaked file handle's `ResourceWarning`.
+- **Known bugs are pinned as strict xfails** in `tests/test_known_bugs.py`. Each test
+  asserts the *fixed* behaviour, names its PLAN PR in `reason`, and uses `raises=` to pin
+  how it fails today. When a PR fixes a bug, its test XPASSes, which fails the run. That PR
+  must then delete the `xfail` marker and tighten the assertion to the final contract.
+- **To reproduce a bug as a failing test:** add a normal test (not an xfail) that uses
+  `client` or `get_json` plus `read_db`, and assert on both the response and the persisted
+  state.
 
 ## Where data lives
 
@@ -130,7 +164,8 @@ as the single command, and CI runs it in PLAN PR 5. pytest is already installed 
 | `PLAN.md` | The authoritative staged plan: PR table, human decisions, change log. |
 | `AGENTS.md` | This file. `CLAUDE.md` just imports it. |
 | `AI_NOTES.md` | Log of where the AI was confidently wrong and how it was caught (Outcome 7). |
-| `Makefile` | `setup`, `run`, `lock` and `help`. More targets (`test`, `records`, `reconcile`, `scenario`, `agent`) arrive with later PLAN PRs. |
+| `Makefile` | `setup`, `run`, `test`, `lock` and `help`. More targets (`records`, `reconcile`, `scenario`, `agent`) arrive with later PLAN PRs. |
+| `tests/`, `pytest.ini` | The pytest suite and its config (see Test). |
 | `requirements.in` / `requirements.txt` | Direct runtime deps / hash-locked full runtime set. |
 | `requirements-dev.in` / `requirements-dev.txt` | Direct dev deps / hash-locked dev set, constrained to the runtime lock. |
 | `.python-version` | `3.15`. |
@@ -138,15 +173,16 @@ as the single command, and CI runs it in PLAN PR 5. pytest is already installed 
 
 ## Known behaviour worth knowing before debugging
 
-These exist today and are scheduled in PLAN.md. Don't "fix" them outside their PR.
+These exist today and are scheduled in PLAN.md. Don't "fix" them outside their PR. The
+ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
 
 - Errors are JSON `{"msg": ...}` with status 422, but Flask's own 404/405/500 pages are
-  HTML. Stable failure kinds are **coming in PLAN PR 7**.
-- `radius` isn't validated: a negative value is accepted and `inf` returns every scooter
-  (PLAN PR 8).
+  HTML *(xfail: 404, 405)*. Stable failure kinds are **coming in PLAN PR 7**.
+- `radius` isn't validated: a negative value or `nan` is accepted, and `inf` returns every
+  scooter (PLAN PR 8) *(xfail)*.
 - If the payment gateway ever returned a failure, `/reservation/end` would crash with a
-  `KeyError` and return an HTML 500 (PLAN PR 13). `txn_id` is an int, although the README
-  says it's a string.
+  `KeyError` and return an HTML 500 (PLAN PR 13) *(xfail)*. `txn_id` is an int, although the
+  README says it's a string *(xfail)*.
 - The DB read/write isn't locked, and the write isn't atomic, so concurrent requests can
   lose updates (PLAN PR 11).
 - A missing or corrupt DB file (including a wrong `SCOOTER_DB_PATH`) gives an HTML 500.
