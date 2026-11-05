@@ -107,8 +107,8 @@ make test                          # the single command: runs setup if needed, t
 make test ARGS="-k search -x"      # pass any pytest options through ARGS
 ```
 
-The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). CI that runs
-`make test` is **coming in PLAN PR 5**.
+The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). CI runs the
+same command (see CI below).
 
 - **Layout:** tests live in `tests/`, and the pytest config is `pytest.ini`.
   - `tests/conftest.py` has the fixtures.
@@ -159,6 +159,34 @@ The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). 
   `client` or `get_json` plus `read_db`, and assert on both the response and the persisted
   state.
 
+## CI
+
+GitHub Actions runs `.github/workflows/test.yml` (workflow name **tests**, job **test**) on
+every pull request and on every push to `master`.
+
+- **What it does:** checks out the repo and installs the Python version in
+  `.python-version` (3.15) with `actions/setup-python`. It then runs
+  `make test PYTHON=<that interpreter>`, which runs `make setup` (hash-locked install) and
+  then pytest. **It's the same command you run locally.** pip's download cache is keyed on
+  `requirements*.txt`.
+- **Settings:** `ubuntu-24.04`, `timeout-minutes: 10`, and `permissions: contents: read`.
+  Checkout uses `persist-credentials: false`, so the job holds no write token.
+- **Superseded runs:** a newer push to the same PR cancels the older run. Runs on `master`
+  are never cancelled.
+- **Action pinning:** actions are pinned to full commit SHAs, with the release named in a
+  comment. To bump one, resolve the new tag with
+  `gh api repos/actions/<name>/git/ref/tags/<tag>`. If `object.type` is `tag`,
+  dereference it with `gh api repos/actions/<name>/git/tags/<sha>`. Then update both the
+  SHA and the comment.
+- **Checking results:**
+  - `gh pr checks <pr> --repo Kiwi-223/scooterAPI-reliability-TI26` shows the status of a
+    PR's checks.
+  - `gh run list --repo Kiwi-223/scooterAPI-reliability-TI26 --workflow tests` lists runs.
+  - `gh run view <id> --log-failed --repo Kiwi-223/scooterAPI-reliability-TI26` shows the
+    logs of failed steps.
+- **Branch protection** that *requires* this check before merging is a human decision (H2)
+  and isn't set by agents.
+
 ## Where data lives
 
 - **`scooter_db.json`** is the live database: a JSON list of
@@ -185,6 +213,7 @@ The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). 
 | `AI_NOTES.md` | Log of where the AI was confidently wrong and how it was caught (Outcome 7). |
 | `Makefile` | `setup`, `run`, `test`, `lock` and `help`. More targets (`records`, `reconcile`, `scenario`, `agent`) arrive with later PLAN PRs. |
 | `tests/`, `pytest.ini` | The pytest suite and its config (see Test). |
+| `.github/workflows/test.yml` | CI: runs `make test` on PRs and on pushes to `master` (see CI). |
 | `requirements.in` / `requirements.txt` | Direct runtime deps / hash-locked full runtime set. |
 | `requirements-dev.in` / `requirements-dev.txt` | Direct dev deps / hash-locked dev set, constrained to the runtime lock. |
 | `.python-version` | `3.15`. |

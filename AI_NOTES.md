@@ -131,3 +131,27 @@ strongest entries.
 
   AGENTS.md now has the rule. Lesson: known-bug tests need specific assertions, not just
   "no 500". When a mutation is caught, check which assertion caught it.
+
+### 9. The reviewer's probe "contradicted" AGENTS.md, but the probe was wrong
+- **Where:** re-review of PR #5, checking AGENTS.md's Flask 3 `TESTING` / 500-handler table.
+- **What the AI claimed:** the reviewer agent's own probe seemed to show that a JSON handler
+  registered for `Exception` does **not** produce JSON for an unhandled error, which would
+  contradict the table in AGENTS.md.
+- **Reality:** the doc was right. The probe's `Exception` handler passed every
+  `HTTPException` through unchanged. `InternalServerError` is itself an `HTTPException`
+  (`issubclass` is `True`), so whenever the 500 reached the handler as an
+  `InternalServerError`, the handler returned Flask's HTML page instead of JSON.
+  The writer re-checked on Flask 3.1.3 with a handler of that shape, and the result was the
+  same with `TESTING` on or off:
+
+  | Route | Response |
+  |---|---|
+  | raises `KeyError` | JSON 500 |
+  | calls `abort(500)` | HTML 500 |
+- **How it was caught:** the reviewer re-checked its own probe before posting, fixed the
+  pass-through condition, re-ran it, and got the result AGENTS.md documents. No false
+  finding was posted.
+- **What changed:** nothing in the docs. Lesson: the reviewer can be confidently wrong too.
+  Before you call something a bug, check that the probe tests what you think it tests.
+  This also matters for PLAN PR 7: a JSON `internal_error` handler that passes
+  `HTTPException` through must not let `InternalServerError` through as HTML.
