@@ -169,3 +169,49 @@ strongest entries.
   `Exception` handler was the one returning HTML. It was written from a paraphrase of the
   review, not from the probe's recorded output, and the reviewer caught it. Lesson:
   fact-check log entries against recorded output, not against someone's summary of it.
+
+### 10. "`--max-turns` isn't in `--help`, so there is no turn cap"
+- **Where:** `scripts/agent.sh` and AGENTS.md "Budget", first version (PR #7). The idea
+  came in from an earlier review note, and the writer adopted it.
+- **What the AI claimed:** the installed CLI has no `--max-turns` flag, because
+  `claude --help` doesn't list it. So the wrapper could only cap money and time.
+- **Reality:** the flag exists and is supported. It's in the official CLI reference, which
+  the writer had **already downloaded** while researching this PR and saw listed. The
+  2.1.310 binary defines it with `.hideHelp()`: "Maximum number of agentic turns in
+  non-interactive mode". It's hidden, not missing.
+- **How it was caught:** the reviewer checked the docs and grepped the CLI binary for the
+  option definition.
+- **What changed:** `MAX_TURNS` (default 40) is now passed to `--max-turns`, and the docs
+  are corrected. Lesson: `--help` isn't the full interface. When `--help` and the official
+  reference disagree, check the binary or the reference before treating a flag as absent.
+
+### 11. `claude doctor` was presented as validating the settings file
+- **Where:** AGENTS.md "Agent boundaries" and the PR #7 description, first version.
+- **What the AI claimed:** `claude doctor` "reports no invalid entries", which implied the
+  settings were validated. The writer's two negative tests seemed to back this up: doctor
+  flagged a wrong type and one malformed MCP rule.
+- **Reality:** doctor stays silent on unknown or misspelled keys, both top-level and inside
+  `sandbox`, and on many malformed rules. The writer's own negative test had already shown
+  it ignoring `Bash(command:rm *)`, and the writer generalised from the two cases it did
+  catch. A misspelled `sandbox.enabeld` would have passed "validation" and silently left
+  the sandbox off.
+- **How it was caught:** the reviewer planted bad entries (unknown keys, malformed rules)
+  and watched doctor say nothing.
+- **What changed:** a new `make check-settings` (`scripts/check_settings.py`) validates
+  against the vendored SchemaStore schema, with the top level made strict. CI runs it, and
+  `tests/test_settings_schema.py` plants nine kinds of mistake and checks that each is
+  rejected. AGENTS.md now says what doctor does and doesn't check. Lesson: a negative test
+  has to cover the failure you care about (here, a typo that disables a guardrail), not
+  just *a* failure.
+
+### 12. AGENTS.md recommended a command that the same PR denies
+- **Where:** AGENTS.md Setup and Reversibility, PR #7.
+- **What the AI claimed:** "to reset the venv, run `rm -rf .venv && make setup`".
+- **Reality:** the same PR added a `Bash(rm -rf *)` deny rule, so an agent following the
+  onboarding doc would be blocked by the repo's own policy.
+- **How it was caught:** the reviewer ran the documented commands against the new rules.
+- **What changed:** a new `make clean` target removes `.venv`, and the docs now say
+  `make clean && make setup`. Lesson: after changing a policy, re-run the documented
+  workflow under it. Docs and guardrails drift apart when they're written in separate
+  passes.
+

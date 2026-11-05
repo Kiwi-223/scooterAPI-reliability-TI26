@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "disableBypassPermissionsMode": "disable",
+    "allow": [
+      "Bash(make help)",
+      "Bash(make setup)",
+      "Bash(make test)",
+      "Bash(make test *)",
+      "Bash(make run)",
+      "Bash(make lock)",
+      "Bash(make lock *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git rev-parse *)",
+      "Bash(git branch --show-current)",
+      "Bash(git fetch *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr list *)",
+      "Bash(gh pr diff *)",
+      "Bash(gh pr checks *)",
+      "Bash(gh run list *)",
+      "Bash(gh run view *)",
+      "Bash(gh run watch *)"
+    ],
+    "ask": [
+      "Bash(dangerouslyDisableSandbox:true)",
+      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr merge *)",
+      "Bash(gh pr comment *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr review *)",
+      "Bash(gh pr close *)",
+      "Bash(gh api *)",
+      "Bash(git -C *)",
+      "Bash(git -c *)",
+      "Bash(git reset --hard*)",
+      "Bash(git clean *)",
+      "Bash(git branch -D *)",
+      "Edit(/.claude/**)",
+      "Edit(/.github/**)",
+      "Edit(/Makefile)",
+      "Edit(/requirements*)",
+      "Edit(/scripts/**)"
+    ],
+    "deny": [
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git push --force-with-lease *)",
+      "Bash(git push * --force)",
+      "Bash(git push * --force *)",
+      "Bash(git push * -f)",
+      "Bash(git push * -f *)",
+      "Bash(git push * --force-with-lease*)",
+      "Bash(git push * +*)",
+      "Bash(git push * master)",
+      "Bash(git push * master *)",
+      "Bash(git push *:master)",
+      "Bash(git push *:master *)",
+      "Bash(git push *:refs/heads/master*)",
+      "Bash(gh pr merge * --admin*)",
+      "Bash(gh repo delete *)",
+      "Bash(gh release delete *)",
+      "Bash(rm -rf *)",
+      "Bash(rm -fr *)",
+      "Bash(rm -Rf *)",
+      "Bash(rm -r -f *)",
+      "Bash(rm -f -r *)",
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/*.pem)",
+      "Read(**/*.key)",
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.netrc)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.git-credentials)"
+    ]
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": true,
+    "excludedCommands": [
+      "gh *",
+      "git push *"
+    ],
+    "network": {
+      "allowedDomains": [
+        "pypi.org",
+        "files.pythonhosted.org",
+        "github.com",
+        "api.github.com",
+        "localhost"
+      ],
+      "allowLocalBinding": true
+    }
+  }
+}

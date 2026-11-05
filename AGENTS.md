@@ -37,7 +37,8 @@ make help         # lists every target
   `make lock UPGRADE=1` bumps every pin to the latest allowed version.
 - `make setup` only reinstalls when a lock file changes (it uses a stamp file,
   `.venv/.installed`). It installs on top of the existing venv. To get a venv that exactly
-  matches the lock, run `rm -rf .venv && make setup`.
+  matches the lock, run `make clean && make setup`. `make clean` removes `.venv`. Agents
+  can't run a raw `rm -rf`: it's a deny rule (see Agent boundaries).
 - `.venv/` is git-ignored.
 
 ## Run
@@ -72,9 +73,10 @@ tcsh) and CI images do. If `make run` binds somewhere unexpected, check `env | g
 - Production-style server: the Procfile runs plain `gunicorn app:app`. gunicorn binds
   `127.0.0.1:8000` by default, but if `PORT` is set in the environment it binds
   `0.0.0.0:$PORT`, which means every network interface. For local use, be explicit:
-  `.venv/bin/gunicorn --bind 127.0.0.1:8000 app:app`.
-  gunicorn 26 also creates a control socket at `~/.gunicorn/gunicorn.ctl`, outside the repo.
-  Add `--no-control-socket` if you don't want that. Deploy readiness is PLAN PR 19.
+  `.venv/bin/gunicorn --no-control-socket --bind 127.0.0.1:8000 app:app`.
+  Without `--no-control-socket`, gunicorn 26 creates a control socket at
+  `~/.gunicorn/gunicorn.ctl`, outside the repo, and the Claude Code sandbox blocks that
+  write (see Agent boundaries). Deploy readiness is PLAN PR 19.
 - Server logs: the Flask dev server prints request lines (`"GET /search?... 200"`) to
   **stderr**; only its banner goes to stdout. gunicorn logs **no** requests unless you run
   it with `--access-logfile -`, which sends them to stdout. Neither log is persisted.
@@ -168,8 +170,8 @@ every pull request and on every push to `master`.
   `.python-version` (3.15) with `actions/setup-python`, using `check-latest: true` so it
   gets the newest 3.15.x patch rather than the runner's cached one. It then runs
   `make test PYTHON=<that interpreter>`, which runs `make setup` (hash-locked install) and
-  then pytest. **It's the same command you run locally.** pip's download cache is keyed on
-  `requirements*.txt`.
+  then pytest, and then `make check-settings`. **These are the same commands you run
+  locally.** pip's download cache is keyed on `requirements*.txt`.
 - **Settings:** `ubuntu-24.04`, `timeout-minutes: 10`, and `permissions: contents: read`.
   Checkout uses `persist-credentials: false`, so the job holds no write token.
 - **Superseded runs:** a newer push to the same PR cancels the older run. Runs on `master`
@@ -218,7 +220,10 @@ every pull request and on every push to `master`.
 | `PLAN.md` | The authoritative staged plan: PR table, human decisions, change log. |
 | `AGENTS.md` | This file. `CLAUDE.md` just imports it. |
 | `AI_NOTES.md` | Log of where the AI was confidently wrong and how it was caught (Outcome 7). |
-| `Makefile` | `setup`, `run`, `test`, `lock` and `help`. More targets (`records`, `reconcile`, `scenario`, `agent`) arrive with later PLAN PRs. |
+| `Makefile` | `setup`, `run`, `test`, `check-settings`, `lock`, `agent`, `clean` and `help`. More targets (`records`, `reconcile`, `scenario`) arrive with later PLAN PRs. |
+| `.claude/settings.json` | Claude Code sandbox and permission rules for this repo (see Agent boundaries). |
+| `scripts/agent.sh` | Headless `claude -p` wrapper with spend, turn and wall-clock caps (`make agent`). |
+| `scripts/check_settings.py`, `schemas/` | `make check-settings`: validates `.claude/settings.json` against the vendored Claude Code settings schema. |
 | `tests/`, `pytest.ini` | The pytest suite and its config (see Test). |
 | `.github/workflows/test.yml` | CI: runs `make test` on PRs and on pushes to `master` (see CI). |
 | `requirements.in` / `requirements.txt` | Direct runtime deps / hash-locked full runtime set. |
@@ -258,8 +263,208 @@ PLAN PR 10.
 
 ## Agent boundaries
 
-**Coming in PLAN PR 6.** A checked-in `.claude/settings.json` sandbox and permissions,
-plus a budget wrapper. Until then, follow the workflow rules below.
+The boundaries live in three places:
+
+- **`.claude/settings.json`**: committed, project scope, the Claude Code sandbox plus
+  permission rules. It applies to every Claude Code session whose working directory is the
+  repo root, including worktrees of this repo.
+- **`scripts/agent.sh` / `make agent`**: the budget, turn and time wrapper for headless
+  runs.
+- **GitHub settings that only a human can change:** branch protection (H2).
+
+The settings use only keys documented at <https://code.claude.com/docs> (settings
+reference, permissions, sandboxing) for Claude Code 2.1.310.
+
+**Validate after every edit with `make check-settings`.** CI runs it too.
+
+- **What it checks:** `.claude/settings.json` against the SchemaStore Claude Code settings
+  schema, vendored at `schemas/claude-code-settings.schema.json`. The source URL, fetch
+  date and sha256 are in `scripts/check_settings.py`. The script also makes the top level
+  strict. It fails on:
+  - an unknown or misspelled key at any level that matters (top level, `permissions`,
+    `sandbox`, `sandbox.network`, `sandbox.filesystem`)
+  - a wrong type or enum value
+  - a permission rule that doesn't fit the rule pattern, such as an unknown tool name or
+    an unbalanced parenthesis
+- **Tests:** `tests/test_settings_schema.py` plants each of those mistakes and checks that
+  they're rejected.
+- **`claude doctor` is not a validator.** It reports malformed JSON, wrong value types and
+  some rule errors. It stays **silent on unknown keys** (for example a misspelled sandbox
+  key) and on many malformed rules (AI_NOTES #11).
+- **Stale schema:** SchemaStore can lag behind new CLI releases. If the check rejects a key
+  that the docs document, re-fetch the schema and update the date and hash in the script.
+
+> **Honesty first:** permission rules match the command *text*. They're a speed bump for
+> the usual spelling of a command, not a security boundary. The sandbox is OS-enforced
+> (Seatbelt on macOS, bubblewrap on Linux) and is the real control for files and network
+> inside a session. Branch protection is the real control for `master`, and **it is not on
+> yet** (H2).
+
+### Blast radius: the worst a confused agent could do here
+
+- **Rewrite shared history:** push to `master` or force-push, losing work.
+- **Merge without review:** merge its own PR.
+- **Destroy uncommitted work** in this shared checkout (other agents work here too):
+  `rm -rf`, `git reset --hard`, `git clean`. Or kill another agent's server.
+- **Leak credentials** such as the `gh` token, `~/.ssh` or git credentials, by sending them
+  to an arbitrary host.
+- **Weaken its own guardrails** by editing `.claude/settings.json`, `.github/`, the
+  `Makefile` or `scripts/agent.sh`, then running the edited code.
+- **Burn money:** a headless run that loops forever.
+
+### What's enforced, and how strongly
+
+| Control | Mechanism | Strength / known bypasses |
+|---|---|---|
+| **Writes** limited to this checkout and `$TMPDIR` | Sandbox (`sandbox.enabled`, `failIfUnavailable: true`) | **OS-enforced** for every Bash command and its children: `python -c`, `make` and anything else. Inside the checkout, the sandbox still protects `.claude/settings*.json`, `.git/hooks` and `.git/config`. Bypasses: Claude's own Edit/Write tools run outside the sandbox and follow permission rules instead; excluded commands (below); approved unsandboxed retries. |
+| **Network** limited to `pypi.org`, `files.pythonhosted.org`, `github.com`, `api.github.com`, `localhost` | Sandbox proxy (`network.allowedDomains`) | **OS-enforced** for all sandboxed processes, including `python -c "urllib..."`. Per the docs, any other host prompts in Manual / `acceptEdits` mode and is refused in `dontAsk` mode, in auto mode (unless the classifier approves), and in `make agent`. Not exercised here. Residual risk: GitHub is allowlisted, so data could still be sent *to GitHub*. The proxy doesn't inspect TLS. The WebFetch tool isn't sandboxed; it follows its own permission prompts. |
+| **Localhost** (`make run` + `curl localhost:8080`) | `network.allowLocalBinding: true` (macOS) | Needed for manual endpoint checks. Trade-off: sandboxed commands can reach **any** service listening on localhost. |
+| **Secrets** unreadable: `.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, `~/.netrc`, `~/.config/gh`, `~/.git-credentials` | `Read(...)` deny rules, which Claude Code also feeds into the sandbox's `denyRead` | Enforced for the Read tool **and** OS-enforced for sandboxed commands. It doesn't cover the excluded `gh` / `git push` commands, which need their credentials. |
+| **Unsandboxed retry** (`dangerouslyDisableSandbox`) needs a human | ask rule `Bash(dangerouslyDisableSandbox:true)` | This prompt also appears in auto and bypass modes. Headless (`make agent`) can't answer it, so the retry is denied. |
+| **No bypass mode** | `permissions.disableBypassPermissionsMode: "disable"` | `--dangerously-skip-permissions` is rejected in this repo. |
+| **Asks first** before `git push`, `gh pr create/merge/comment/edit/review/close`, `gh api`, `git -C`, `git -c`, `git reset --hard`, `git clean`, `git branch -D`, and before editing `.claude/**`, `.github/**`, `Makefile`, `requirements*` or `scripts/**` | `ask` rules | Text match only. `/usr/bin/git push`, `sh -c 'git push'` or a Python `subprocess` aren't matched. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('Makefile','w')"`. |
+| **Denied:** force-push, push to `master`, `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `rm -rf` (common spellings) | `deny` rules | Text match only, **defence in depth, bypassable.** A push to `master` is caught as `git push <remote> master` and `git push <remote> <src>:master`. It isn't caught as `git push` while on `master`, `git -C . push ...`, or through an alias or a script. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
+| **`master` can't be pushed or force-pushed** | GitHub branch protection | **Not enabled.** It's a human decision (H2) and agents don't change it. This is the only real control on `master`. Recommended now that CI (check name `test`) exists. |
+| **Spend and time caps** for headless runs | `make agent` → `scripts/agent.sh` | `--max-budget-usd` is a client-side estimate, so spend can pass it a little. The wall clock is enforced by the script's watchdog. Interactive sessions have no cap from this repo. |
+
+### The specific bypasses, and whether they're closed
+
+- **`python -c` to reach the network (or read secrets): closed for sandboxed commands.**
+  The sandbox applies to child processes, so Python goes through the same proxy and
+  `denyRead`.
+  - **Still open:** allowlisted hosts, and anything that runs outside the sandbox:
+    the excluded `gh *` / `git push *`, an approved unsandboxed retry, Claude's
+    WebFetch tool, hooks and MCP servers.
+  - **Stricter option:** drop `github.com` / `api.github.com` from `allowedDomains` and
+    also exclude `git fetch *` / `git pull *`. Then only excluded, permission-checked
+    commands can reach GitHub.
+- **`git push origin HEAD:master`: caught only by text matching.**
+  - The deny rules match it, and the `git push *` ask rule makes a human see every
+    spelled-out push.
+  - **Still open:** a sandboxed `git -C . push ...` (now an ask rule), a script, or a
+    plain `git push` while `master` is checked out can still reach `github.com`.
+  - **The real fix is branch protection (H2).**
+- **Edit the `Makefile`, then run `make`: partly closed.**
+  - Editing it with Claude's file tools, or with a redirect, `sed` or `tee`, asks first.
+  - Rewriting it from inside a sandboxed process (e.g. `python -c`) doesn't. However,
+    whatever `make` then runs is **still sandboxed**, so it gets the same write, network
+    and secret limits.
+  - The change also shows up in `git diff` and in review.
+  - Adding `./Makefile` to `sandbox.filesystem.denyWrite` would close this, but sandboxed
+    `git checkout` / `git pull` would then fail whenever a branch changes the Makefile.
+
+### Permissions, in short
+
+| Rule | Commands |
+|---|---|
+| **Allow** (no prompt) | `make help/setup/test/run/lock`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); read-only `gh` (`pr view/list/diff/checks`, `run list/view/watch`) |
+| **Ask** | everything in the "Asks first" row above |
+| **Deny** | the "Denied" row above, plus the secret reads |
+
+With the sandbox on and `autoAllowBashIfSandboxed: true`, most other sandboxed commands run
+**without** a prompt: the sandbox boundary replaces the prompt. Deny and ask rules still
+apply. In a `claude -p` run, project **allow** rules aren't applied, because the workspace
+is never "trusted" there. `scripts/agent.sh` passes its own `--allowed-tools` for that
+reason.
+
+**Workspace trust:** the first interactive session in this repo shows the workspace trust
+dialog. The project allow rules only apply once you accept it.
+
+### Commands that run outside the sandbox (`excludedCommands`)
+
+- **`gh *`:** on macOS, Go programs like `gh` can fail TLS verification under Seatbelt
+  (documented limitation).
+- **`git push *`:** so it can use the keychain credential helper. Every push still asks
+  first.
+
+Excluded commands run with your full access, subject only to the permission rules above.
+
+**An exclusion applies only when the whole Bash call is that one command.** A loop, pipe,
+`cd`, redirect or `$(...)` keeps the call sandboxed, and then `gh` may fail TLS on macOS.
+So run `gh ...` and `git push ...` as **plain single commands**: no `for` retry loops, no
+`| head`. If one fails, re-run it. This replaces the retry-loop advice from before the
+sandbox.
+
+`claude -p` and any session with the sandbox on also block writes outside the checkout. So:
+
+- pip can't write its cache under `~/Library/Caches`. It warns and carries on.
+- gunicorn needs `--no-control-socket`; see Run.
+- **Unverified:** whether a harness scratchpad directory outside the checkout (for example
+  under `/private/tmp/claude-<uid>/`) is writable from sandboxed Bash. Only the checkout
+  and `$TMPDIR` are documented as writable. Claude's Write tool isn't sandboxed and isn't
+  affected.
+
+### Isolation
+
+- **Branches:** every change happens on a `stage-<N>/<slug>` branch and lands through a
+  reviewed, squash-merged PR.
+- **Worktrees:** the reviewer works in a separate worktree. `make agent WORKTREE=<name>`
+  runs the headless agent in `.claude/worktrees/<name>` (git-ignored) on its own branch,
+  so it can't touch this checkout's working tree.
+- **Sandbox:** see above.
+- **No container or VM.** The Claude Code process itself, its file tools, hooks and MCP
+  servers run with your user's full access.
+
+### Reversibility
+
+| What went wrong | How to undo it |
+|---|---|
+| A bad change on a branch | Push a fix commit. Never force-push. |
+| A bad merge on `master` | `git revert <sha>` in a new PR. Squash merges make that one commit. |
+| A mutated live DB | `git restore scooter_db.json` |
+| A broken venv | `make clean && make setup` |
+| A broken agent worktree | `git worktree remove .claude/worktrees/<name>` |
+
+Things that **can't** be undone from here: a force-push to `master` (prevented only by H2),
+a leaked token (rotate it on GitHub), and money already spent.
+
+### Budget: `make agent`
+
+```sh
+make agent TASK="Find why scooter 18 stays reserved; write a failing test" \
+           BUDGET_USD=2 MAX_TURNS=40 TIMEOUT_MIN=20   # the defaults
+make agent TASK="..." DRY_RUN=1            # print the exact claude command; no API call
+scripts/agent.sh --help
+```
+
+- **The command it runs:** `claude -p "<task>" --max-budget-usd <B> --max-turns <N>
+  --permission-mode acceptEdits --permission-prompts none --allowed-tools <make
+  setup/test, read-only git, git add/commit>` (plus `--worktree <name>` if you set
+  `WORKTREE`).
+- **`WORKTREE` names:** letters, digits, `.`, `_` and `-`, starting with a letter or digit.
+  `..`, a leading `.` and any `/` are rejected.
+- **Effect:** edits inside the repo are accepted. Anything that would prompt is denied,
+  because nobody is watching: `git push`, `gh pr create`, unsandboxed retries, hosts outside
+  the allowlist.
+- **Wall clock:** a portable watchdog, needed because macOS has no `timeout(1)`. It sends
+  TERM to the agent's whole process group after `TIMEOUT_MIN`, and KILL 15 s later. The
+  script then exits with **124**. Limitation: a process the agent started in its *own*
+  process group or session, such as a daemonised server or anything run via `setsid`,
+  isn't in that group and may survive. Check `ps` after a timeout.
+- **Turn cap:** `MAX_TURNS`, passed to `--max-turns`. That flag is **hidden from
+  `claude --help`** but is supported: it's in the [CLI reference](https://code.claude.com/docs/en/cli-reference),
+  and the 2.1.310 binary defines it as "Maximum number of agentic turns in non-interactive
+  mode" (AI_NOTES #10).
+- **Task text:** pass it through `TASK=`. With `make`, a `$` in the task is expanded by
+  make, so write `$$` or call `scripts/agent.sh "<task>"` directly. A task can't start
+  with `-`.
+- **Verified without any API call:** `--help`, `DRY_RUN=1`, rejection of a bad budget,
+  turn count, timeout, worktree name (including `..`, `.` and `a/b`) or task, and the
+  watchdog. The watchdog was tested with a fake
+  `claude` on `PATH`: a normal exit passed its status through, a hang gave 124 after 60 s,
+  and a process ignoring TERM was KILLed and gave 124. No processes were left over.
+  **A real paid run hasn't been made.**
+
+### How to check the sandbox yourself
+
+Start an interactive `claude` session in the repo root and run `/sandbox`. Its Config tab
+shows the resolved policy. Then ask Claude (not `!`, which runs unsandboxed) to run each of
+these:
+
+- `touch ~/sandbox-probe` should fail with `Operation not permitted`.
+- `curl --noproxy '*' https://example.com` should fail.
+- `curl -sI https://example.com` should prompt, or be refused in `dontAsk`.
+- `make test` should pass.
 
 ## Workflow rules
 
@@ -276,8 +481,10 @@ plus a budget wrapper. Until then, follow the workflow rules below.
 - **In each PR:** mark that PR's row ✅ in PLAN.md, keep this file accurate, and log any
   confident AI mistakes in `AI_NOTES.md`.
 - **Commits** use conventional style (`build:`, `fix:`, `docs:`, ...).
-- **Network to GitHub can be flaky** (TLS timeouts, connection resets). Retry
-  `git push` and `gh` calls. After a failed `gh pr create`, check
+- **Network to GitHub can be flaky** (TLS timeouts, connection resets). Re-run a failed
+  `git push` or `gh` call, as a plain single command so it stays out of the sandbox (see
+  Agent boundaries), rather than wrapping it in a shell retry loop. After a failed
+  `gh pr create`, check
   `gh pr list --repo Kiwi-223/scooterAPI-reliability-TI26 --head <branch>` before you
   retry, to avoid opening duplicates.
 - **Don't trust memory for library APIs or versions.** Check with `pip index versions`,
