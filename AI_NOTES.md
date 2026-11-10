@@ -451,3 +451,26 @@ strongest entries.
   not only the error counts. And when a verification script prints nothing, treat that
   as a failure.
 
+
+### 24. A replayed idempotency key was framed as a legacy-only problem
+- **Where:** PR #15 (PLAN PR 12). See the AGENTS.md "Database schema" section and the PLAN
+  change log.
+- **What the AI claimed:** the restore hazard was "a legacy key isn't unique over time":
+  after a `git restore`, ending scooter 33 reuses `legacy-33`. The note was written as a
+  property of synthesised `legacy-<id>` reservations, and PR 13 was told to "account for
+  `legacy-<id>` keys repeating".
+- **Reality:** restoring **any** DB snapshot replays **every** reservation in it, with the
+  same `reservation_id` and `idempotency_key`, uuid ones included. With PR 13's ledger, the
+  second end of a restored ride could find "already charged" and let the rider go free.
+  The hazard comes from restoring state, not from the legacy shape.
+- **How it was caught:** the reviewer started scooter 18 (a real uuid reservation), took a
+  snapshot of the DB, ended the ride, restored the snapshot and ended it again. The same
+  uuid `reservation_id` was cleared twice.
+- **What changed:**
+  - AGENTS.md and the change log now describe the general hazard.
+  - PLAN row 13 requires ledger hits to match the ride (scooter, reservation, amount),
+    treats anything else as a conflict, and adds a restore test.
+  - `test_a_restored_reservation_is_charged_again_not_ridden_free` pins today's behaviour
+    for both a uuid and a legacy reservation.
+  - Lesson: when a hazard turns up in one shape of data, check whether it applies to every
+    shape before scoping the note to the one where it was noticed.

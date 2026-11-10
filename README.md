@@ -183,7 +183,7 @@ never renamed; new ones may be added.
 | `payment_failed` | 502 | The payment failed; the reservation was not ended. |
 | `route_not_found` | 404 | There's no endpoint at that path. |
 | `method_not_allowed` | 405 | All endpoints are `GET`. |
-| `storage_error` | 500 | The server couldn't read or write its database. |
+| `storage_error` | 500 | The server couldn't read or write its database, or (start/end only) that scooter's reservation is in a state this server version can't handle. |
 | `storage_busy` | 503 | The database was locked by another request for too long; nothing was changed. Retry after the `Retry-After` seconds (`/reservation/*` only). |
 | `internal_error` | 500 | Unexpected server error. |
 

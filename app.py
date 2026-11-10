@@ -161,6 +161,7 @@ def start_reservation():
 		# try and find the scooter with specified id
 		scooter = find_scooter(reserve_id, db)
 		if scooter:
+			refuse_unsupported_reservation(scooter, txn.path)
 			# reserve if possible
 			if not scooter.is_reserved:
 				# scooter can be reserved
@@ -217,6 +218,7 @@ def end_reservation():
 		# try and find the scooter with specified id
 		scooter = find_scooter(scooter_id_to_end, db)
 		if scooter:
+			refuse_unsupported_reservation(scooter, txn.path)
 			# end reservation if possible
 			if scooter.is_reserved:
 				# scooter is reserved and can be ended
@@ -400,8 +402,10 @@ SCOOTER_FIELDS = DB_FIELDS | { 'reservation' }		# known; any other field is kept
 # A reservation object (AGENTS.md "Database schema"). Unknown keys inside it are kept as-is.
 RESERVATION_FIELDS = { 'reservation_id', 'started_at', 'start_request_id', 'payment_state', 'idempotency_key' }
 # The payment states this code knows how to handle. PLAN PRs 13-15 add more (payment_pending,
-# paid, outstanding_balance, ...). A state this code doesn't know is refused as storage_error
-# rather than guessed at: ending a ride in an unknown payment state could charge twice.
+# paid, outstanding_balance, ...). A reservation in a state this code doesn't know still loads
+# (the scooter counts as reserved, and the rest of the API keeps working), but start/end on
+# that scooter are refused as storage_error rather than guessed at (ending it could charge
+# twice), and write_db refuses to change it. See AGENTS.md "Database schema".
 PAYMENT_STATES = { 'active' }
 LAT_RANGE, LNG_RANGE = (-90, 90), (-180, 180)
 
@@ -425,8 +429,8 @@ def find_reservation_problem(reservation):
 	for field in ('started_at', 'start_request_id'):
 		if reservation[field] is not None and not isinstance(reservation[field], str):
 			return f'reservation.{field} is {type(reservation[field]).__name__}, not a string or null'
-	if not isinstance(reservation['payment_state'], str) or reservation['payment_state'] not in PAYMENT_STATES:	# (a list isn't hashable)
-		return f'reservation.payment_state is not one of {sorted(PAYMENT_STATES)}'
+	if not _is_nonempty_str(reservation['payment_state']):
+		return 'reservation.payment_state is not a non-empty string'
 	if 'legacy' in reservation and not isinstance(reservation['legacy'], bool):
 		return 'reservation.legacy is not a boolean'
 	return None
@@ -437,6 +441,9 @@ def find_db_shape_problem(db_list):
 	if not isinstance(db_list, list):
 		return f'top level is {type(db_list).__name__}, not a list'
 	first_index_of_id = {}
+	# Reservation ids and idempotency keys must be unique across scooters too: two rides
+	# sharing an idempotency key would be one charge for two rides (PLAN PR 13).
+	first_index_of_key = { 'reservation_id': {}, 'idempotency_key': {} }
 	for i, scooter in enumerate(db_list):
 		if not isinstance(scooter, dict):
 			return f'entry {i} is {type(scooter).__name__}, not an object'
@@ -468,7 +475,25 @@ def find_db_shape_problem(db_list):
 				problem = find_reservation_problem(reservation)
 				if problem:
 					return f'entry {i}: {problem}'
+		reservation = load_reservation(scooter)	# legacy entries count with their synthesised ids
+		if reservation is not None:
+			for field, seen in first_index_of_key.items():
+				if reservation[field] in seen:
+					return f'entry {i}: duplicate reservation.{field} (same as entry {seen[reservation[field]]})'
+				seen[reservation[field]] = i
 	return None
+
+def is_supported_reservation(reservation):
+	# False for a reservation in a payment state this code doesn't handle (PAYMENT_STATES).
+	return reservation is None or reservation['payment_state'] in PAYMENT_STATES
+
+def refuse_unsupported_reservation(scooter, path):
+	# start/end must not touch a reservation this code doesn't understand (see PAYMENT_STATES).
+	if not is_supported_reservation(scooter.reservation):
+		records.note('reservation', 'unsupported', reservation_id=scooter.reservation['reservation_id'],
+			payment_state=scooter.reservation['payment_state'][:64])
+		raise StorageError(f'The reservation for scooter {scooter.id} is in a payment state this server version '
+			f'does not handle (reservation.payment_state is not one of {sorted(PAYMENT_STATES)}).', path)
 
 def legacy_reservation(scooter_id):
 	# A reservation for a scooter that was reserved before reservations were persisted
@@ -570,6 +595,12 @@ def write_db(db, path=None):
 	db_list = convert_db_to_dictlist(db)
 	path = path or get_db_path()
 	problem = find_db_shape_problem(db_list)
+	for i, scooter in enumerate(db):
+		# A reservation in a payment state this code doesn't handle is written back exactly as
+		# it was read, never changed (and never created by this code).
+		if not problem and scooter.reservation != scooter.loaded_reservation and not (
+				is_supported_reservation(scooter.reservation) and is_supported_reservation(scooter.loaded_reservation)):
+			problem = f'entry {i}: a reservation in an unknown payment state was changed'
 	if problem:
 		# A code bug produced state that init_db would refuse (e.g. reserved without a
 		# reservation). Writing it would turn every later request into storage_error, so
@@ -600,6 +631,7 @@ class Scooter:
 		self.lng = lng
 		self.is_reserved = is_reserved
 		self.reservation = reservation	# dict while reserved, None while free (see RESERVATION_FIELDS)
+		self.loaded_reservation = copy.deepcopy(reservation)	# as read from the DB (write_db's guard)
 		self.extra = extra or {}		# unknown top-level DB fields, written back unchanged
 	
 	def to_dict(self):

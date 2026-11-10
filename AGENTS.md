@@ -252,11 +252,11 @@ every pull request and on every push to `master`.
 | `lat`, `lng` | finite number | In [-90, 90] and [-180, 180]. |
 | `is_reserved` | boolean | Kept for compatibility (the README's public shape). |
 | `reservation` | object or `null` | The active reservation, or `null` when the scooter is free. **Invariant: `is_reserved == (reservation is not null)`.** |
-| `reservation.reservation_id` | non-empty string | uuid4 hex, new for every start. Returned as `reservation_id` by `/reservation/start`. |
+| `reservation.reservation_id` | non-empty string | uuid4 hex, new for every start. Returned as `reservation_id` by `/reservation/start`. Unique across the file. |
 | `reservation.started_at` | string or `null` | UTC ISO-8601 with milliseconds and `Z`, set by the start. `null` only for legacy reservations. |
 | `reservation.start_request_id` | string or `null` | The `X-Request-ID` of the start request, i.e. its request record: `make records ARGS="request <id>"`. `null` only for legacy reservations. |
-| `reservation.payment_state` | string | `"active"` (ride in progress). PLAN PRs 13–15 add states such as `payment_pending`, `paid` and `outstanding_balance`. |
-| `reservation.idempotency_key` | non-empty string | **Equal to `reservation_id`** (one reservation, one ride, one charge). It's the key PLAN PR 13 sends to the gateway. It's a separate field so a later PR can change how it's derived without changing the id. |
+| `reservation.payment_state` | non-empty string | `"active"` (ride in progress). PLAN PRs 13–15 add states such as `payment_pending`, `paid` and `outstanding_balance`. A state this code doesn't know is scoped to that one scooter (below). |
+| `reservation.idempotency_key` | non-empty string | **Equal to `reservation_id`** (one reservation, one ride, one charge). It's the key PLAN PR 13 sends to the gateway. It's a separate field so a later PR can change how it's derived without changing the id. Unique across the file. |
 | `reservation.legacy` | boolean, optional | `true` on a synthesised legacy reservation (below). |
 | *anything else* | any | **Unknown fields are kept**: top-level and inside `reservation`, they're written back unchanged (round-trip tested). They're not shown by `/view_all_available`, which returns exactly `id`, `lat`, `lng`, `is_reserved`. They do appear in request records' scooter snapshots. |
 
@@ -269,16 +269,28 @@ every pull request and on every push to `master`.
 - **Validation (`init_db` → `find_db_shape_problem`):** every read checks the whole file.
   Any problem is `storage_error` (500), and nothing is written. Problems: a missing
   required field; a wrong type; `lat`/`lng` not finite or out of range; a duplicate `id`;
-  a broken invariant; a `reservation` that isn't an object or `null`, or that lacks a
-  field, has a wrong type, or has a `payment_state` this code doesn't know. The msg names
-  the entry index and the field, never a value from the file, e.g.
-  `(entry 4: is_reserved is true but reservation is null)`.
-- **Unknown `payment_state` is refused on purpose.** Guessing could charge a ride twice.
-  The consequence: once PLAN PR 13+ writes a new state, **rolling back to older code
-  makes every request `storage_error`** until that reservation ends under the new code
-  (or the DB is restored).
+  a duplicate `reservation_id` or `idempotency_key` across scooters (one key would cover
+  two rides; legacy entries count with their `legacy-<id>`); a broken invariant; a
+  `reservation` that isn't an object or `null`, or that lacks a field or has a wrong
+  type. The msg names the entry index and the field, never a value from the file, e.g.
+  `(entry 4: is_reserved is true but reservation is null)` or
+  `(entry 4: duplicate reservation.reservation_id (same as entry 1))`.
+- **A `payment_state` this code doesn't know affects only that scooter** (e.g. after
+  rolling back past a PLAN PR that added `payment_pending`):
+  - The file still loads. The scooter counts as reserved, so `/view_all_available` and
+    `/search` leave it out, and every other scooter keeps working normally.
+  - `/reservation/start` and `/reservation/end` on **that** scooter are `storage_error`
+    (500): `The reservation for scooter 33 is in a payment state this server version
+    does not handle (reservation.payment_state is not one of ['active']).` Nothing is
+    charged or written, and the record has a `reservation: unsupported` decision with the
+    state. Guessing could charge a ride twice.
+  - Writes for other scooters copy that reservation back exactly as read. The write guard
+    refuses any write that changes it or creates a state this code doesn't know.
+  - To recover: roll forward to code that knows the state, or fix that entry by hand.
 - **The app refuses to write a DB that would fail that validation** (for example, a code
-  bug that reserves without a reservation). `write_db` checks before writing; the request
+  bug that reserves without a reservation, or reuses another scooter's reservation id),
+  or that changes a reservation in an unknown payment state (compared with a copy taken
+  at load). `write_db` checks before writing; the request
   becomes `internal_error` (500), the file is left as it was, and the record shows
   `db_write: {attempted: true, ok: false, error: "InvalidDbState"}` plus a
   `db_write: refused` decision naming the problem. Without this, one buggy request would
@@ -295,17 +307,31 @@ every pull request and on every push to `master`.
     shape**, including legacy reservations (kept, with `legacy: true`).
   - Files may mix legacy and new entries. A `reservation` key that's present is always
     checked against the invariant.
-  - **Note for PLAN PR 13:** a legacy key isn't unique over time. If the DB is restored
-    (`git restore`) after scooter 33's ride was ended and charged, the next end charges
-    with the same key `legacy-33` again. A gateway that deduplicates by key would treat
-    it as the earlier charge.
+  - **Why deterministic, not a random id per load:** reads never write, so a random id
+    would change on every load until a write persisted it. A ride whose end fails before
+    writing (payment failure, PLAN PR 14's timeouts) would then retry under a new key, so
+    the gateway couldn't recognise the retry and could charge twice. A deterministic key
+    keeps retries recognisable. Randomising wouldn't fix the restore hazard below anyway,
+    because uuid reservations replay too.
+- **Restoring a DB snapshot replays its reservations, and their keys.** This applies to any
+  restored file (`git restore scooter_db.json`, a backup, a rollback), not just legacy
+  entries. Every reservation in it comes back with the same `reservation_id` and
+  `idempotency_key`, legacy (`legacy-33` returns on every `git restore`) or uuid. Ending
+  it again uses that key a second time.
+  - **Today** there's no ledger, so the rider is simply charged again
+    (`test_a_restored_reservation_is_charged_again_not_ridden_free`).
+  - **PLAN PR 13 must not turn this into a free ride.** With a ledger keyed by idempotency
+    key, a second end would find "already charged". So a ledger hit counts as "already
+    charged" only if it matches the ride (scooter id, reservation id and amount); anything
+    else is a conflict, never a free ride. That's in PLAN row 13's scope.
 - **Request records** show the same full form (`reservation` and unknown fields) in
   `scooter_before`, `scooter_after` and `scooter_in_memory`. A legacy reserved scooter's
   `scooter_before` shows its synthesised reservation, i.e. the scooter as the app loaded
   it, not the file's raw bytes.
 - **Code:** `app.py`: `Scooter` (`to_dict` is the persisted form, `to_public_dict` the
   README form), `find_db_shape_problem`, `find_reservation_problem`, `load_reservation`,
-  `legacy_reservation`, `new_reservation`, and the guard in `write_db`.
+  `legacy_reservation`, `new_reservation`, `is_supported_reservation`,
+  `refuse_unsupported_reservation`, and the guard in `write_db`.
 
 ## Repo map
 
@@ -348,6 +374,9 @@ ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
   to save (`storage_error`). The rider pays for a ride that didn't end *(xfail, PLAN PR 14)*.
 - A scooter reserved before PLAN PR 12 has no record of when or by which request its ride
   started: it loads with a synthesised `legacy-<id>` reservation (see Database schema).
+- Restoring a DB snapshot replays its reservations with the same ids and keys; ending one
+  again charges again (no ledger yet). PLAN PR 13 must keep that from becoming a free ride
+  (see Database schema).
 - The start response's `reservation_id` isn't used by any endpoint yet. `/reservation/end`
   still takes only `id`, `lat` and `lng`. Later PLAN PRs build on it.
 
@@ -478,7 +507,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `reservation` (`created`/`cleared`, with the `reservation_id`; see Database schema), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `reservation` (`created`/`cleared` with the `reservation_id`, or `unsupported` with the unknown `payment_state`; see Database schema), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -622,7 +651,7 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `route_not_found` | 404 | No endpoint at that path. |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
 | `storage_busy` | 503 | A mutating request (`/reservation/*`) couldn't get the DB lock within `SCOOTER_DB_LOCK_TIMEOUT` (default 5 s), because another request held it. **Nothing was read or written**, so it's safe to retry; the response has `Retry-After: 1`. The record has a `db_lock: timeout` decision with `wait_ms`. A separate kind from `storage_error` because it's transient and retryable, and agents counting failures should see "contention" apart from "broken DB". |
-| `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable, or has the wrong shape: the top level must be a list of objects, each with a unique string `id`, finite-number `lat`/`lng` in range and a boolean `is_reserved`, plus a valid `reservation` consistent with `is_reserved` when that key is present (see Database schema; extra fields are allowed and kept). The msg names the cause without a path, e.g. `(FileNotFoundError)` or `(entry 3: lat is not a finite number)`. The **server log** line `storage error: … (db=<path>)` carries the path and the original exception's traceback. |
+| `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable, or has the wrong shape: the top level must be a list of objects, each with a unique string `id`, finite-number `lat`/`lng` in range and a boolean `is_reserved`, plus a valid `reservation` consistent with `is_reserved` when that key is present, and unique reservation ids and idempotency keys (see Database schema; extra fields are allowed and kept). Also: start/end on a scooter whose reservation is in a `payment_state` this server version doesn't handle (only that scooter is affected). The msg names the cause without a path, e.g. `(FileNotFoundError)` or `(entry 3: lat is not a finite number)`. The **server log** line `storage error: … (db=<path>)` carries the path and the original exception's traceback. |
 | `internal_error` | 500 | Anything else, i.e. a bug, including `abort(500)` and a write refused because the code produced an invalid DB state (`db_write.error: "InvalidDbState"`). The msg is generic; the **traceback is in the server log** (`unhandled exception`). Any other HTTP error raised by the framework (unreachable today) also gets this kind but keeps its own status. |
 
 - **How it's wired (Flask 3):** a handler for `StorageError`, one for `HTTPException`

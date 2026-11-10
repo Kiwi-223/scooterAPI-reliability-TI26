@@ -206,6 +206,14 @@ def _with(sid, **changes):
     return data
 
 
+def _with2(*changes):
+    """The seed, with changes to several entries: (id, {field: value}) pairs."""
+    data = seed()
+    for sid, fields in changes:
+        next(s for s in data if s["id"] == sid).update(fields)
+    return data
+
+
 def _res(**changes):
     reservation = dict(A_RESERVATION)
     for key, value in changes.items():
@@ -226,9 +234,9 @@ def _res(**changes):
     (_with("33", reservation=_res(idempotency_key=5)), "entry 4: reservation.idempotency_key is not a non-empty string"),
     (_with("33", reservation=_res(started_at=5)), "entry 4: reservation.started_at is int, not a string or null"),
     (_with("33", reservation=_res(start_request_id=[])), "entry 4: reservation.start_request_id is list, not a string or null"),
-    (_with("33", reservation=_res(payment_state="paid")), "entry 4: reservation.payment_state is not one of ['active']"),
-    (_with("33", reservation=_res(payment_state=None)), "entry 4: reservation.payment_state is not one of ['active']"),
-    (_with("33", reservation=_res(payment_state=["active"])), "entry 4: reservation.payment_state is not one of ['active']"),
+    (_with("33", reservation=_res(payment_state="")), "entry 4: reservation.payment_state is not a non-empty string"),
+    (_with("33", reservation=_res(payment_state=None)), "entry 4: reservation.payment_state is not a non-empty string"),
+    (_with("33", reservation=_res(payment_state=["active"])), "entry 4: reservation.payment_state is not a non-empty string"),
     (_with("33", reservation=_res(legacy="yes")), "entry 4: reservation.legacy is not a boolean"),
     (_with("15", lat=90.0001), "entry 0: lat is outside [-90, 90]"),
     (_with("15", lat=-91), "entry 0: lat is outside [-90, 90]"),
@@ -236,6 +244,14 @@ def _res(**changes):
     (_with("15", lng=-181), "entry 0: lng is outside [-180, 180]"),
     (seed() + [dict(seed()[1])], "entry 5: duplicate id (same as entry 1)"),
     (seed() + [dict(seed()[4], lat=1.0)], "entry 5: duplicate id (same as entry 4)"),
+    # reservation ids and idempotency keys are unique across scooters (one key, one ride)
+    (_with2(("18", dict(is_reserved=True, reservation=A_RESERVATION)), ("33", dict(reservation=A_RESERVATION))),
+     "entry 4: duplicate reservation.reservation_id (same as entry 1)"),
+    (_with2(("18", dict(is_reserved=True, reservation=A_RESERVATION)),
+            ("33", dict(reservation=_res(reservation_id="b" * 32)))),
+     "entry 4: duplicate reservation.idempotency_key (same as entry 1)"),
+    (_with("18", is_reserved=True, reservation=_res(reservation_id="legacy-33", idempotency_key="k")),
+     "entry 4: duplicate reservation.reservation_id (same as entry 1)"),   # vs 33's synthesised legacy id
 ])
 def test_invalid_db_is_storage_error_everywhere(client, db_path, data, why):
     write(db_path, data)
@@ -256,6 +272,9 @@ def test_invalid_db_is_storage_error_everywhere(client, db_path, data, why):
     _with("18", reservation=None),                              # mixed legacy/new entries
     _with("33", reservation=dict(LEGACY_33)),
     _with("33", reservation=dict(A_RESERVATION, gateway_ref="x")),   # unknown keys inside are kept
+    _with("33", reservation=_res(payment_state="payment_pending")),  # unknown state: loads (scoped below)
+    _with2(("18", dict(is_reserved=True, reservation=A_RESERVATION)),
+           ("33", dict(reservation=_res(reservation_id="b" * 32, idempotency_key="b" * 32)))),
 ])
 def test_valid_db_shapes_load(get_json, db_path, data):
     write(db_path, data)
@@ -281,3 +300,105 @@ def test_unknown_fields_round_trip_through_writes(client, db_path, read_db, get_
     assert db["33"]["reservation"] == dict(A_RESERVATION, gateway_ref="g-1")
     assert {k: v for k, v in db["9"].items() if k != "reservation"} == data[2]
     assert all(set(s) == PUBLIC_FIELDS for s in get_json("/view_all_available", 200))
+
+
+def test_a_write_that_would_duplicate_a_reservation_id_is_refused(client, monkeypatch, db_path, read_records):
+    # e.g. a bug that reuses another scooter's reservation: one key for two rides
+    monkeypatch.setattr(app_module, "new_reservation", lambda: {k: v for k, v in LEGACY_33.items() if k != "legacy"})
+    before = db_path.read_bytes()
+    assert_envelope(client.get("/reservation/start?id=18"), FailureKind.INTERNAL_ERROR)
+    assert db_path.read_bytes() == before
+    r = read_records()[-1]
+    assert r["db_write"]["error"] == "InvalidDbState"
+    assert [d["detail"]["error"] for d in r["decisions"] if d["step"] == "db_write"] == \
+        ["entry 4: duplicate reservation.reservation_id (same as entry 1)"]
+
+
+# ---- a payment state this code doesn't know (e.g. after a rollback past PLAN PR 13+) ----------
+
+PENDING = dict(A_RESERVATION, payment_state="payment_pending", gateway_ref="g-9")
+UNSUPPORTED_MSG = ("Error 500 - The reservation for scooter 33 is in a payment state this server version "
+                   "does not handle (reservation.payment_state is not one of ['active']).")
+
+
+@pytest.fixture
+def pending_db(db_path):
+    write(db_path, _with("33", reservation=PENDING))
+    return db_path
+
+
+def test_unknown_payment_state_scooter_reads_as_reserved(get_json, pending_db):
+    assert "33" not in [s["id"] for s in get_json("/view_all_available", 200)]
+    assert len(get_json("/view_all_available", 200)) == 4
+    assert get_json("/search?lat=24&lng=-28&radius=1000", 200) == []
+
+
+def test_other_scooters_keep_working_and_the_unknown_reservation_is_kept(client, pending_db, read_db):
+    assert client.get("/reservation/start?id=18").status_code == 200
+    assert client.get("/reservation/end?id=18&lat=1&lng=1").status_code == 200
+    assert read_db()["33"] == {"id": "33", "lat": 24.0, "lng": -28.0, "is_reserved": True, "reservation": PENDING}
+
+
+@pytest.mark.parametrize("url", ["/reservation/start?id=33", "/reservation/end?id=33&lat=1&lng=1"])
+def test_start_and_end_on_the_unknown_payment_state_scooter_are_refused(client, monkeypatch, pending_db, read_records, url):
+    calls = []
+    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: calls.append(cost) or {"status": True, "txn_id": 1})
+    before = pending_db.read_bytes()
+    body = assert_envelope(client.get(url), FailureKind.STORAGE_ERROR)
+    assert body["msg"] == UNSUPPORTED_MSG
+    assert calls == [] and pending_db.read_bytes() == before            # never charged, nothing written
+    r = read_records()[-1]
+    assert {"step": "reservation", "outcome": "unsupported",
+            "detail": {"reservation_id": "a" * 32, "payment_state": "payment_pending"}} in r["decisions"]
+    assert not any(d["step"] in ("payment", "reserve", "end") for d in r["decisions"])
+    assert r["db_write"]["attempted"] is False
+
+
+def test_the_write_guard_never_changes_an_unknown_payment_state_reservation(client, monkeypatch, pending_db, read_records):
+    monkeypatch.setattr(app_module, "refuse_unsupported_reservation", lambda scooter, path: None)  # planted bug
+    before = pending_db.read_bytes()
+    assert_envelope(client.get("/reservation/end?id=33&lat=1&lng=1"), FailureKind.INTERNAL_ERROR)
+    assert pending_db.read_bytes() == before
+    assert [d["detail"]["error"] for d in read_records()[-1]["decisions"] if d["step"] == "db_write"] == \
+        ["entry 4: a reservation in an unknown payment state was changed"]
+
+
+def test_the_write_guard_compares_against_what_was_read_not_the_live_object(client, monkeypatch, pending_db):
+    # A planted bug that "upgrades" the unknown state in place: the guard must compare with a
+    # copy taken at load time, or it would see nothing changed.
+    def upgrade_in_place(scooter, path):
+        scooter.reservation["payment_state"] = "active"
+    monkeypatch.setattr(app_module, "refuse_unsupported_reservation", upgrade_in_place)
+    before = pending_db.read_bytes()
+    assert_envelope(client.get("/reservation/end?id=33&lat=1&lng=1"), FailureKind.INTERNAL_ERROR)
+    assert pending_db.read_bytes() == before
+
+
+def test_the_write_guard_never_creates_an_unknown_payment_state(client, monkeypatch, db_path):
+    real = app_module.new_reservation
+    monkeypatch.setattr(app_module, "new_reservation", lambda: dict(real(), payment_state="made_up"))
+    before = db_path.read_bytes()
+    assert_envelope(client.get("/reservation/start?id=18"), FailureKind.INTERNAL_ERROR)
+    assert db_path.read_bytes() == before
+
+
+# ---- restoring a DB snapshot replays its reservations (input for PLAN PR 13) -----------------
+
+@pytest.mark.parametrize("sid", ["18", "33"])                       # a uuid reservation, and a legacy one
+def test_a_restored_reservation_is_charged_again_not_ridden_free(client, monkeypatch, db_path, read_records, sid):
+    # Restoring a snapshot (git restore, a backup) brings back every reservation in it, with
+    # the same reservation_id and idempotency_key. Today there's no ledger, so ending it again
+    # charges again. PLAN PR 13's ledger must keep that from becoming a free ride: a ledger
+    # hit only counts as "already charged" if it matches the ride; see PLAN row 13.
+    calls = []
+    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: calls.append(cost) or {"status": True, "txn_id": len(calls)})
+    if sid == "18":
+        client.get("/reservation/start?id=18")
+    snapshot = db_path.read_bytes()
+    assert client.get(f"/reservation/end?id={sid}&lat=1&lng=1").status_code == 200
+    db_path.write_bytes(snapshot)                                     # the restore
+    assert client.get(f"/reservation/end?id={sid}&lat=1&lng=1").status_code == 200
+    cleared = [d["detail"]["reservation_id"] for r in read_records() for d in r["decisions"]
+               if d["step"] == "reservation" and d["outcome"] == "cleared"]
+    assert len(cleared) == 2 and cleared[0] == cleared[1]             # the same key, twice
+    assert len(calls) == 2 and calls[0] == calls[1] > 0               # and the rider was charged both times
