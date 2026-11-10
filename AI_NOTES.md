@@ -749,3 +749,21 @@ strongest entries.
   attempt under test is seeded (any of the four faults is fine for it). The test was then
   run six times. Lesson: **a seed makes a draw reproducible only if every input to the
   draw is fixed**; list the inputs before calling a test deterministic.
+
+### 38. A new auto-approval created an unguarded, unsandboxed entry point
+- **Where:** PLAN PR 16 (PR #23), `.claude/settings.json` `enabledMcpjsonServers: ["scooter"]`.
+- **What the AI claimed:** the MCP server was safe to auto-approve: its read-only tools only
+  read data files, and its action tools ask.
+- **Reality:** the approval is by *name*. Whatever command `.mcp.json` names under
+  `scooter` runs outside the sandbox with no prompt in the next session, and `.mcp.json`
+  had no ask rule or `denyWrite` of its own in this repo's policy. Editing one JSON file
+  would have turned the approval into arbitrary unsandboxed execution. The server's own
+  imports (`app.py` and friends) are the same class of risk, now an open human decision
+  (H11). Separately, `run_tests` passed `PYTEST_ADDOPTS` and `PYTHONPATH` through, so the
+  validated argv could be widened from the environment.
+- **How it was caught:** the adversarial review of PR #23.
+- **What changed:** ask rules for edits to `.mcp.json` and `mcp_server.py`, `.mcp.json` in
+  the sandbox `denyWrite`, policy tests for both, `PYTEST_*`/`PYTHON*` stripped from
+  `run_tests`, and the residual risk documented. Lesson: **every new auto-approval needs
+  its source file guarded**: when you approve something by name, path or pattern, ask who
+  can change what that name points to, and guard that too.

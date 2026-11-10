@@ -249,11 +249,13 @@ def test_sandbox_fail_closed_and_no_bypass_mode():
 
 @pytest.mark.parametrize("rule", [
     "Edit(/.claude/**)", "Edit(/.github/**)", "Bash(dangerouslyDisableSandbox:true)",
+    "Edit(/.mcp.json)", "Edit(/mcp_server.py)",      # what the auto-approved MCP server runs (PR #23 review)
 ])
 def test_guardrail_edits_and_unsandboxed_retries_ask(rule):
     assert rule in PERM["ask"]
     assert rule not in PERM["allow"]
-    assert not any(r.startswith(("Edit(/.claude", "Edit(/.github")) for r in PERM["allow"])
+    assert not any(r.startswith(("Edit(/.claude", "Edit(/.github", "Edit(/.mcp", "Edit(/mcp_server")) for r in PERM["allow"])
+    assert not any(r in ("Edit", "Edit(*)", "Edit(/**)", "Write", "Write(*)") for r in PERM["allow"])
 
 
 @pytest.mark.parametrize("rule", [
@@ -306,3 +308,12 @@ def test_the_mcp_rules_name_tools_the_server_really_has():
     listed = anyio.run(names)
     named = {r.split("__", 2)[2] for k in ("allow", "ask") for r in _mcp_rules(k)}
     assert named == listed
+
+
+def test_mcp_json_is_write_denied_in_the_sandbox():
+    # PR #23 review: enabledMcpjsonServers approves the server by NAME, so whoever can rewrite
+    # .mcp.json picks the command that runs unsandboxed and unprompted next session. The
+    # sandbox already protects .mcp.json by default (a "protected path"); this makes it
+    # explicit, pinned and independent of the CLI version. Edits through Claude's file tools
+    # ask (test above).
+    assert SANDBOX["filesystem"] == {"denyWrite": ["./.mcp.json"]}

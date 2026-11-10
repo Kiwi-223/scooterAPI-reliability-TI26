@@ -69,6 +69,8 @@
       "Bash(git branch -D *)",
       "Edit(/.claude/**)",
       "Edit(/.github/**)",
+      "Edit(/.mcp.json)",
+      "Edit(/mcp_server.py)",
       "mcp__scooter__run_tests",
       "mcp__scooter__replay_fault",
       "mcp__scooter__reconcile_run"
@@ -185,6 +187,9 @@
         "json.schemastore.org"
       ],
       "allowLocalBinding": true
+    },
+    "filesystem": {
+      "denyWrite": ["./.mcp.json"]
     }
   }
 }

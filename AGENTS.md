@@ -1395,6 +1395,33 @@ a message saying what to fix); the server keeps running.
   every action tool an ask rule, and every rule names a real tool. `make check-settings`
   checks that `enabledMcpjsonServers` and every `mcp__…` rule name a server in `.mcp.json`,
   and that the server's command exists.
+- **Trust boundary (read this before approving anything).** The server is started by Claude
+  Code **outside the Bash sandbox**, from whatever `.mcp.json` says, and approved by
+  **name** (`enabledMcpjsonServers`). So:
+  - **`.mcp.json` and `mcp_server.py` are guarded** (PR #23 review): edits to either through
+    Claude's file tools **ask** (`Edit(/.mcp.json)`, `Edit(/mcp_server.py)`), and
+    `.mcp.json` is in the sandbox's `filesystem.denyWrite` (Claude Code also protects
+    `.mcp.json` by default; the explicit entry is pinned by a test). A sandboxed
+    `git checkout` / `git pull` that changes `.mcp.json` therefore fails with `unable to
+    unlink old`; approve the unsandboxed retry or run git yourself. `.mcp.json` rarely
+    changes, so that's acceptable. `mcp_server.py` is **not** in `denyWrite`, because every
+    branch that touches the server would hit the same failure; a sandboxed shell write to
+    it is only caught in review.
+  - **`run_tests` runs the working tree's test code** (`tests/*.py`, `conftest.py`) outside
+    the sandbox once approved, and the approval prompt shows only the arguments, not the
+    code. **Prefer `make test`** (it runs sandboxed), and approve `run_tests` only for tests
+    you've reviewed. It drops every `PYTEST_*` and `PYTHON*` variable (e.g.
+    `PYTEST_ADDOPTS`, `PYTHONPATH`) from pytest's environment, so the validated argument
+    list can't be widened from outside.
+  - **Residual risk, not fixed: the auto-approved read-only tools run working-tree code
+    too.** The server imports `app.py`, `records_query.py`, `reconcile.py`, `payments.py`,
+    `records.py` and `failures.py` when it starts, and `check_invariants` loads
+    `tests/invariants.py` on every call. An ordinary edit to one of them (no prompt, since
+    sandboxed edits to code are allowed) therefore runs **unsandboxed** on the next server
+    start or `check_invariants` call. Wrapping the server in an OS sandbox
+    (`sandbox-exec` / `bwrap`) is an open human decision, **H11** in PLAN.md. Until then:
+    restart the server (`/mcp`) only on code you've reviewed, and treat a working tree
+    with unreviewed changes to those files as untrusted for MCP use.
 - **`replay_fault` isolation.** It reads the record, the live DB and the live ledger, and
   writes only to a fresh temp directory (deleted afterwards): a DB that is the current
   one with that scooter put back as the record saw it (`scooter_before`), the key's
@@ -1544,10 +1571,11 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 | **Unsandboxed retry** (`dangerouslyDisableSandbox`) needs a human | ask rule `Bash(dangerouslyDisableSandbox:true)` | This prompt also appears in auto and bypass modes. Headless (`make agent`) can't answer it, so the retry is denied. |
 | **No bypass mode** | `permissions.disableBypassPermissionsMode: "disable"` | `--dangerously-skip-permissions` is rejected in this repo. |
 | **Allowed without a prompt** (escalation policy): pushes of the shape `git push [-u\|-q\|--set-upstream] origin stage-…`; `gh pr create/comment/edit/review`; `gh pr merge --squash`; `gh api` **reads**; edits to `Makefile`, `requirements*` and `scripts/**` | `allow` rules | Deny and ask rules below still win over these. Any other push shape (a bare `git push`, `git push origin HEAD`, other branch prefixes), other merge styles (`--merge`, `--rebase`) and `gh pr close` have no allow rule, so the session's permission mode decides (Manual prompts; auto mode asks the classifier, not a human). `git -C <path> …` has no allow rule either: it isn't excluded, so it runs **sandboxed** and the sandbox auto-approves it. |
-| **Asks first:** `gh api` writes (`-X`/`--method` anything, `-f`/`-F` incl. `--field`/`--raw-field`, `--input`), edits to `.claude/**` (an agent can't loosen its own boundaries) or `.github/**` (CI integrity), any unsandboxed retry, and `git -c`, `git reset --hard`, `git clean`, `git branch -D` | `ask` rules | Text match only. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('.github/x','w')"`. `.claude/settings*.json` is **also** write-protected by the sandbox, which is OS-enforced. |
+| **Asks first:** `gh api` writes (`-X`/`--method` anything, `-f`/`-F` incl. `--field`/`--raw-field`, `--input`), edits to `.claude/**` (an agent can't loosen its own boundaries), `.github/**` (CI integrity) or `.mcp.json` / `mcp_server.py` (what the unsandboxed MCP server runs), any unsandboxed retry, and `git -c`, `git reset --hard`, `git clean`, `git branch -D` | `ask` rules | Text match only. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('.github/x','w')"`. `.claude/settings*.json` is **also** write-protected by the sandbox, which is OS-enforced. |
 | **Denied (`git push`):** every dangerous flag in `git push -h` (git 2.54), matched anywhere in the command, including git's unique-prefix abbreviations: `--force`/`--force-with-lease`/`--force-if-includes` (`--for…`), `--mirror` (`--mi…`), `--all` (`--al…`), `--branches` (`--br…`), `--prune` (`--pru…`), `--delete` (`--de…`), `--receive-pack`/`--exec` (they run a program). Also any short-flag cluster in which `f` or `d` appears within its first three letters, mixed with `u q v n` (e.g. `-f`, `-uf`, `-qud`, `-fquv`; PLAN 6b), a `+` refspec, a `:branch` delete refspec, any `refs/…` refspec, **any mention of `master`**, and `git -C … push` | `deny` rules | Text match only, **defence in depth, bypassable.** Not caught: a plain `git push` / `git push origin HEAD` while `master` is checked out (no allow rule, so the mode decides); short-flag clusters where `f`/`d` first appears at the 4th letter or later (`-uqvf`) or that mix in `-4`/`-6` (`-4uf`); for those, the real control is branch protection (H2) plus PR review; quoted or escaped spellings, because the rules match the raw command text. The substring rules (`master`, `refs/`, long flags) still catch whole-token quotes such as `'HEAD:master'` or `"--mirror"`, but split quotes (`--mi"rror"`, `"mas"ter`) defeat them. The short-flag rules are defeated by **any** quoting or escaping of the flag (`'-f'`, `"-uf"`, `-"f"`, `-\f`), and by a tab instead of a space before it. Also not caught: aliases, scripts and `sh -c`. Side effect: a branch whose name contains `master` can't be pushed. |
 | **Denied (other):** `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `gh api` calls touching `*protection*` / `*rulesets*` or containing `DELETE` (any of `-X DELETE`, `-XDELETE`, `--method DELETE`, `--method=DELETE`), `gh auth *` (would print the token), `rm -rf` (common spellings) | `deny` rules | Text match only. A lowercase `-X delete` is still an API write, so it asks rather than being denied. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
 | **`master` can't be pushed or force-pushed, and merges need green CI** | GitHub branch protection: require PRs, require the `test` check, block force-push | **Not enabled.** It's a human decision (H2), and agents are denied the API calls that change it. With merges automated, this is **the** control on `master`. Turn it on before relying on autonomous merges. |
+| **The `scooter` MCP server** runs outside the sandbox, approved by name | ask rules on its action tools and on edits to `.mcp.json` / `mcp_server.py`; sandbox `denyWrite` on `.mcp.json` | The entry point is guarded, but the read-only tools (allowed) import working-tree modules, so an unprompted edit to `app.py` etc. runs unsandboxed on the next server start. **Open human decision H11** (see Agent tools (MCP), "Trust boundary"). |
 | **Spend and time caps** for headless runs | `make agent` → `scripts/agent.sh` | `--max-budget-usd` is a client-side estimate, so spend can pass it a little. The wall clock is enforced by the script's watchdog. Interactive sessions have no cap from this repo. |
 
 ### The specific bypasses, and whether they're closed
@@ -1571,6 +1599,12 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
     `git push` while `master` is checked out isn't pre-approved, but auto mode's classifier
     (not a human) decides it.
   - **The real fix is branch protection (H2).**
+- **Edit a module the MCP server imports, then let the server run it: open (H11).** Edits
+  to `app.py`, `records_query.py` and the rest are allowed and unprompted, and the
+  `scooter` server (unsandboxed) imports them on its next start. `.mcp.json` and
+  `mcp_server.py` edits ask, and `.mcp.json` is write-denied in the sandbox, so the
+  server's command can't be swapped silently; its imported code can. See Agent tools
+  (MCP), "Trust boundary".
 - **Edit the `Makefile`, then run `make`: allowed by policy, contained by the sandbox.**
   - Editing `Makefile`, `requirements*` and `scripts/**` is allowed, because later PRs
     need it routinely.
@@ -1587,7 +1621,7 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 | Rule | Commands |
 |---|---|
 | **Allow** (no prompt) | the 12 read-only `scooter` MCP tools (`mcp__scooter__…`); `make help/setup/test/run/lock/check-settings/clean`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); `git push [-u\|-q\|--set-upstream] origin stage-…`; `gh pr view/list/diff/checks/create/comment/edit/review`; `gh pr merge --squash`; `gh run list/view/watch`; `gh api` reads; edits to `Makefile`, `requirements*`, `scripts/**` |
-| **Ask** | everything in the "Asks first" row above, plus the `scooter` MCP tools `run_tests`, `replay_fault` and `reconcile_run` |
+| **Ask** | everything in the "Asks first" row above, plus the `scooter` MCP tools `run_tests`, `replay_fault` and `reconcile_run`, and edits to `.mcp.json` and `mcp_server.py` |
 | **Deny** | the "Denied" row above, plus the secret reads |
 
 With the sandbox on and `autoAllowBashIfSandboxed: true`, most other sandboxed commands run

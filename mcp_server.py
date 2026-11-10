@@ -297,6 +297,22 @@ TAIL_MAX, TIMEOUT_MAX = 400, 900
 NESTED = "SCOOTER_MCP_RUN_TESTS"
 
 
+# Variables that change what pytest or Python runs, so a validated argv can't be widened
+# from the environment: PYTEST_ADDOPTS adds options, PYTEST_PLUGINS loads plugins, and
+# PYTHONPATH / PYTHONSTARTUP / PYTHONHOME / PYTHONINSPECT / PYTHONBREAKPOINT etc. load or run
+# other code. Every PYTEST_* and PYTHON* variable is dropped (PR #23 review).
+SCRUBBED_ENV_PREFIXES = ("PYTEST_", "PYTHON", "_PYTEST")
+
+
+def child_env(environ=None):
+    """The environment run_tests gives pytest: the server's, minus everything that could
+    change what runs, plus the nesting marker."""
+    environ = os.environ if environ is None else environ
+    env = {k: v for k, v in environ.items() if not k.upper().startswith(SCRUBBED_ENV_PREFIXES)}
+    env.update({NESTED: "1", "PYTHONDONTWRITEBYTECODE": "1"})
+    return env
+
+
 def pytest_argv(paths=None, keyword=None, exitfirst=False):
     """The validated pytest command: only test files under tests/, an optional -k expression
     of plain words, and -x. No other option, no shell."""
@@ -319,14 +335,16 @@ def run_tests(paths: list[str] | None = None, keyword: str | None = None, exitfi
               timeout_s: int = 600, tail_lines: int = 60) -> dict[str, Any]:
     """Run the test suite (as `make test`), or a validated subset: test files under tests/
     (`tests/test_x.py` or `tests/test_x.py::test_name`), a -k keyword, -x. Returns the exit
-    code, the summary line and the last tail_lines lines. The tests never touch the live files."""
+    code, the summary line and the last tail_lines lines. The tests never touch the live files.
+    PYTEST_* and PYTHON* variables are dropped from the child's environment. NOTE: this runs
+    the working tree's test code (and conftest.py) outside the Bash sandbox; prefer `make
+    test` (sandboxed) and approve this only for tests you've reviewed."""
     if os.environ.get(NESTED):
         raise ToolError("run_tests is already running the tests (no nested runs)")
     if not 1 <= timeout_s <= TIMEOUT_MAX or not 1 <= tail_lines <= TAIL_MAX:
         raise ToolError(f"timeout_s must be 1..{TIMEOUT_MAX} and tail_lines 1..{TAIL_MAX}")
     argv = pytest_argv(paths, keyword, exitfirst)
-    env = dict(os.environ, **{NESTED: "1"})
-    proc = subprocess.Popen(argv, cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    proc = subprocess.Popen(argv, cwd=REPO, env=child_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, start_new_session=True)
     try:
         out, _ = proc.communicate(timeout=timeout_s)

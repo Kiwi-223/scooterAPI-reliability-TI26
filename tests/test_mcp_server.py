@@ -277,6 +277,22 @@ def test_run_tests_runs_a_subset_and_returns_a_bounded_tail(monkeypatch):
     assert len(out["tail"]) <= 3 and out["command"].startswith("-m pytest")
 
 
+def test_run_tests_ignores_pytest_and_python_variables(monkeypatch, tmp_path):
+    # PR #23 review: PYTEST_ADDOPTS="--co -q" would turn the run into a collection-only "pass"
+    evil = tmp_path / "evil"
+    evil.mkdir()
+    (evil / "sitecustomize.py").write_text("raise SystemExit('sitecustomize from PYTHONPATH ran')\n")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--co -q")
+    monkeypatch.setenv("PYTEST_PLUGINS", "no_such_plugin")
+    monkeypatch.setenv("PYTHONPATH", str(evil))
+    monkeypatch.setenv("PYTHONSTARTUP", str(evil / "sitecustomize.py"))
+    env = mcp_server.child_env()
+    assert not [k for k in env if k.startswith(("PYTEST_", "PYTHONPATH", "PYTHONSTARTUP"))]
+    assert env[mcp_server.NESTED] == "1" and env["SCOOTER_DB_PATH"] == os.environ["SCOOTER_DB_PATH"]
+    out = ok("run_tests", {"paths": ["tests/test_view_all.py"]})
+    assert out["passed"] is True and " passed" in out["summary"] and "collected" not in out["summary"]
+
+
 def test_run_tests_times_out_and_refuses_nesting(monkeypatch):
     monkeypatch.setattr(mcp_server, "pytest_argv", lambda *a: [sys.executable, "-c", "import time; time.sleep(60)"])
     started = time.monotonic()
