@@ -605,3 +605,44 @@ strongest entries.
   - AGENTS.md names "double charge" as the failure class.
   - Lesson: start from the failure class that matters most (here, charging a ride twice).
     Plant every way you can think of to cause it, not only the bugs someone else listed.
+
+### 31. A test sorted by request start time and called it "lock order"
+- **Where:** `tests/test_db_transactions.py::test_concurrent_cycles_across_processes`
+  (PLAN PR 11), the assertion "replay them in lock order".
+- **What the AI claimed:** sorting scooter 18's successful writes by `ts` replays them in lock
+  order, so the last one's `scooter_after` must equal the final DB.
+- **Reality:** `ts` is when a request *started*. Waiters poll the lock every 5 ms, so after a
+  release whichever waiter polls first wins, and a request that started later often gets
+  the lock first. The reviewer measured this: with the lock held, a start followed 20 ms
+  later by an end gave a start order different from the lock order in 17 of 30 trials. The
+  assertion flaked on CI in PR #18.
+- **How it was caught:** a CI failure on an unrelated PR. The writer diagnosed it from the
+  code without fixing it on the side, and the reviewer confirmed it experimentally.
+- **What changed (PLAN PR 11c):**
+  - The `db_lock` decision records `acquired_at`.
+  - The test and `make records ARGS="scooter <id>"` order by it.
+  - `test_lock_order_not_start_order_decides_what_is_on_disk` reproduces the difference
+    deterministically: a request that started first gets the lock second, and only lock
+    order explains the final DB.
+  - The fixed test passed 50 of 50 local runs.
+  - Lesson: a comment that names a property ("lock order") isn't evidence that the code
+    computes it. Order by the event you mean, and record it if it isn't recorded.
+
+### 32. The deterministic repro delayed the request outside the code whose timing it tested
+- **Where:** PR #19 (PLAN PR 11c), `test_lock_order_not_start_order_decides_what_is_on_disk`.
+- **What the AI claimed:** the new test pinned the fix. Lock order is recorded by
+  `acquired_at`, and ordering by it explains the final DB.
+- **Reality:** the test made request A late by wrapping `acquire_db_lock` and waiting
+  *before* calling it, so A never waited inside the real polling loop. The test therefore
+  couldn't tell where `acquired_at` was taken. The reviewer moved the timestamp to the start
+  of `acquire_db_lock`, before the wait, and all 155 relevant tests still passed. That
+  mutation brings the original flake back.
+- **How it was caught:** the reviewer's mutation of the timestamp's position.
+- **What changed:**
+  - A's process now makes every non-blocking `flock` attempt in `app` report "busy" until
+    the test says go, so A really polls inside `acquire_db_lock` (`wait_ms` ≥ 50).
+  - The test asserts that A's `acquired_at` is after B's, and after A's wait.
+  - The timestamp-before-the-wait mutation is now caught. The test passed 30 of 30 looped
+    runs.
+  - Lesson: a deterministic repro must put the delay where the real race happens, inside
+    the code under test, or it proves only the part downstream of the delay.

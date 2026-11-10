@@ -435,7 +435,11 @@ def acquire_db_lock(db_path, timeout):
 		try:
 			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 			waited_ms = round((time.monotonic() - started) * 1000, 3)
-			records.note('db_lock', 'acquired', lock_path=lock_path, wait_ms=waited_ms)
+			# acquired_at is when this request got the lock: the order in which mutating requests
+			# actually took effect. A record's ts is when the request *started*; waiters poll every
+			# _LOCK_POLL_SECONDS, so start order and lock order can differ (PLAN PR 11c).
+			acquired_at = datetime.datetime.now(datetime.UTC).isoformat(timespec='microseconds').replace('+00:00', 'Z')
+			records.note('db_lock', 'acquired', lock_path=lock_path, wait_ms=waited_ms, acquired_at=acquired_at)
 			return fd
 		except BlockingIOError:
 			waited = time.monotonic() - started

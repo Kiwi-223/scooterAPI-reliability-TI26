@@ -677,6 +677,13 @@ The JSON file DB is safe under threads, several gunicorn workers and separate pr
     written.
   - Every mutating request's record has a `db_lock` decision (`acquired`/`timeout`) with
     `wait_ms` and `lock_path`, so contention shows up in the records.
+  - **Lock order isn't start order.** Waiters poll the lock every 5 ms, so whichever
+    retries first after a release wins; a request that started later can get the lock
+    first. The `acquired` decision's `acquired_at` (UTC, microseconds, the same host's
+    clock) gives the order requests took effect. Sort by it, not by `ts`, when asking
+    "what was the last write". (PLAN PR 11c; a test sorted by `ts`, called it lock order,
+    and flaked. `test_lock_order_not_start_order_decides_what_is_on_disk` reproduces the
+    difference deterministically.)
 - **Known cost, kept on purpose:** `/reservation/end` calls the payment gateway while
   holding the lock (phase 1 → charge → phase 2), so a slow gateway delays every writer.
   PLAN PR 14 chose correctness over lock-hold time; see "Payment state machine" for why
@@ -748,7 +755,8 @@ the evidence to use when debugging. Read the records before reading code.
  "scooter_id": "18",
  "decisions": [
    {"step": "params", "outcome": "ok", "detail": {"lat": 23.01, "lng": 19.01}},
-   {"step": "db_lock", "outcome": "acquired", "detail": {"lock_path": "scooter_db.json.lock", "wait_ms": 0.042}},
+   {"step": "db_lock", "outcome": "acquired", "detail": {"lock_path": "scooter_db.json.lock", "wait_ms": 0.042,
+                                                        "acquired_at": "2026-11-10T01:39:40.482613Z"}},
    {"step": "db_read", "outcome": "ok", "detail": {"db_path": "scooter_db.json", "scooters": 5}},
    {"step": "lookup", "outcome": "found", "detail": {"id": "18"}},
    {"step": "end", "outcome": "allowed", "detail": {"reason": "scooter is reserved"}},
@@ -778,11 +786,11 @@ the evidence to use when debugging. Read the records before reading code.
 
 | Field | Meaning |
 |---|---|
-| `ts` | When the request started, UTC ISO-8601 with milliseconds and a `Z`. Plain string comparison sorts and filters by time. |
+| `ts` | When the request started, UTC ISO-8601 with milliseconds and a `Z`. Plain string comparison sorts and filters by time. **Not the order changes took effect:** requests wait for the DB lock by polling, so one that started later can get the lock first. For that order use the `db_lock` decision's `acquired_at` (below). |
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -801,7 +809,7 @@ it needs no MCP approval. The MCP server (PLAN PR 16) reuses the same functions.
 ```sh
 make records ARGS="failure-counts --since 1h"      # how many of each kind in the last hour
 make records ARGS="recent-failures --limit 20"     # newest failures first (--since works too)
-make records ARGS="scooter 18"                     # one scooter's history, oldest first by ts
+make records ARGS="scooter 18"                     # one scooter's history, in the order it took effect
 make records ARGS="request <request_id>"           # the full record(s) for an X-Request-ID
 make records ARGS="anomalies"                      # records whose fields contradict each other
 make records ARGS="ledger-check"                   # ledger vs records: double charges, died-mid-payment requests
@@ -933,7 +941,8 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     `git restore` of the DB and manual edits all break that chain legitimately, so it would
     mostly be noise. The per-record rules catch persistence bugs inside the request that
     caused them. For a manual continuity view, use `make records ARGS="scooter <id>"`,
-    which prints before/after for each request in `ts` order.
+    which prints before/after for each request in the order they took effect: by
+    `acquired_at` (lock order) where the record has one, else by `ts` (PLAN PR 11c).
 - **`ledger-check`** (exit 1 if it finds a problem) cross-checks the payments ledger against
   the records. Run it when a payment looks wrong, or after a crash, a deploy or a `kill -9`.
   It reports:
@@ -975,8 +984,10 @@ R=data/records.jsonl     # or "$SCOOTER_RECORDS_PATH"
 jq 'select(.request_id == "probe-42")' $R
 grep '"request_id": "probe-42"' $R                       # same, without jq
 
-# One scooter's history, oldest first. File order is completion order (several workers
-# can finish out of order), so sort by ts:
+# One scooter's history, roughly oldest first. File order is completion order (several
+# workers can finish out of order). Sorting by ts gives START order, which can differ from
+# the order changes took effect (lock order); `make records ARGS="scooter 18"` sorts by
+# the db_lock decision's acquired_at, so prefer it when order matters:
 jq -s -c 'map(select(.scooter_id == "18")) | sort_by(.ts)[] | {ts, path, status, kind: .error.kind,
        before: .scooter_before.is_reserved, after: .scooter_after.is_reserved}' $R
 
