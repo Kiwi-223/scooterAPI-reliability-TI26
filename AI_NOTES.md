@@ -646,3 +646,45 @@ strongest entries.
     runs.
   - Lesson: a deterministic repro must put the delay where the real race happens, inside
     the code under test, or it proves only the part downstream of the delay.
+
+### 33. A soak test assumed random faults would always leave stuck rides
+- **Where:** `tests/test_reconcile.py`, the extended soak (PLAN PR 15), while it was being
+  written.
+- **What the AI claimed:** after a 500-operation random-fault soak there would always be
+  `payment_pending` rides left for reconcile to settle. The test asserted it as a
+  precondition.
+- **Reality:** riders retry pending rides too, and which ride is still pending at the end
+  depends on how the processes interleave. On the second run the soak left none, so the
+  test failed its own precondition. A test that sometimes has nothing to prove would have
+  passed vacuously if the assertion had been weaker.
+- **How it was caught:** the test's precondition assertion failed on a rerun.
+- **What changed:** after the soak, the test deliberately leaves every free scooter with a
+  failed end (charged and uncharged timeouts, errors) before running reconcile under the
+  same random faults. Lesson: when a test's evidence depends on randomness producing a
+  situation, create the situation explicitly and assert it exists.
+
+### 34. Pattern: integrity checks keyed on a derived identifier miss bugs that change it
+- **Where:** three PRs, one mistake.
+  - PR #16: ride identity checked by the amount (AI_NOTES #27 and #28).
+  - PR #18: double charges checked per idempotency key, not per reservation (AI_NOTES #30).
+  - PR #20 (PLAN PR 15): invariant I1's "charged and also owes a balance" checked per
+    idempotency key.
+- **What the AI claimed, each time:** the check "covers" the property: one charge per
+  ride, no paid ride that also owes.
+- **Reality:** each check was keyed on a value **derived** from the business entity (the
+  rounded distance, the idempotency key) rather than on the entity itself (the ride or
+  reservation). A bug that changes the derived value escapes the check, and those are the
+  worst bugs.
+  - In PR #20 the reviewer planted "settle under a new key". Ride 18 ended both charged
+    (key K) and owing a `payment_unresolved` balance (key K-r).
+  - The invariants said nothing, and `anomalies` showed only the indirect hint
+    `payment_key_mismatch`.
+- **How it was caught:** adversarial planted bugs that change the identifier, three times
+  by the same reviewer.
+- **What changed:**
+  - I1's charge-plus-balance check is keyed on `reservation_id`.
+  - A new `charged_and_owed` anomaly works across records and keys.
+  - The bug is planted as R1.
+  - Lesson (the pattern): **key every "same thing?" or "at most one?" check on business
+    identity (the reservation or ride), never on a value derived from it**. Then plant a
+    bug that changes the derived value, to prove the check still fires.

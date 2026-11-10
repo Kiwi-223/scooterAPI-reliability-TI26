@@ -435,6 +435,15 @@ def test_the_invariant_checker_catches_each_violation(db, ledger, keys, expected
     assert expected in [v[0] for v in violations(db, ledger, keys)]
 
 
+def test_the_invariant_checker_catches_charged_and_owed_under_different_keys():
+    # PR #20 review: charged under key k, balance recorded under k-r, same reservation k
+    ledger = [dict(_charge("k"), reservation_id="k")]
+    db = [_entry(balances=[{"idempotency_key": "k-r", "reservation_id": "k", "amount": 10}])]
+    found = [v[0] for v in violations(db, ledger, {"k"})]
+    assert "I1 a reservation was charged and also owes a balance" in found
+    assert "I1 charged, and also recorded as an outstanding balance" not in found      # the per-key check misses it
+
+
 def test_the_invariant_checker_catches_a_double_charge_across_keys():
     # PR #18's review: each attempt charged under its own key (k-0, k-1) for reservation k.
     ledger = [dict(_charge("k-0", "t1"), reservation_id="k"), dict(_charge("k-1", "t2"), reservation_id="k")]

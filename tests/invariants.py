@@ -88,6 +88,12 @@ def violations(db, ledger, keys, amounts=None):
             found.append(("I1 charged, but the ride is active (not ended, not pending)", key, None))
         if key in balances:
             found.append(("I1 charged, and also recorded as an outstanding balance", key, None))
+    # the same per RESERVATION (business identity), whatever keys the charge and the balance
+    # were made under (PR #20 review: a key switch hid "charged and owes" from the per-key check)
+    owed_reservations = {b.get("reservation_id") for owed in balances.values() for b in owed}
+    for reservation_id in by_reservation:
+        if reservation_id in owed_reservations:
+            found.append(("I1 a reservation was charged and also owes a balance", reservation_id, None))
     for entry in ledger:
         key = entry["idempotency_key"]
         if amounts and key in amounts and entry.get("charged") and entry.get("amount") not in amounts[key]:

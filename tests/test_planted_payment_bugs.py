@@ -36,6 +36,11 @@ for step in json.loads(sys.argv[2]):
         shutil.copyfile(db, db + ".snap")
     elif step[0] == "restore":
         shutil.copyfile(db + ".snap", db)
+    elif step[0] == "reconcile":                 # ["reconcile", fault, max_attempts]
+        import reconcile
+        os.environ["PAYMENT_FAULT"] = step[1]
+        reconcile.run(max_attempts=step[2])
+        os.environ["PAYMENT_FAULT"] = "none"
 print(json.dumps(statuses))
 """
 
@@ -86,12 +91,12 @@ BUGS = [
 ]
 
 
-def _run(tmp_path, app_source, steps, db_path, records_path):
+def _run(tmp_path, app_source, steps, db_path, records_path, planted_file="app.py"):
     planted = tmp_path / "app_copy"
     planted.mkdir(exist_ok=True)
-    (planted / "app.py").write_text(app_source)
-    for name in ("records.py", "failures.py", "payments.py"):
+    for name in ("app.py", "records.py", "failures.py", "payments.py", "reconcile.py"):
         (planted / name).write_text((REPO / name).read_text())
+    (planted / planted_file).write_text(app_source)
     env = dict(os.environ, ENABLE_FAULT_INJECTION="1", PAYMENT_TIMEOUT_DELAY_MS="0", PYTHONDONTWRITEBYTECODE="1")
     out = subprocess.run([sys.executable, "-c", _SCENARIO, str(planted), json.dumps(steps)], env=env,
                          capture_output=True, text=True, timeout=120)
@@ -117,4 +122,38 @@ def test_anomalies_name_each_planted_payment_bug(tmp_path, db_path, records_path
 @pytest.mark.parametrize("steps", sorted({json.dumps(b[4]) for b in BUGS}))
 def test_the_same_scenarios_are_clean_on_the_real_app(tmp_path, db_path, records_path, capsys, steps):
     _run(tmp_path, (REPO / "app.py").read_text(), json.loads(steps), db_path, records_path)
+    assert _cli_anomalies(records_path, capsys) == (0, [])
+
+
+# ---- planted in reconcile.py (PR #20 review): bugs only the suite saw ---------------------------
+
+RECONCILE_BUGS = [
+    ("R1", "settle_charged pays under a new key: the ride ends charged AND owing a balance",
+     "        payment = app_module.pay(scooter)\n",
+     "        reservation['idempotency_key'] = reservation['idempotency_key'] + '-r'\n"
+     "        payment = app_module.pay(scooter)\n",
+     [["start", "18"], ["end", "18", 1, 1, "timeout_charged"],
+      ["reconcile", "error", 3], ["reconcile", "error", 3], ["reconcile", "error", 3]],
+     "charged_and_owed"),
+    ("R2", "a restored ride is settled at the scooter's current position, not the ledger's",
+     '"end_lat": decision["end_lat"],\n                                "end_lng": decision["end_lng"],',
+     '"end_lat": scooter.lat,\n                                "end_lng": scooter.lng,',
+     [["start", "18"], ["snapshot"], ["end", "18", 3, 3, "none"], ["restore"], ["reconcile", "none", 3]],
+     "end_location_not_persisted"),
+]
+
+
+@pytest.mark.parametrize("bug,what,old,new,steps,rule", RECONCILE_BUGS, ids=[b[0] for b in RECONCILE_BUGS])
+def test_anomalies_name_each_planted_reconcile_bug(tmp_path, db_path, records_path, capsys, bug, what, old, new, steps, rule):
+    source = (REPO / "reconcile.py").read_text()
+    assert source.count(old) == 1, f"{bug}: reconcile.py changed shape; update this test"
+    _run(tmp_path, source.replace(old, new), steps, db_path, records_path, planted_file="reconcile.py")
+    code, types = _cli_anomalies(records_path, capsys)
+    assert code == 1 and rule in types, (bug, what, types)
+
+
+@pytest.mark.parametrize("steps", [json.dumps(b[4]) for b in RECONCILE_BUGS])
+def test_the_reconcile_scenarios_are_clean_on_the_real_code(tmp_path, db_path, records_path, capsys, steps):
+    _run(tmp_path, (REPO / "reconcile.py").read_text(), json.loads(steps), db_path, records_path,
+         planted_file="reconcile.py")
     assert _cli_anomalies(records_path, capsys) == (0, [])
