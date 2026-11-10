@@ -646,3 +646,19 @@ strongest entries.
     runs.
   - Lesson: a deterministic repro must put the delay where the real race happens, inside
     the code under test, or it proves only the part downstream of the delay.
+
+### 33. A soak test assumed random faults would always leave stuck rides
+- **Where:** `tests/test_reconcile.py`, the extended soak (PLAN PR 15), while it was being
+  written.
+- **What the AI claimed:** after a 500-operation random-fault soak there would always be
+  `payment_pending` rides left for reconcile to settle. The test asserted it as a
+  precondition.
+- **Reality:** riders retry pending rides too, and which ride is still pending at the end
+  depends on how the processes interleave. On the second run the soak left none, so the
+  test failed its own precondition. A test that sometimes has nothing to prove would have
+  passed vacuously if the assertion had been weaker.
+- **How it was caught:** the test's precondition assertion failed on a rerun.
+- **What changed:** after the soak, the test deliberately leaves every free scooter with a
+  failed end (charged and uncharged timeouts, errors) before running reconcile under the
+  same random faults. Lesson: when a test's evidence depends on randomness producing a
+  situation, create the situation explicitly and assert it exists.

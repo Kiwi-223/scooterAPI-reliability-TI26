@@ -348,9 +348,10 @@ def abandon_payment(scooter):
 	records.note('reservation', 'payment_abandoned', reservation_id=scooter.reservation['reservation_id'],
 		reason='the ledger has a charge for a different ride under this key')
 
-def record_outstanding_balance(scooter):
-	# H3: a definitive decline ends the ride without a charge; the debt is recorded in the DB,
-	# in the same atomic write that ends the ride (AGENTS.md "Database schema").
+def record_outstanding_balance(scooter, reason='payment_declined'):
+	# H3: a definitive decline (or, from reconcile, a payment still unresolved after the
+	# terminal rule's N attempts / T minutes: reason 'payment_unresolved') ends the ride without
+	# a charge; the debt is recorded in the DB, in the same atomic write that ends the ride.
 	reservation = scooter.reservation
 	balance = {	'reservation_id': reservation['reservation_id'],
 				'idempotency_key': reservation['idempotency_key'],
@@ -358,10 +359,10 @@ def record_outstanding_balance(scooter):
 				'end_lat': reservation['end_lat'],
 				'end_lng': reservation['end_lng'],
 				'ended_at': utc_now_iso(),
-				'reason': 'payment_declined'
+				'reason': reason
 			  }
 	scooter.outstanding_balances = (scooter.outstanding_balances or []) + [balance]
-	records.note('balance', 'recorded', reservation_id=balance['reservation_id'], amount=balance['amount'])
+	records.note('balance', 'recorded', reservation_id=balance['reservation_id'], amount=balance['amount'], reason=reason)
 
 def finish_ride(scooter):
 	# payment_pending -> free: close the reservation and leave the scooter where the ride

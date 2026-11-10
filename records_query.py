@@ -241,6 +241,12 @@ def anomalies(records, since=None):
       key (or reservation) other than the reservation's own (scooter_before)
     - double_charge: a second charge (a different ledger txn) for a reservation that a
       record already shows charged, i.e. one ride paid twice. Checked across records.
+    - scooter_double_charge: two charges on one scooter between a successful start and the
+      scooter becoming free, under any reservation or key (PLAN PR 15). Checked across
+      records, in the order they took effect.
+    - reconcile_not_settled: a /reconcile record (PLAN PR 15) says it ended the ride (status
+      200, an action other than none) but scooter_after is still reserved; or it ended it
+      unpaid without an outstanding balance for that reservation.
 
     decline_not_settled also requires the balance's amount to equal the amount charged for
     (the `payment: requested` cost) and its idempotency_key to be the reservation's.
@@ -257,6 +263,7 @@ def anomalies(records, since=None):
     pending_by_key = {}     # idempotency key -> {(location, amount)} fixed by phase 1
     retries = []            # (key, values, flag) checked against pending_by_key at the end
     charged_by_reservation = {}   # reservation_id -> the first txn a record shows charged for it
+    scooter_events = []           # (effect time, scooter, started, charged, freed, record, in window)
     for r in records:
         decisions = [d for d in r.get("decisions") or [] if isinstance(d, dict)]
         pending_at, pending = _decision(decisions, "payment", "pending")
@@ -279,6 +286,14 @@ def anomalies(records, since=None):
             if first != txn:
                 double = {"reservation_id": charged_rid, "earlier_txn_id": first, "this_txn_id": txn,
                           "charged_under": paid_detail.get("idempotency_key")}
+        after_early = r.get("scooter_after")
+        if r.get("scooter_id") is not None:
+            started = r.get("path") == "/reservation/start" and r.get("status") == 200
+            freed = isinstance(after_early, dict) and after_early.get("is_reserved") is False and \
+                (r.get("scooter_before") or {}).get("is_reserved") is True
+            if started or freed or simulator.get("charged") is True:
+                scooter_events.append((_effect_key(r), r.get("scooter_id"), started, simulator.get("charged") is True,
+                                       freed, r, in_window(r, since)))
         if not in_window(r, since):
             continue
         db_write = r.get("db_write") or {}
@@ -351,6 +366,17 @@ def anomalies(records, since=None):
         if kind in ("payment_timeout", "payment_failed") and isinstance(after, dict) and "reservation" in after:
             if (after.get("reservation") or {}).get("payment_state") != "payment_pending":
                 flag("failed_payment_not_pending", {"scooter_after": after})
+        if path == "/reconcile":
+            _, rc = _decision(decisions, "reconcile", "end_unpaid")
+            acted = [d for d in decisions if d.get("step") == "reconcile" and d.get("outcome") not in ("none", "report", "skipped")]
+            if status == 200 and acted and isinstance(after, dict) and after.get("is_reserved") is not False:
+                flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after})
+            elif rc is not None and isinstance(after, dict):
+                rid = before_res.get("reservation_id")
+                if not any(isinstance(b, dict) and b.get("reservation_id") == rid and b.get("reason") == "payment_unresolved"
+                           for b in after.get("outstanding_balances") or []):
+                    flag("reconcile_not_settled", {"reconcile": rc, "scooter_after": after,
+                                                   "problem": "ended unpaid without an outstanding balance"})
         if isinstance(after, dict) and "reservation" in after:
             reservation = after["reservation"]
             if (after.get("is_reserved") is True) != (reservation is not None):
@@ -358,6 +384,16 @@ def anomalies(records, since=None):
             if path == "/reservation/start" and status == 200 and (
                     not isinstance(reservation, dict) or reservation.get("start_request_id") != r.get("request_id")):
                 flag("start_reservation_not_persisted", {"scooter_after": after})
+    charges_since_start = {}
+    for _, scooter, started, charged, freed, r, in_win in sorted(scooter_events, key=lambda e: e[0]):
+        if started:
+            charges_since_start[scooter] = 0
+        if charged:
+            charges_since_start[scooter] = charges_since_start.get(scooter, 0) + 1
+            if charges_since_start[scooter] > 1 and in_win:
+                found.append(_finding(r, "scooter_double_charge", {"charges_since_start": charges_since_start[scooter]}))
+        if freed:
+            charges_since_start[scooter] = 0
     for key, charged, r in retries:
         known = pending_by_key.get(key)
         if known and charged not in known:
