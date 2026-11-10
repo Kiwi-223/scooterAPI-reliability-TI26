@@ -10,6 +10,11 @@
 - `records_path` (autouse): points SCOOTER_RECORDS_PATH at <tmp_path>/records.jsonl.
 - `read_records`: returns the test's request records as a list of dicts (one per line).
 - `_guard_real_records` (autouse): fails the test if the live data/records.jsonl changes.
+- `ledger_path` (autouse): points SCOOTER_PAYMENTS_LEDGER_PATH at <tmp_path>/payments_ledger.jsonl
+  and clears every PAYMENT_* / ENABLE_FAULT_INJECTION variable, so the gateway starts empty
+  with no faults whatever the developer's shell exports.
+- `read_ledger`: returns the test's ledger entries as a list of dicts.
+- `_guard_real_ledger` (autouse): fails the test if the live data/payments_ledger.jsonl changes.
 """
 import hashlib
 import json
@@ -21,6 +26,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REAL_DB = REPO_ROOT / "scooter_db.json"
 REAL_RECORDS = REPO_ROOT / "data" / "records.jsonl"
+REAL_LEDGER = REPO_ROOT / "data" / "payments_ledger.jsonl"
+PAYMENT_ENV = ("PAYMENT_FAULT", "PAYMENT_SEED", "PAYMENT_FAULT_RATE", "PAYMENT_TIMEOUT_DELAY_MS",
+               "ENABLE_FAULT_INJECTION")
 SEED_DB = Path(__file__).resolve().parent / "seed_db.json"
 
 
@@ -47,6 +55,34 @@ def _guard_real_records():
         f"{REAL_RECORDS} changed during this test: tests must only write to the temp "
         "records file (the autouse `records_path` fixture sets SCOOTER_RECORDS_PATH)."
     )
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_ledger():
+    before = _fingerprint(REAL_LEDGER)
+    yield
+    assert _fingerprint(REAL_LEDGER) == before, (
+        f"{REAL_LEDGER} changed during this test: tests must only use the temp ledger "
+        "(the autouse `ledger_path` fixture sets SCOOTER_PAYMENTS_LEDGER_PATH)."
+    )
+
+
+@pytest.fixture(autouse=True)
+def ledger_path(tmp_path, monkeypatch):
+    path = tmp_path / "payments_ledger.jsonl"
+    monkeypatch.setenv("SCOOTER_PAYMENTS_LEDGER_PATH", str(path))
+    for name in PAYMENT_ENV:
+        monkeypatch.delenv(name, raising=False)
+    return path
+
+
+@pytest.fixture
+def read_ledger(ledger_path):
+    def _read():
+        if not ledger_path.exists():
+            return []
+        return [json.loads(line) for line in ledger_path.read_text().split("\n") if line]
+    return _read
 
 
 @pytest.fixture(autouse=True)

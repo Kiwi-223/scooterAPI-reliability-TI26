@@ -182,16 +182,24 @@ def test_end_success_records_payment_and_move(client, read_records):
     cleared = [d for d in r["decisions"] if d["step"] == "reservation"][0]
     assert cleared["detail"] == {"reservation_id": r["scooter_before"]["reservation"]["reservation_id"], "legacy": False}
     payment = [d for d in r["decisions"] if d["step"] == "payment"]
+    key = r["scooter_before"]["reservation"]["idempotency_key"]
     assert payment[0]["detail"]["cost"] == payment[0]["detail"]["distance_m"] > 0
-    assert payment[1]["detail"]["txn_id"] == 379892831
+    assert payment[0]["detail"]["idempotency_key"] == key
+    detail = payment[1]["detail"]
+    assert re.fullmatch(r"[0-9a-f]{32}", detail["txn_id"])
+    assert detail == {"gateway_outcome": "success", "txn_id": detail["txn_id"], "attempt": 1,
+                      "fault": {"source": "env", "mode": "none"},
+                      "simulator": {"charged": True, "ledger_txn_id": detail["txn_id"]}}
 
 
 def test_end_payment_failed_records_ride_left_open(client, monkeypatch, read_records):
-    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: {"status": False})
     client.get("/reservation/start?id=18")
+    monkeypatch.setenv("PAYMENT_FAULT", "error")
     client.get("/reservation/end?id=18&lat=1&lng=1")
     r = read_records()[-1]
     assert ("payment", "failed") in steps(r)
+    failed = [d["detail"] for d in r["decisions"] if d["step"] == "payment"][-1]
+    assert (failed["gateway_outcome"], failed["txn_id"], failed["fault"]) == ("error", None, {"source": "env", "mode": "error"})
     assert r["scooter_before"] == r["scooter_after"] == reserved_18(r["scooter_before"])
     assert r["db_write"]["attempted"] is False
     assert r["error"]["kind"] == "payment_failed" and r["status"] == 502

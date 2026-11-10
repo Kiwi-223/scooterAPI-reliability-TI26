@@ -12,7 +12,7 @@ PIP_COMPILE := CUSTOM_COMPILE_COMMAND="make lock" $(BIN)/pip-compile --quiet \
 	--allow-unsafe --generate-hashes --strip-extras
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run test check-settings records lock agent clean
+.PHONY: help setup run test check-settings records payments lock agent clean
 
 help: ## List available targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*## ' $(MAKEFILE_LIST) | \
@@ -39,6 +39,9 @@ check-settings: $(STAMP) ## Validate .claude/settings.json against the vendored 
 
 records: $(STAMP) ## Query request records: make records ARGS="failure-counts --since 1h" (see AGENTS.md)
 	@$(BIN)/python -m records_query $(ARGS)
+
+payments: $(STAMP) ## Inspect the payment gateway: make payments ARGS="lookup <key>" or ARGS="draw --seed S --key K --attempt N"
+	@$(BIN)/python -m payments $(ARGS)
 
 # TASK, BUDGET_USD, MAX_TURNS, TIMEOUT_MIN, WORKTREE and DRY_RUN given on the make command line reach
 # the script through the environment, so the task text needs no extra quoting here.

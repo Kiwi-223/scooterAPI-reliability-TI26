@@ -41,11 +41,22 @@ class FailureKind(StrEnum):
     NO_ACTIVE_RESERVATION = ("no_active_reservation", HTTPStatus.UNPROCESSABLE_ENTITY,
                              "End was requested for a scooter that is not reserved.")
 
-    # ---- payment ---------------------------------------------------------------------
-    # The gateway reported a failure. The ride is NOT ended and the scooter stays reserved
-    # (today's behaviour). PLAN PRs 13/14 add finer kinds (decline, timeout, gateway error).
+    # ---- payment (H7) ------------------------------------------------------------------
+    # Every payment failure leaves the ride open: the reservation is NOT ended and the
+    # scooter stays reserved. PLAN PR 14 changes what a decline/timeout/error does to the
+    # ride (payment_pending, H3's outstanding balance); the kinds stay.
+    # Since PLAN PR 13 payment_failed means "the gateway reported an error" (outcome `error`,
+    # or a ledger it can't read). Its id and status are unchanged.
     PAYMENT_FAILED = ("payment_failed", HTTPStatus.BAD_GATEWAY,
-                      "The payment gateway reported a failure; the reservation was not ended.")
+                      "The payment gateway reported an error; the reservation was not ended.")
+    PAYMENT_DECLINED = ("payment_declined", HTTPStatus.UNPROCESSABLE_ENTITY,
+                        "The payment was declined; the reservation was not ended (PLAN PR 14 applies H3).")
+    PAYMENT_TIMEOUT = ("payment_timeout", HTTPStatus.GATEWAY_TIMEOUT,
+                       "The payment gateway timed out; the rider may or may not have been charged. "
+                       "The reservation was not ended; a retry is charged at most once.")
+    PAYMENT_CONFLICT = ("payment_conflict", HTTPStatus.CONFLICT,
+                        "The reservation's idempotency key already has a charge for a different ride "
+                        "(scooter, reservation or amount); nothing was charged and the reservation was not ended.")
 
     # ---- framework / infrastructure ----------------------------------------------------
     ROUTE_NOT_FOUND = ("route_not_found", HTTPStatus.NOT_FOUND,

@@ -223,6 +223,17 @@ def _summary(record):
             f"id={record.get('request_id')} scooter={record.get('scooter_id')}")
 
 
+def _payment(record):
+    """The last payment result in a record: the gateway's outcome (PLAN PR 13+), or the older
+    records' ok/failed, or None if the request didn't pay."""
+    paid = [d for d in record.get("decisions") or [] if isinstance(d, dict) and d.get("step") == "payment"
+            and d.get("outcome") in ("ok", "failed")]
+    if not paid:
+        return None
+    detail = paid[-1].get("detail") or {}
+    return detail.get("gateway_outcome") or paid[-1].get("outcome")
+
+
 def _state(s):
     if not isinstance(s, dict):
         return "-"
@@ -242,8 +253,10 @@ def _print_human(command, result, args):
     elif command == "scooter":
         print(f"scooter {args.scooter_id}: {len(result)} record(s), oldest first")
         for r in result:
+            payment = _payment(r)
             print(f"  {_summary(r)}\n      before={_state(r.get('scooter_before'))} "
-                  f"after={_state(r.get('scooter_after'))} in_memory={_state(r.get('scooter_in_memory'))}")
+                  f"after={_state(r.get('scooter_after'))} in_memory={_state(r.get('scooter_in_memory'))}"
+                  + (f" payment={payment}" if payment else ""))
     elif command == "request":
         for record in result:
             print(json.dumps(record, indent=2, ensure_ascii=False))
