@@ -688,3 +688,26 @@ strongest entries.
   - Lesson (the pattern): **key every "same thing?" or "at most one?" check on business
     identity (the reservation or ride), never on a value derived from it**. Then plant a
     bug that changes the derived value, to prove the check still fires.
+
+### 35. "A charge always wins" held per timeline, not across a restore's replays
+- **Where:** PLAN PR 15 (`reconcile.py`'s terminal rule) and PR 13's gateway; fixed in PLAN PR 15b.
+- **What the AI claimed:** a ride is never both charged and owing: the ledger is read under
+  the DB lock before any balance is recorded, so "a charge always wins".
+- **Reality:** that holds inside one timeline. A DB restore replays a reservation with its
+  idempotency key. A ride that was **declined** (ended with a balance), then restored and
+  ended again, was **charged** by the gateway, which only remembered charges per key. A
+  later restore of a snapshot taken after the decline brought the balance back: one
+  reservation charged **and** owing. `anomalies`' `charged_and_owed` saw it in the records,
+  but couldn't say whether the DB still held the balance.
+- **How it was caught:** review of PR #20's follow-ups: the "at most one outcome per
+  reservation" rule was argued for a single timeline only.
+- **What changed:**
+  - The gateway replays a decline (a conflict for another ride), so a replay is never charged.
+  - Reconcile's `clear_paid_balance` marks a paid balance settled (kept for the audit trail).
+  - `charged_and_owed` says `still_in_db` / `resolved`.
+  - Tests build both variants (balance still in the DB, and wiped) with the pre-15b gateway,
+    plus seeded restore-heavy random histories that must end clean after reconcile.
+  - Lesson: **restores replay identities, so check every "at most one" rule across replays,
+    not only within a timeline.** For each identity a restore can bring back (reservation,
+    key), ask what happens when its *earlier* outcome (decline, charge, balance) meets a
+    *new* attempt.

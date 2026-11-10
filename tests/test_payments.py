@@ -116,6 +116,24 @@ def test_a_ledger_hit_for_another_ride_is_a_conflict_never_a_charge(change):
     assert [e["charged"] for e in payments.lookup("k1")] == [True, False, False]
 
 
+def test_a_declined_key_replays_the_decline_never_a_charge(monkeypatch):
+    # PLAN PR 15b: a decline is definitive. Only a DB restore can ask again for a declined
+    # ride; charging it then would leave the ride both charged and owing.
+    ride = {"idempotency_key": "k1", "scooter_id": "18", "reservation_id": "r1", "amount": 100,
+            "end_lat": 1.5, "end_lng": 2.0}
+    monkeypatch.setenv("PAYMENT_FAULT", "decline")
+    assert payments.charge(**ride).outcome == "decline"
+    monkeypatch.setenv("PAYMENT_FAULT", "none")
+    again = payments.charge(**ride, override="none")                   # even a header can't change it
+    assert (again.outcome, again.charged, again.fault) == ("decline", False, {"source": "ledger", "replayed": "decline"})
+    assert again.detail["existing_decline"]["attempt"] == 1
+    elsewhere = payments.charge(**dict(ride, end_lat=1.0))
+    assert (elsewhere.outcome, elsewhere.charged) == ("conflict", False)
+    assert not any(e["charged"] for e in payments.lookup("k1"))
+    monkeypatch.setattr(payments, "REPLAY_DECLINES", False)          # the gateway before PR 15b
+    assert payments.charge(**ride).charged is True
+
+
 def test_a_retry_from_elsewhere_after_a_charged_timeout_settles_at_the_stored_location(client, monkeypatch, read_db, read_ledger):
     # PLAN PR 14: the first attempt fixed the end location and amount; a retry from another
     # spot (GPS jitter) is the same ride, not a conflict.

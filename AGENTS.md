@@ -138,13 +138,14 @@ same command (see CI below).
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
     `test_failure_kinds.py`, `test_records.py`, `test_records_query.py`, `test_db_transactions.py`,
     `test_reservation_state.py`, `test_payments.py`, `test_end_ride.py`, `test_planted_payment_bugs.py`,
-    `test_reconcile.py`,
+    `test_reconcile.py`, `test_restore_replay.py`,
     `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
   - `tests/invariants.py` checks the end-ride invariants against the DB, the ledger and the
     records (see "Payment state machine"). `test_end_ride.py` runs it after every fault ×
-    scenario and after a seeded random soak.
+    scenario and after a seeded random soak. `.venv/bin/python tests/invariants.py` runs it
+    read-only on the live files (see Reconcile, runbook step 5).
 - **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
   each test's `tmp_path` and points `SCOOTER_DB_PATH` at that copy with
   `monkeypatch.setenv`. Every test therefore starts from the same data, whatever state the
@@ -294,7 +295,7 @@ every pull request and on every push to `master`.
 | `reservation.end_lat`, `end_lng`, `distance_m`, `amount` | numbers | **Only while `payment_pending`** (and then required): where the ride ends and what it costs, fixed by the **first** end request. Retries and reconcile reuse them. |
 | `reservation.payment_requested_at`, `payment_request_id` | string or `null` | Only while `payment_pending`: when, and by which request (`X-Request-ID`), payment started. |
 | `reservation.payment_attempts`, `last_payment_outcome` | int ≥ 0, string or `null` | Only while `payment_pending`: failed gateway attempts so far, and the last one's outcome (reconcile's "3 attempts or 15 minutes" rule, H3). |
-| `outstanding_balances` | list, optional | H3 debts: one entry per ride that ended **without being paid**: `reservation_id`, `idempotency_key`, `amount`, `end_lat`, `end_lng`, `ended_at`, `reason` (`payment_declined` for a decline, `payment_unresolved` when reconcile's terminal rule ended it). Written in the same atomic write that ends the ride. Absent until the first decline on that scooter. Not shown by `/view_all_available`. |
+| `outstanding_balances` | list, optional | H3 debts: one entry per ride that ended **without being paid**: `reservation_id`, `idempotency_key`, `amount`, `end_lat`, `end_lng`, `ended_at`, `reason` (`payment_declined` for a decline, `payment_unresolved` when reconcile's terminal rule ended it). Written in the same atomic write that ends the ride. Absent until the first decline on that scooter. Not shown by `/view_all_available`. **Settled balances** (PLAN PR 15b): when the ledger shows the reservation was charged after all (a restore replayed a declined ride into a charge), reconcile's `clear_paid_balance` keeps the entry for the audit trail and adds `settled_by_txn_id` (the charge), `settled_at` and `settled_reason`, all three or none. A balance is **owed (open) only without `settled_by_txn_id`**. |
 | `reservation.idempotency_key` | non-empty string | **Equal to `reservation_id`** (one reservation, one ride, one charge). It's the key PLAN PR 13 sends to the gateway. It's a separate field so a later PR can change how it's derived without changing the id. Unique across the file. |
 | `reservation.legacy` | boolean, optional | `true` on a synthesised legacy reservation (below). |
 | *anything else* | any | **Unknown fields are kept**: top-level and inside `reservation`, they're written back unchanged (round-trip tested). They're not shown by `/view_all_available`, which returns exactly `id`, `lat`, `lng`, `is_reserved`. They do appear in request records' scooter snapshots. |
@@ -370,6 +371,17 @@ every pull request and on every push to `master`.
   - **But the restore itself breaks invariant I1** ("charged, yet the ride is `active`")
     until someone ends that ride where it was charged; the record's `existing_charge` says
     where. `make reconcile` finds and settles these from the ledger (see Reconcile).
+  - **A restored ride that was declined** (PLAN PR 15b) is declined again when it's ended
+    the same way: the gateway replays the decline, never charges it, and the ride ends with
+    a `payment_declined` balance again. Ending it anywhere else is `payment_conflict`, and
+    `make reconcile` settles it from the ledger's decline (`settle_declined_from_ledger`).
+    Before 15b the replay was **charged**, and a later restore that brought the balance
+    back left the reservation **charged and owing**; reconcile's `clear_paid_balance`
+    voids such a balance (see Reconcile and AI_NOTES #35).
+  - **A restore from before a ride started loses that ride's balance** (known, not fixed):
+    the DB no longer has the reservation or its debt, and nothing rebuilds it from the
+    ledger's decline. Invariant I2 ("ended without a charge or an outstanding balance")
+    flags it. `git restore scooter_db.json` after a decline does exactly this.
 - **Request records** show the same full form (`reservation` and unknown fields) in
   `scooter_before`, `scooter_after` and `scooter_in_memory`. A legacy reserved scooter's
   `scooter_before` shows its synthesised reservation, i.e. the scooter as the app loaded
@@ -437,9 +449,12 @@ reservation moves through these states, and every arrow is one atomic DB write:
 - **Invariants** (`tests/invariants.py`, checked against the DB, the ledger and the
   records):
   - **I1** no charge without an ended or `payment_pending` ride, and no ride both charged
-    **and** owing a balance, checked per `reservation_id` (business identity), not only per
-    idempotency key, so a bug that switches keys can't hide it (PR #20 review);
-  - **I2** no ended ride without exactly one charge or one outstanding balance;
+    **and** owing an open balance, checked per `reservation_id` (business identity), not
+    only per idempotency key, so a bug that switches keys can't hide it (PR #20 review). A
+    balance marked settled isn't owed, but its `settled_by_txn_id` must be a ledger charge
+    for that same reservation (PLAN PR 15b);
+  - **I2** no ended ride without exactly one charge or one outstanding balance (at most one
+    open);
   - **I3** at most one charge per reservation, **whatever key it was charged under**
     (checked per idempotency key *and* per `reservation_id`, which every ledger entry
     carries), and no charge under a key that no reservation ever owned. A **double charge**
@@ -462,9 +477,10 @@ reservation moves through these states, and every arrow is one atomic DB write:
 ## Reconcile (stuck rides)
 
 `make reconcile` (`reconcile.py`, PLAN PR 15) makes sure **no scooter stays reserved
-forever** (ACTIVITY Outcome 3). It settles every `payment_pending` ride, and every ride a
-restored DB left `active` although the ledger shows it was paid. It's a command to run or
-schedule. The server never runs it on its own.
+forever** (ACTIVITY Outcome 3). It settles every `payment_pending` ride, every ride a
+restored DB left `active` although the ledger shows it was paid or declined, and voids any
+outstanding balance whose reservation the ledger shows charged (PLAN PR 15b). It's a command
+to run or schedule. The server never runs it on its own.
 
 ```sh
 make reconcile ARGS="--dry-run"        # what it would do; changes nothing, writes no records
@@ -475,22 +491,34 @@ make reconcile ARGS="--only 18 --max-attempts 3 --max-age-minutes 15"
 ```
 
 **What it decides**, per scooter. `reconcile.decide()` is a pure function of the scooter's
-DB entry, the ledger entries for its key and the time:
+DB entry, the ledger and the time. The first matching row wins:
 
 | State | Ledger | Action | Result |
 |---|---|---|---|
+| any (free too), with an **open outstanding balance** | a charge for that balance's reservation, on this scooter (a restore replayed a declined ride into a charge, PLAN PR 15b) | `clear_paid_balance` | marks every such balance settled (`settled_by_txn_id`, `settled_at`, `settled_reason`; kept, not deleted) and records `balance: settled`. A charge always wins: the rider paid, so they owe nothing. Nothing is charged |
 | `payment_pending` | a charge for **this** ride (same scooter, reservation, stored end location and amount), e.g. after `timeout_charged` | `settle_charged` | ends the ride with **that** `txn_id`; the gateway answers `already_charged`, so nothing new is charged |
 | `payment_pending` | a charge under the key for a **different** ride | `report` | nothing changes; a human looks |
+| `payment_pending` | no charge, a **decline** for this ride (only a restore gets a declined ride back to pending) | `settle_declined` | ends it with a `payment_declined` balance; **no gateway call** (it would only replay the decline) |
+| `payment_pending` | no charge, a decline for a **different** ride | `report` | nothing changes |
 | `payment_pending` | no charge, attempts < N **and** age < T | `retry` | one new gateway attempt (same key, stored location and amount): paid → ended; decline → ended with balance (H3); timeout/error → still pending (attempts +1) |
 | `payment_pending` | no charge, attempts ≥ N **or** age ≥ T | `end_unpaid` | H3's terminal rule: ends the ride at the stored location with an outstanding balance (`reason: payment_unresolved`); **nothing is charged** |
 | `active` | a charge for this reservation (a restored DB: invariant I1) | `settle_from_ledger` | ends the ride where the ledger says it ended, with the original `txn_id`; no new charge |
 | `active` | a charge that doesn't fit (another scooter or reservation, or an amount that doesn't match the distance from where the scooter stands) | `report` | nothing changes |
+| `active` | no charge, a **decline** for this reservation (a restored declined ride, ended elsewhere: `payment_conflict`) | `settle_declined_from_ledger` | ends the ride where the decline says it ended, with a `payment_declined` balance; no gateway call. A decline that doesn't fit is reported, as above |
+| free (no open paid balance), or `active` with nothing in the ledger (riding) | — | `none` | nothing |
 
 `report` is recorded as the failure kind **`reconcile_unsettled`** (409), with a msg naming
 the scooter and the reason, so `make records ARGS="recent-failures"` and `failure-counts`
 show it. Every settling decision records the end coordinates it settles at, which
 `anomalies` (`end_location_not_persisted`) checks against `scooter_after`.
-| free, or `active` with no charge (riding) | — | `none` | nothing |
+
+- **Passes.** A run makes up to 3 passes, so a scooter whose paid balance was cleared gets
+  its ride settled in the same run. A scooter that was retried or reported isn't touched
+  again in that run. `--dry-run` shows the first pass only.
+- **Why mark a paid balance settled instead of deleting it** (PLAN PR 15b): the balance
+  was really recorded (the decline happened), and the charge that voids it came later.
+  Keeping both, linked by `settled_by_txn_id`, lets a human see the whole story in the DB;
+  invariant I1 checks that the txn is a real charge for that reservation.
 
 - **The terminal rule (H3): N attempts or T minutes.**
   - N defaults to 3 (`--max-attempts`, `RECONCILE_MAX_ATTEMPTS`). The attempt count is the
@@ -524,9 +552,11 @@ show it. Every settling decision records the end coordinates it settles at, whic
     reservation is reported and nothing changes. See "Unreadable ledger".
   - A `payment_state` this code doesn't know is reported (`storage_error`), not touched.
 - **Exit codes:**
-  - 0: no `payment_pending` ride left and nothing reported.
-  - 1: something remains (a ride still pending after this run's attempt, or a reported
-    problem); with `--dry-run`, there is something to do.
+  - 0: no `payment_pending` ride left, no open balance the ledger shows paid
+    (`paid_balances_open` in `--json`), and nothing reported.
+  - 1: something remains (a ride still pending after this run's attempt, a reported
+    problem, or a ledger it couldn't read afterwards); with `--dry-run`, there is something
+    to do.
   - 2: usage error.
 
   (`make` turns non-zero into its own `Error`, so use `python -m reconcile` when the code
@@ -542,6 +572,23 @@ show it. Every settling decision records the end coordinates it settles at, whic
      waits for N/T). A `report` needs a human: look at
      `make records ARGS="scooter <id>"` and `make payments ARGS="lookup <key>"`.
   4. Confirm with `make records ARGS="anomalies"` and `make records ARGS="ledger-check"`.
+     `anomalies` exits 1 only for **unresolved** findings. A `charged_and_owed` labelled
+     `[historical: resolved]` is history: its detail says `still_in_db: false` (the current
+     DB holds no open balance for that reservation) and `settled_by` (the reconcile request
+     that settled it, or null if a restore wiped it).
+  5. **After a DB restore, confirm against the DB itself**, not only the records (the
+     records can't see a restore): the DB-based invariants I1–I5 in `tests/invariants.py`.
+     From a shell, with the server stopped or idle:
+     ```sh
+     .venv/bin/python tests/invariants.py     # read-only; exit 0 = all hold, 1 = one JSON line per violation
+     ```
+     It reads the same `SCOOTER_DB_PATH` / `SCOOTER_PAYMENTS_LEDGER_PATH` /
+     `SCOOTER_RECORDS_PATH` as the app (a missing ledger or records file counts as empty).
+     The current DB stands in for the "initial" one, so a ride from before the records
+     began counts only while it's still in the DB. A
+     `"I1 a reservation was charged and also owes a balance"` means a paid balance is still
+     open: run `make reconcile`. An `"I2 ended without a charge or an outstanding balance"`
+     right after a restore is the known lost-balance hazard (see Database schema): escalate.
 - **Scheduling (documented only; nothing here deploys it):** run it every minute or so next
   to the server, against the same data files. For example, a crontab line:
   `* * * * * cd /path/to/repo && .venv/bin/python -m reconcile >> data/reconcile.log 2>&1`.
@@ -549,7 +596,11 @@ show it. Every settling decision records the end coordinates it settles at, whic
 - **Verified:**
   - **Tests** (`tests/test_reconcile.py`): every branch, both terminal rules with an
     injected clock, a restored ride, idempotency, dry run, and concurrency with live
-    requests.
+    requests. `tests/test_restore_replay.py` (PLAN PR 15b): a declined ride replayed by a
+    restore, with the balance still in the DB and with it wiped, both before and after
+    reconcile; and 8 seeded restore-heavy random histories (300 steps each, per-scooter
+    restores), with the pre-15b gateway and the current one, which all end with I1–I5
+    holding, no unresolved anomaly and a clean `ledger-check` after reconcile.
   - **Soak:** after a 500-operation multi-process random-fault soak, reconcile runs under
     the *same* random faults until nothing is pending. Then zero `payment_pending` rides
     remain, I1–I5 hold, `anomalies` is clean, `ledger-check` is clean, and another run has
@@ -598,6 +649,12 @@ reconcile's "no charge yet" checks safe.
   so two end points ~2 km apart at the same distance would have looked like one ride
   (PR #16's review; AI_NOTES #27).
   `already_charged`/`conflict` win over any forced fault: the gateway knows it was paid.
+- **A decline is replayed** (PLAN PR 15b, `payments.REPLAY_DECLINES`). A key with no charge
+  but an earlier `decline` answers `decline` again for the same ride (nothing charged; the
+  entry's `fault` is `{"source": "ledger", "replayed": "decline"}`), or `conflict` for a
+  different ride. This also wins over any forced fault. Only a DB restore can ask again for
+  a declined ride; charging it would leave the ride both charged and owing a balance.
+  H3 calls a decline *definitive*, and a real gateway's idempotency replays the result.
 - **Attempt numbers** are counted from the ledger (1 + earlier entries for the key), so
   they're the same whichever worker serves the retry.
 - **Fails closed.** If any line can't be parsed, the gateway can't know whether a key was
@@ -647,7 +704,7 @@ make payments ARGS="verify"     # readable: exit 0. Not: exit 1 (make shows "Err
    charged. Without it, every restored or retried ride would be charged again.
 
 **Choosing faults**, in order of precedence:
-1. The ledger (`already_charged` / `conflict`), as above.
+1. The ledger (`already_charged` / `conflict`, or a replayed `decline`), as above.
 2. The `X-Payment-Fault` request header, **only if `ENABLE_FAULT_INJECTION=1`** in the
    server's environment. Values: `none`/`success`, a fault name, or `random`.
    - Without the flag, the header is ignored. The record says so:
@@ -758,7 +815,9 @@ ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
   `payment_conflict`, and the ride goes back to `active` (see Database schema). Until it's
   ended where it was charged, that ride breaks invariant I1, and `make reconcile` settles
   it from the ledger (see Reconcile). The ledger survives `git restore`, so for a
-  clean demo reset also move the ledger aside (see Payments & fault injection).
+  clean demo reset also move the ledger aside (see Payments & fault injection). A restored
+  ride that was **declined** is declined again (PLAN PR 15b). A restore from before a ride
+  started loses that ride's outstanding balance, which I2 flags; nothing rebuilds it yet.
 - The start response's `reservation_id` isn't used by any endpoint yet. `/reservation/end`
   still takes only `id`, `lat` and `lng`. Later PLAN PRs build on it.
 
@@ -939,8 +998,9 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   Warnings go to stderr.
 - **Exit codes:**
   - 0: success, including "0 failures".
-  - 1: `scooter`/`request` found nothing, or `anomalies` found at least one, like `grep`
-    and linters.
+  - 1: `scooter`/`request` found nothing, or `anomalies` found at least one **unresolved**
+    finding, like `grep` and linters. (A finding marked `"resolved": true`, so far only a
+    historical `charged_and_owed`, is listed but doesn't count.)
   - 2: bad arguments, or the records file is missing or unreadable.
 
   `make` turns any non-zero exit into its own error (exit 2), so call
@@ -1013,10 +1073,20 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     balance recorded (in that record or any other), whatever keys the charge and the balance
     were made under: the rider paid **and** owes for one ride. (PR #20 review: a reconcile
     bug that switched keys produced exactly this, and only `payment_key_mismatch` hinted
-    at it.)
+    at it.) **Records are history, and a DB restore or reconcile can change what's owed**
+    (PLAN PR 15b), so this rule also reads the current DB (`--db PATH`, default
+    `$SCOOTER_DB_PATH` or `scooter_db.json`; read-only, no lock). Its detail adds
+    `still_in_db` (the DB still has an **open** balance for the reservation; `null` if the
+    DB couldn't be read) and `settled_by` (the request_id of a `balance: settled` record).
+    The finding is `"resolved": true` when `still_in_db` is false, or, with no readable DB,
+    when a settled record exists. The human output labels it `[historical: resolved]`.
+    Resolved means "no longer owed in the DB", not "never happened": the rider was
+    declined and then charged for that ride.
   - **`reconcile_not_settled`:** a `/reconcile` record says it ended a ride (status 200,
-    an action other than `none`) but `scooter_after` is still reserved; or it ended one
-    unpaid (`end_unpaid`) without a `payment_unresolved` balance for that reservation.
+    an action other than `none` or `clear_paid_balance`) but `scooter_after` is still
+    reserved; or it ended one unpaid (`end_unpaid`) without a `payment_unresolved`
+    balance, or declined (`settle_declined*`) without a `payment_declined` balance, for
+    that reservation; or a `clear_paid_balance` left one of its balances open.
 
   The reservation rules only judge snapshots that have a `reservation` key, and the
   payment-ordering rules only judge records that have a `payment: pending` decision, so
@@ -1038,15 +1108,20 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   | a decline's balance recorded as 0 | `decline_not_settled` |
   | **a new idempotency key per attempt** (a charged timeout plus a retry charges the ride twice: a **double charge**) | `double_charge`, `payment_key_mismatch` |
   | a decline's balance recorded under the wrong key | `decline_not_settled` |
-  | (in `reconcile.py`) settling a charged ride under a new key: it ends charged **and** owing | `charged_and_owed`, `payment_key_mismatch` |
+  | (in `reconcile.py`) settling a charged ride under a new key: it ends charged **and** owing | `payment_key_mismatch` (since PLAN PR 15b the same run's `clear_paid_balance` voids the balance, so `charged_and_owed` is listed as resolved) |
   | (in `reconcile.py`) settling a restored ride at the scooter's current position, not the ledger's | `end_location_not_persisted` |
+  | (in `reconcile.py`) `clear_paid_balance` leaves the paid balance open | `reconcile_not_settled` |
+  | (in `reconcile.py`) `settle_declined_from_ledger` ends the ride without a balance | `reconcile_not_settled` |
+  | (in `reconcile.py`) never finding a paid balance: the rider still owes in the DB | `charged_and_owed` (`still_in_db: true`) |
+  | (in `payments.py`) a gateway that charges a restored, declined ride | `charged_and_owed` |
 
   The same scenarios on the real app give no anomalies.
 
   **What `anomalies` can't see** (don't overclaim it):
   - **Requests that left no record.** A worker killed mid-request writes nothing, so no rule
     can judge that request. Use `ledger-check` (below) for the payment side.
-  - **Anything not in the records.** It doesn't read the DB or the ledger. It can't tell
+  - **Anything not in the records.** It doesn't read the ledger, and reads the DB only to
+    label `charged_and_owed`. It can't tell
     that a charge in the ledger was for the wrong amount, or that the DB was restored or
     edited by hand. That needs the cross-file invariants (`tests/invariants.py`, I1–I5)
     and `ledger-check`.

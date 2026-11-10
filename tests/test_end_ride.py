@@ -268,6 +268,11 @@ def _db(**entry_33):
     (_db(outstanding_balances={}), "outstanding_balances is dict, not a list"),
     (_db(outstanding_balances=[dict(BALANCE, amount=None)]), "outstanding_balances[0].amount is not a finite number >= 0"),
     (_db(outstanding_balances=[{k: v for k, v in BALANCE.items() if k != "reason"}]), "outstanding_balances[0] is missing ['reason']"),
+    # PLAN PR 15b: a settled balance carries all three settled_* fields, as strings
+    (_db(outstanding_balances=[dict(BALANCE, settled_by_txn_id="t1")]),
+     "outstanding_balances[0] is missing ['settled_at', 'settled_reason']"),
+    (_db(outstanding_balances=[dict(BALANCE, settled_by_txn_id="", settled_at="2026-11-10T00:00:00.000Z",
+                                    settled_reason="paid")]), "outstanding_balances[0].settled_by_txn_id is not a non-empty string"),
 ])
 def test_invalid_payment_fields_are_storage_error(client, db_path, data, why):
     db_path.write_text(json.dumps(data))
@@ -275,8 +280,10 @@ def test_invalid_payment_fields_are_storage_error(client, db_path, data, why):
     assert why in body["msg"]
 
 
-def test_valid_payment_fields_load_and_round_trip(client, db_path):
-    data = _db(reservation=_pending(), outstanding_balances=[BALANCE])
+@pytest.mark.parametrize("balances", [[BALANCE], [dict(BALANCE, settled_by_txn_id="t1", settled_at="2026-11-10T00:00:00.000Z",
+                                                        settled_reason="paid"), BALANCE]])
+def test_valid_payment_fields_load_and_round_trip(client, db_path, balances):
+    data = _db(reservation=_pending(), outstanding_balances=balances)
     db_path.write_text(json.dumps(data))
     assert client.get("/view_all_available").status_code == 200
     assert client.get("/reservation/start?id=18").status_code == 200    # a write keeps them
@@ -442,6 +449,23 @@ def test_the_invariant_checker_catches_charged_and_owed_under_different_keys():
     found = [v[0] for v in violations(db, ledger, {"k"})]
     assert "I1 a reservation was charged and also owes a balance" in found
     assert "I1 charged, and also recorded as an outstanding balance" not in found      # the per-key check misses it
+
+
+def _settled(txn="t1", **over):
+    return dict({"idempotency_key": "k", "reservation_id": "k", "amount": 10, "settled_by_txn_id": txn,
+                 "settled_at": "2026-11-10T00:00:00.000Z", "settled_reason": "paid"}, **over)
+
+
+def test_a_settled_balance_is_not_owed_but_must_be_settled_by_its_charge():
+    # PLAN PR 15b: reconcile's clear_paid_balance marks a paid balance settled instead of deleting it
+    assert violations([_entry(balances=[_settled()])], [_charge("k")], {"k"}) == []
+    assert violations([_entry(balances=[_settled(), {"idempotency_key": "k", "reservation_id": "k"}])], [], {"k"}) == [
+        ("I1 balance settled by a txn that isn't a charge for its reservation", "k", "t1")]
+    other = violations([_entry(balances=[_settled()])], [dict(_charge("x"), txn_id="t1")], {"k", "x"})
+    assert ("I1 balance settled by a txn that isn't a charge for its reservation", "k", "t1") in other
+    # still at most one OPEN balance per key; a settled one doesn't count
+    assert "I2 more than one outstanding balance" not in [
+        v[0] for v in violations([_entry(balances=[_settled(), {"idempotency_key": "k"}])], [_charge("k")], {"k"})]
 
 
 def test_the_invariant_checker_catches_a_double_charge_across_keys():

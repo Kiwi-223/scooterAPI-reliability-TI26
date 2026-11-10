@@ -5,10 +5,12 @@ returns every broken invariant (empty list = all hold):
 
 - I1 no charge without an ended ride: every charged idempotency key belongs to a ride that
   has ended, or that is payment_pending (a retry / reconcile will settle it). A charged key
-  whose ride is `active` (or that also has an outstanding balance) is a violation.
+  whose ride is `active` (or that also has an open outstanding balance) is a violation. A
+  balance marked settled (`settled_by_txn_id`, reconcile's clear_paid_balance, PLAN PR 15b)
+  is not owed, but its txn must be a ledger charge for that same reservation.
 - I2 no ended ride without a charge or an outstanding balance: every reservation that ever
   existed (from the records' successful starts plus the DB's initial reservations) and is no
-  longer in the DB has exactly one charge or a recorded balance.
+  longer in the DB has exactly one charge or a recorded balance (at most one open).
 - I3 at most one charge per reservation: per idempotency key, and per reservation_id (the
   ledger records both, so a bug that charges one ride under two keys is caught), and no
   charge under a key that no reservation ever owned (`keys`).
@@ -72,7 +74,8 @@ def violations(db, ledger, keys, amounts=None):
     for reservation_id, txns in by_reservation.items():
         if len(txns) > 1:
             found.append(("I3 one reservation charged more than once (a double charge)", reservation_id, txns))
-    live, balances = {}, defaultdict(list)
+    txn_reservation = {e.get("txn_id"): e.get("reservation_id") for e in ledger if e.get("charged")}
+    live, balances, open_balances = {}, defaultdict(list), defaultdict(list)
     for entry in db:
         reservation = _reservation(entry)
         if entry["is_reserved"] != (reservation is not None):
@@ -83,14 +86,19 @@ def violations(db, ledger, keys, amounts=None):
             live[reservation["idempotency_key"]] = reservation.get("payment_state")
         for balance in entry.get("outstanding_balances") or []:
             balances[balance["idempotency_key"]].append(balance)
+            if "settled_by_txn_id" not in balance:
+                open_balances[balance["idempotency_key"]].append(balance)
+            elif txn_reservation.get(balance["settled_by_txn_id"]) != balance.get("reservation_id"):
+                found.append(("I1 balance settled by a txn that isn't a charge for its reservation",
+                              balance.get("reservation_id"), balance["settled_by_txn_id"]))
     for key in charges:
         if live.get(key) == "active":
             found.append(("I1 charged, but the ride is active (not ended, not pending)", key, None))
-        if key in balances:
+        if key in open_balances:
             found.append(("I1 charged, and also recorded as an outstanding balance", key, None))
     # the same per RESERVATION (business identity), whatever keys the charge and the balance
     # were made under (PR #20 review: a key switch hid "charged and owes" from the per-key check)
-    owed_reservations = {b.get("reservation_id") for owed in balances.values() for b in owed}
+    owed_reservations = {b.get("reservation_id") for owed in open_balances.values() for b in owed}
     for reservation_id in by_reservation:
         if reservation_id in owed_reservations:
             found.append(("I1 a reservation was charged and also owes a balance", reservation_id, None))
@@ -107,6 +115,35 @@ def violations(db, ledger, keys, amounts=None):
             continue                                   # still riding, or pending (settleable)
         if key not in charges and key not in balances:
             found.append(("I2 ended without a charge or an outstanding balance", key, None))
-        if len(balances.get(key, [])) > 1:
+        if len(open_balances.get(key, [])) > 1:
             found.append(("I2 more than one outstanding balance", key, None))
     return found
+
+
+def main(argv=None):
+    """`.venv/bin/python tests/invariants.py`: check I1-I5 on the current DB, ledger and records
+    (PLAN PR 15b; the way to confirm a restored DB, which the records can't see). Paths come
+    from SCOOTER_DB_PATH / SCOOTER_PAYMENTS_LEDGER_PATH / SCOOTER_RECORDS_PATH as the app uses
+    them; a missing ledger or records file counts as empty. Read-only. Exit 0 = all hold."""
+    import json
+    import os
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import payments
+    import records_query as rq
+    db_path = os.environ.get("SCOOTER_DB_PATH") or "scooter_db.json"
+    with open(db_path, encoding="utf-8") as f:
+        db = json.load(f)
+    ledger = payments.all_entries() if os.path.exists(payments.ledger_path()) else []
+    records = list(rq.read_records(rq.records_path())) if os.path.exists(rq.records_path()) else []
+    # the current DB stands in for the initial one: a ride from before the records began
+    # counts only while it's still in the DB
+    found = violations(db, ledger, started_keys(records, db), pending_amounts(records))
+    for v in found:
+        print(json.dumps(v))
+    print(f"{len(found)} invariant violation(s) in {db_path} ({len(ledger)} ledger entries, {len(records)} records)")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

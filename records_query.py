@@ -4,14 +4,15 @@
     python -m records_query failure-counts [--since 1h]
     python -m records_query scooter <id>
     python -m records_query request <request_id>
-    python -m records_query anomalies [--since 1h]
+    python -m records_query anomalies [--since 1h] [--db PATH]
     make records ARGS="failure-counts --since 1h"
 
 Global options (before the command): --file PATH (default: $SCOOTER_RECORDS_PATH, else
 data/records.jsonl) and --json (machine-readable output on stdout).
 
 Exit codes: 0 = success; 1 = nothing found for `scooter`/`request`, or `anomalies` found at
-least one; 2 = bad arguments or the records file is missing/unreadable.
+least one unresolved finding (a `resolved` one is history the current DB no longer holds); 2 =
+bad arguments or the records file is missing/unreadable.
 
 The query functions are pure: they take an iterable of record dicts (see `read_records`)
 and return plain data, so the MCP server (PLAN PR 16) reuses them as-is. Reading streams
@@ -216,9 +217,24 @@ def _reconciled_end(decisions):
     return None
 
 
-def anomalies(records, since=None):
+def open_balance_reservations(db):
+    """{reservation_id} of every open (not settled) outstanding balance in a persisted DB (the
+    list of scooter dicts), or None if `db` is None."""
+    if db is None:
+        return None
+    return {b.get("reservation_id") for s in db if isinstance(s, dict)
+            for b in s.get("outstanding_balances") or [] if isinstance(b, dict) and "settled_by_txn_id" not in b}
+
+
+def unresolved(findings):
+    """The findings that still need attention (not marked `resolved`)."""
+    return [f for f in findings if not f.get("resolved")]
+
+
+def anomalies(records, since=None, db=None):
     """Records whose own fields contradict each other. Each finding is a dict with
-    `type`, `request_id`, `ts`, `path`, `scooter_id`, `status` and `detail`.
+    `type`, `request_id`, `ts`, `path`, `scooter_id`, `status` and `detail`, and `resolved`
+    (true only for a charged_and_owed whose balance is no longer owed, see below).
 
     - write_not_persisted: db_write.ok but scooter_after != scooter_in_memory (the code
       changed the scooter, but what was written doesn't contain that change)
@@ -260,10 +276,19 @@ def anomalies(records, since=None):
       records, in the order they took effect.
     - charged_and_owed: a reservation that a record shows charged also has an outstanding
       balance recorded (by this or another record), whatever keys they were made under:
-      the rider paid AND owes for one ride (PR #20 review). Checked across records.
+      the rider paid AND owes for one ride (PR #20 review). Checked across records. The
+      records are history: a DB restore can wipe the balance, and reconcile's
+      clear_paid_balance marks it settled (PLAN PR 15b). So the detail says
+      `still_in_db` (the current DB, `db`, still holds an open balance for the reservation;
+      None if no DB was given) and `settled_by` (the request_id of a `balance: settled`
+      record for it, or None), and the finding is `resolved` when the DB doesn't hold it
+      (still_in_db false), or, with no DB, when a settled record exists. A resolved finding
+      is a labelled historical flag; it doesn't make the CLI exit 1.
     - reconcile_not_settled: a /reconcile record (PLAN PR 15) says it ended the ride (status
-      200, an action other than none) but scooter_after is still reserved; or it ended it
-      unpaid without an outstanding balance for that reservation.
+      200, an action other than none or clear_paid_balance) but scooter_after is still
+      reserved; or it ended it unpaid (payment_unresolved) or declined (settle_declined*,
+      payment_declined) without an outstanding balance of that reason for the reservation;
+      or clear_paid_balance left one of its balances open.
 
     decline_not_settled also requires the balance's amount to equal the amount charged for
     (the `payment: requested` cost) and its idempotency_key to be the reservation's.
@@ -282,6 +307,7 @@ def anomalies(records, since=None):
     charged_by_reservation = {}   # reservation_id -> the first txn a record shows charged for it
     scooter_events = []           # (effect time, scooter, started, charged, freed, record, in window)
     owed_by_reservation = {}      # reservation_id -> first record that recorded a balance for it
+    settled_by = {}               # reservation_id -> the last record that marked its balance settled
     for r in records:
         decisions = [d for d in r.get("decisions") or [] if isinstance(d, dict)]
         pending_at, pending = _decision(decisions, "payment", "pending")
@@ -315,6 +341,9 @@ def anomalies(records, since=None):
         charged_and_owed = None
         owed = [(d.get("detail") or {}).get("reservation_id") for d in decisions
                 if d.get("step") == "balance" and d.get("outcome") == "recorded"]
+        for d in decisions:
+            if d.get("step") == "balance" and d.get("outcome") == "settled":
+                settled_by[(d.get("detail") or {}).get("reservation_id")] = r.get("request_id")
         for rid in owed:
             owed_by_reservation.setdefault(rid, r)
             if rid in charged_by_reservation:
@@ -397,16 +426,27 @@ def anomalies(records, since=None):
             if (after.get("reservation") or {}).get("payment_state") != "payment_pending":
                 flag("failed_payment_not_pending", {"scooter_after": after})
         if path == "/reconcile":
-            _, rc = _decision(decisions, "reconcile", "end_unpaid")
             acted = [d for d in decisions if d.get("step") == "reconcile" and d.get("outcome") not in ("none", "report", "skipped")]
-            if status == 200 and acted and isinstance(after, dict) and after.get("is_reserved") is not False:
+            action = acted[0].get("outcome") if acted else None
+            after_balances = [b for b in (after or {}).get("outstanding_balances") or [] if isinstance(b, dict)] \
+                if isinstance(after, dict) else []
+            owed_reason = {"end_unpaid": "payment_unresolved", "settle_declined": "payment_declined",
+                           "settle_declined_from_ledger": "payment_declined"}.get(action)
+            if action == "clear_paid_balance":
+                if status == 200 and isinstance(after, dict):
+                    cleared = {(b or {}).get("reservation_id") for b in (acted[0].get("detail") or {}).get("balances") or []}
+                    still = [b for b in after_balances if b.get("reservation_id") in cleared and "settled_by_txn_id" not in b]
+                    if still:
+                        flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after,
+                                                       "problem": "a balance the ledger shows paid is still open"})
+            elif status == 200 and acted and isinstance(after, dict) and after.get("is_reserved") is not False:
                 flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after})
-            elif rc is not None and isinstance(after, dict):
+            elif owed_reason is not None and isinstance(after, dict):
                 rid = before_res.get("reservation_id")
-                if not any(isinstance(b, dict) and b.get("reservation_id") == rid and b.get("reason") == "payment_unresolved"
-                           for b in after.get("outstanding_balances") or []):
-                    flag("reconcile_not_settled", {"reconcile": rc, "scooter_after": after,
-                                                   "problem": "ended unpaid without an outstanding balance"})
+                if not any(b.get("reservation_id") == rid and b.get("reason") == owed_reason and "settled_by_txn_id" not in b
+                           for b in after_balances):
+                    flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after,
+                                                   "problem": f"ended without a {owed_reason} outstanding balance"})
         if isinstance(after, dict) and "reservation" in after:
             reservation = after["reservation"]
             if (after.get("is_reserved") is True) != (reservation is not None):
@@ -414,6 +454,13 @@ def anomalies(records, since=None):
             if path == "/reservation/start" and status == 200 and (
                     not isinstance(reservation, dict) or reservation.get("start_request_id") != r.get("request_id")):
                 flag("start_reservation_not_persisted", {"scooter_after": after})
+    open_in_db = open_balance_reservations(db)
+    for f in found:
+        if f["type"] == "charged_and_owed":
+            rid = f["detail"]["reservation_id"]
+            f["detail"]["still_in_db"] = None if open_in_db is None else rid in open_in_db
+            f["detail"]["settled_by"] = settled_by.get(rid)
+            f["resolved"] = (f["detail"]["still_in_db"] is False) if open_in_db is not None else rid in settled_by
     charges_since_start = {}
     for _, scooter, started, charged, freed, r, in_win in sorted(scooter_events, key=lambda e: e[0]):
         if started:
@@ -567,10 +614,28 @@ def _print_human(command, result, args):
         for e in result["resolved_orphans"]:
             print(entry_line(e))
     elif command == "anomalies":
-        print(f"{len(result)} anomaly(ies){window}")
+        historical = len(result) - len(unresolved(result))
+        print(f"{len(result)} anomaly(ies){window}"
+              + (f", {historical} of them historical (resolved: not owed in the current DB)" if historical else ""))
         for a in result:
-            print(f"  {a['type']:22} {a['ts']} {a['path']} id={a['request_id']} scooter={a['scooter_id']}\n"
+            label = "  [historical: resolved]" if a.get("resolved") else ""
+            print(f"  {a['type']:22} {a['ts']} {a['path']} id={a['request_id']} scooter={a['scooter_id']}{label}\n"
                   f"      {json.dumps(a['detail'])}")
+        if result and getattr(args, "db_problem", None):
+            print(f"  (DB not read, so charged_and_owed can't say whether it is still owed: {args.db_problem})")
+
+
+def read_db(path):
+    """The persisted DB (a list of scooter dicts) -> (db, None), or (None, problem) if it can't
+    be read. A plain lock-free read: the app replaces the file atomically."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            db = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, f"{path}: {getattr(exc, 'strerror', None) or exc}"
+    if not isinstance(db, list):
+        return None, f"{path}: not a list of scooters"
+    return db, None
 
 
 def build_parser():
@@ -589,8 +654,10 @@ def build_parser():
     p.add_argument("scooter_id")
     p = sub.add_parser("request", help="the full record(s) for one request id")
     p.add_argument("request_id")
-    p = sub.add_parser("anomalies", help="records whose fields contradict each other (exit 1 if any)")
+    p = sub.add_parser("anomalies", help="records whose fields contradict each other (exit 1 if any unresolved)")
     p.add_argument("--since", help="duration (30s, 15m, 1h, 2d, 1h30m) or ISO-8601 time")
+    p.add_argument("--db", help="the current DB, to tell whether a charged_and_owed balance is still owed "
+                                "(default: $SCOOTER_DB_PATH or scooter_db.json; read-only, lock-free)")
     p = sub.add_parser("ledger-check",
                        help="cross-check the payments ledger with the records: requests that died mid-payment, "
                             "double charges, charges under foreign keys (exit 1 if any)")
@@ -632,7 +699,8 @@ def main(argv=None, now=None):
                 return 2
             result = ledger_check(entries, records, now=now, min_age_s=args.min_age)
         else:
-            result = anomalies(records, args.since_dt)
+            db, args.db_problem = read_db(args.db or os.environ.get("SCOOTER_DB_PATH") or "scooter_db.json")
+            result = anomalies(records, args.since_dt, db)
     except OSError as exc:
         print(f"records_query: cannot read records file {path!r}: {exc.strerror or exc}", file=sys.stderr)
         return 2
@@ -648,7 +716,7 @@ def main(argv=None, now=None):
         wanted = args.scooter_id if args.command == "scooter" else args.request_id
         print(f"records_query: no records for {args.command} {wanted!r} in {path}", file=sys.stderr)
         return 1
-    if args.command == "anomalies" and result:
+    if args.command == "anomalies" and unresolved(result):
         return 1
     if args.command == "ledger-check" and ledger_problems(result):
         return 1

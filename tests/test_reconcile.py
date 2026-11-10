@@ -91,6 +91,58 @@ def test_decide(entry, ledger, action):
     assert reconcile.decide(entry, ledger, T0, 3, datetime.timedelta(minutes=15))["action"] == action
 
 
+def _decline(**over):
+    return dict(_charge(charged=False, txn_id=None, outcome="decline"), **over)
+
+
+def _balance(**over):
+    return dict({"reservation_id": "old", "idempotency_key": "old", "amount": 7, "end_lat": 1.0, "end_lng": 1.0,
+                 "ended_at": "2026-11-10T11:00:00.000Z", "reason": "payment_declined"}, **over)
+
+
+FREE = {"id": "18", "lat": 0.0, "lng": 0.0, "is_reserved": False, "reservation": None}
+PAID_OLD = _charge(idempotency_key="old", reservation_id="old", txn_id="t0", amount=7)
+
+
+@pytest.mark.parametrize("entry,ledger,action", [
+    # PLAN PR 15b: a balance for a reservation the ledger shows charged is void, whatever the ride's state
+    (dict(FREE, outstanding_balances=[_balance()]), [PAID_OLD], "clear_paid_balance"),
+    (dict(_pending(), outstanding_balances=[_balance()]), [PAID_OLD], "clear_paid_balance"),     # first, then the ride
+    (dict(FREE, outstanding_balances=[_balance()]), [], "none"),                                 # owed: no charge
+    (dict(FREE, outstanding_balances=[_balance()]), [dict(PAID_OLD, charged=False)], "none"),
+    (dict(FREE, outstanding_balances=[_balance()]), [dict(PAID_OLD, scooter_id="15")], "none"),  # not this scooter's
+    (dict(FREE, outstanding_balances=[_balance(settled_by_txn_id="t0", settled_at="x", settled_reason="y")]),
+     [PAID_OLD], "none"),                                                                        # already settled
+    # a decline is definitive
+    (_pending(), [_decline()], "settle_declined"),
+    (_pending(payment_attempts=9), [_decline()], "settle_declined"),         # before the terminal rule
+    (_pending(), [_decline(end_lat=1.5)], "report"),                         # a decline for another ride
+    (_pending(), [_decline(), _charge()], "settle_charged"),                 # a charge still wins
+])
+def test_decide_pr15b(entry, ledger, action):
+    assert reconcile.decide(entry, ledger, T0, 3, datetime.timedelta(minutes=15))["action"] == action
+
+
+def test_decide_clears_every_paid_balance_at_once():
+    entry = dict(FREE, outstanding_balances=[_balance(), _balance(reservation_id="b", idempotency_key="b"), _balance(reservation_id="c")])
+    ledger = [PAID_OLD, _charge(idempotency_key="b", reservation_id="b", txn_id="t2")]
+    d = reconcile.decide(entry, ledger, T0)
+    assert [(b["reservation_id"], b["txn_id"]) for b in d["balances"]] == [("old", "t0"), ("b", "t2")]
+
+
+def test_decide_on_an_active_ride_that_was_already_declined():
+    active = {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True,
+              "reservation": {"reservation_id": "k", "idempotency_key": "k", "payment_state": "active"}}
+    _, cost = reconcile._cost_from(23.0, 19.0, 1.0, 1.0)
+    decline = _decline(end_lat=1.0, end_lng=1.0, amount=cost)
+    d = reconcile.decide(active, [decline], T0)
+    assert (d["action"], d["end_lat"], d["amount"]) == ("settle_declined_from_ledger", 1.0, cost)
+    assert reconcile.decide(active, [dict(decline, amount=cost + 1)], T0)["action"] == "report"
+    assert reconcile.decide(active, [dict(decline, reservation_id="other")], T0)["action"] == "report"
+    assert reconcile.decide(active, [decline, dict(_charge(end_lat=1.0, end_lng=1.0, amount=cost))], T0)["action"] == \
+        "settle_from_ledger"
+
+
 def test_decide_on_an_active_ride_that_was_already_charged():
     active = {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True,
               "reservation": {"reservation_id": "k", "idempotency_key": "k", "payment_state": "active"}}
