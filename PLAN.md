@@ -85,7 +85,7 @@ Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blo
 ### Stage 5: Agents can ask the system questions (Outcome 4)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 16 | `feat`: MCP server | Built on the official `mcp` Python SDK (v2.x: `mcp.server.mcpserver.MCPServer`; the 1.x `mcp.server.fastmcp` import no longer exists) and reusing the PR 10 query module. Tools: `recent_failures`, `failure_counts`, `scooter_history`, `request_trace`, `scooter_state`, `run_tests` and `replay_fault`. Registered in a checked-in `.mcp.json` and enabled for fresh sessions through `enabledMcpjsonServers` in `.claude/settings.json`. `run_tests` and `replay_fault` run only against an isolated temp instance; if MCP tools run outside the Bash sandbox, they're set to need approval. AGENTS.md documents it and the CLI fallback. Tests included. | ⬜ |
+| 16 | `feat`: MCP server | Built on the official `mcp` Python SDK (v2.x: `mcp.server.mcpserver.MCPServer`; the 1.x `mcp.server.fastmcp` import no longer exists) and reusing the PR 10 query module. Tools: `recent_failures`, `failure_counts`, `scooter_history`, `request_trace`, `scooter_state`, `run_tests` and `replay_fault`. Registered in a checked-in `.mcp.json` and enabled for fresh sessions through `enabledMcpjsonServers` in `.claude/settings.json`. `run_tests` and `replay_fault` run only against an isolated temp instance; if MCP tools run outside the Bash sandbox, they're set to need approval. AGENTS.md documents it and the CLI fallback. Tests included. | ✅ |
 
 ### Stage 6: Cold-agent readiness (acceptance test)
 | # | PR | Scope | Status |
@@ -199,3 +199,7 @@ These need a person. The agents use the default shown unless told otherwise.
   - **`payment_unresolved` is rebuilt too** when the ledger has uncharged attempts: nobody can retry a ride the DB no longer has, so H3's terminal rule applies at once. An `end_unpaid` by age with 0 attempts has no ledger evidence and is reported.
   - **Rides erased in progress are reported, not settled** (`rollback-check`): there's no end location or cost anywhere. These are free rides.
   - `scooter_double_charge` no longer counts a restored older ride's charge against the scooter's latest ride (a false positive under whole-DB rollbacks).
+- 2026-11-10: PR 16 done (MCP server). Decisions:
+  - **mcp 2.3.0 in the dev lock**, not the runtime one: it's an agent tool, not part of the deployed app. Verified on Python 3.15 (macOS install; Linux cp315 wheels for its compiled deps) and in CI.
+  - **Tools beyond the row's list:** `anomalies`, `ledger_check`, `rollback_check`, `check_invariants`, `payment_lookup`, `payment_draw`, `reconcile_plan` (read-only, allowed) and `reconcile_run` (changes the live DB, asks). `run_tests`, `replay_fault` and `reconcile_run` ask, because MCP servers run outside the Bash sandbox.
+  - **`replay_fault`** rebuilds the scooter from the record's `scooter_before` and the key's earlier ledger entries in a temp instance, and re-applies the record's fault provenance; it never writes a live file.

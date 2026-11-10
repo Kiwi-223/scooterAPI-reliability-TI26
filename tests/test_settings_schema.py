@@ -62,3 +62,27 @@ def _mutate(path, value):
 ])
 def test_planted_mistakes_are_rejected(tmp_path, path, value):
     assert problems(_mutate(path, value), tmp_path), f"{path}={value!r} was not rejected"
+
+
+# ---- MCP entries against .mcp.json (PLAN PR 16) ------------------------------------------------
+
+MCP = json.loads((REPO / ".mcp.json").read_text())
+
+
+def test_committed_mcp_entries_match_mcp_json():
+    assert check_settings.check_mcp(SETTINGS, MCP) == []
+
+
+@pytest.mark.parametrize("path,value,says", [
+    (["enabledMcpjsonServers", None], "scooterr", "isn't defined in .mcp.json"),
+    (["permissions", "allow", None], "mcp__scoter__recent_failures", "names server 'scoter'"),
+    (["permissions", "ask", None], "mcp__other__run_tests", "names server 'other'"),
+])
+def test_planted_mcp_mistakes_are_rejected(path, value, says):
+    found = check_settings.check_mcp(_mutate(path, value), MCP)
+    assert len(found) == 1 and says in found[0]
+
+
+def test_a_missing_server_command_is_rejected():
+    broken = {"mcpServers": {"scooter": dict(MCP["mcpServers"]["scooter"], command=".venv/bin/pythonn")}}
+    assert "doesn't exist" in check_settings.check_mcp(SETTINGS, broken)[0]

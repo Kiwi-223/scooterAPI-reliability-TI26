@@ -734,3 +734,18 @@ strongest entries.
   erases** (each kind of state, and what survives), not by the first symptom found; and
   test it with the *real* rollback (the whole file), not a narrower one that is easier to
   reason about.
+
+### 37. "Seeded, so deterministic" missed that the seed's other input was random
+- **Where:** PLAN PR 16, `tests/test_mcp_server.py` (the `replay_fault` test for a seeded fault).
+- **What the AI claimed:** a test with `PAYMENT_FAULT=random`, a fixed `PAYMENT_SEED` and
+  rate 1 is deterministic, so two ends of one ride give two faults and the second can be
+  replayed.
+- **Reality:** the draw is `sha256(seed, idempotency key, attempt)`, and the key is the
+  ride's uuid, new on every run. About one run in four, attempt 1 drew `decline`, which
+  **ends** the ride; the second end then never reached the gateway. It passed alone and
+  failed in the full suite.
+- **How it was caught:** the full-suite run failed once; re-reading the draw's inputs.
+- **What changed:** attempt 1 is forced (`error`, the ride stays pending), and only the
+  attempt under test is seeded (any of the four faults is fine for it). The test was then
+  run six times. Lesson: **a seed makes a draw reproducible only if every input to the
+  draw is fixed**; list the inputs before calling a test deterministic.
