@@ -46,8 +46,9 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 - **Show live:**
   - the test: `make test ARGS="tests/test_payments.py::test_an_equidistant_end_after_a_restore_is_a_conflict_not_a_free_ride"`
     (passes now);
-  - the pre-fix match rule: `git show 10b1064:payments.py` (`_matches`, line 176, compares
-    scooter, reservation and amount only), in
+  - the pre-fix match rule: `git fetch origin pull/16/head && git show 10b1064:payments.py`
+    (`_matches`, line 176, compares scooter, reservation and amount only). PR #16 was
+    squash-merged, so a fresh clone doesn't have its commits until that fetch. It's in
     [PR #16's first commit](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/commit/10b10646a14bddb12c61ce026878b0d6cb745455);
     the fix is [33cfc8a](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/commit/33cfc8aeae99ec4408111fd35315dfa4ff8867e2).
     Make today's `_matches` compare only scooter, reservation and amount again, and the test

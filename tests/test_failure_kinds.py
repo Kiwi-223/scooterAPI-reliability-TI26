@@ -234,7 +234,7 @@ def test_missing_db_is_storage_error(client, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize("content", ["{not json", '[{"id": "1"}]', "42"])
 @pytest.mark.parametrize("url", ["/view_all_available", "/reservation/end?id=1&lat=0&lng=0",
-                                 "/search?lat=0&lng=0&radius=1", "/reservation/start?id=1"])
+                                 "/search?lat=0&lng=0&radius=1", "/reservation/start?id=1", "/health"])
 def test_corrupt_db_is_storage_error_on_every_endpoint(client, db_path, content, url):
     # Before PR 7 a corrupt file on /reservation/end was reported as invalid_number
     # ("Lat/Lng values must be numbers"), because json's ValueError was caught there.

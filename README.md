@@ -12,7 +12,7 @@ The implementation of this app uses Python/Flask, with JSON as the database. The
 
 #### On the web
 
-The app is not currently deployed. The old Heroku URL from 2019 no longer works.
+The app is not currently deployed. The old Heroku URL from 2019 no longer works. See [Deploying](#deploying) for what a deploy would take, and what still blocks one.
 
 #### On local dev environment
 
@@ -54,8 +54,7 @@ None
 
 #### Error Responses:
 
-* **Code**: 422 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
+This endpoint takes no parameters, so it has no 422 errors. Like every endpoint, it can return `storage_error` (500) if the database can't be read, or `internal_error` (500); see [Errors](#errors).
 
 ### Search for Scooters 
 
@@ -161,6 +160,31 @@ GET /reservation/end
 
   The extra body fields are additive: clients that read only `msg` and `error.kind` are unaffected.
 
+### Health Check
+
+#### Endpoints:
+```
+GET /health
+```
+
+#### Parameters:
+
+None
+
+#### Success Responses:
+
+* **Code**: 200 <br />
+  **Content**: the database could be read and is valid. It never changes anything and never waits for a lock.
+  ```json
+  {"status": "ok", "db": {"readable": true, "scooters": 5, "reserved": 1, "payment_pending": 0}}
+  ```
+  `payment_pending` counts rides waiting for their payment to settle. If it stays above 0, reconcile isn't running (see [Deploying](#deploying)).
+
+#### Error Responses:
+
+* **Code**: 500 <br />
+  **Content**: the usual error envelope with `error.kind` `storage_error`: the database is missing, unreadable or corrupt. The `msg` names the cause (for example `(FileNotFoundError)`), never a file path.
+
 ## Errors
 
 Every error response, on every endpoint, is a JSON object:
@@ -173,7 +197,7 @@ Every error response, on every endpoint, is a JSON object:
 except that a non-numeric `radius` now says "Radius must be a number" instead of
 "Lat/Lng values must be numbers". Match on `error.kind` instead. Besides the per-endpoint kinds listed above, any
 endpoint can return `storage_error` or `internal_error`, and unknown paths or non-`GET`
-methods return `route_not_found` or `method_not_allowed`. `error.kind` is one of the stable ids below. Ids are
+methods return `route_not_found` or `method_not_allowed`. A path with a doubled slash inside it (`/reservation//start`) is `route_not_found`, not a redirect. `error.kind` is one of the stable ids below. Ids are
 never renamed; new ones may be added.
 
 | `error.kind` | HTTP status | Meaning |
@@ -196,3 +220,171 @@ never renamed; new ones may be added.
 | `storage_busy` | 503 | The database was locked by another request for too long; nothing was changed. Retry after the `Retry-After` seconds (`/reservation/*` only). |
 | `internal_error` | 500 | Unexpected server error. |
 
+
+## Deploying
+
+> **Not deployed, and not ready for real riders yet.** The app has the files a Heroku deploy
+> needs (below), and a production-style run was smoke-tested locally. But the JSON-file
+> database, ledger and records can't survive on Heroku's filesystem, and the payment
+> gateway is a simulator. Both are blockers (human decision **H5** in [PLAN.md](PLAN.md)).
+
+### What's in place
+
+- **`Procfile`:**
+  ```
+  web: gunicorn --bind 0.0.0.0:$PORT --workers ${WEB_CONCURRENCY:-2} --timeout 20 --graceful-timeout 25 --no-control-socket app:app
+  ```
+  - `--bind 0.0.0.0:$PORT`: Heroku routes to `$PORT` on any interface. This is explicit;
+    gunicorn's own default is `127.0.0.1:8000`, or `0.0.0.0:$PORT` only when it notices `PORT`.
+  - `--workers ${WEB_CONCURRENCY:-2}`: Heroku sets `WEB_CONCURRENCY` per dyno size (2 on
+    Eco/Basic/Standard-1X; not set on Fir), and `app.json` sets it to 2. Writes are
+    serialised by the DB file lock, so more workers mainly help reads. **Never set
+    `WEB_CONCURRENCY` to an empty value:** gunicorn 26 reads it at import and fails to start.
+  - `--timeout 20`: a worker is killed after 20 s on one request. That must stay above the
+    slowest legitimate request: `SCOOTER_DB_LOCK_TIMEOUT` (5 s) waiting for the lock, plus the
+    gateway call made while holding it (20 ms simulated). Otherwise the client gets
+    gunicorn's HTML 500 instead of a JSON `storage_busy`. It also stays below Heroku's
+    30 s router timeout, after which the client has already been answered with an error.
+  - `--graceful-timeout 25`: on a restart, Heroku sends SIGTERM and then SIGKILL 30 s later.
+    A request in progress gets up to 25 s to finish, so a ride isn't cut off mid-payment.
+  - `--no-control-socket`: gunicorn 26 otherwise writes a control socket to
+    `~/.gunicorn/gunicorn.ctl`.
+  - `tests/test_deploy.py` checks these flags and the timeout arithmetic, and runs the line
+    through gunicorn's `--print-config`.
+- **`app.json`:** the name, a description, the `heroku/python` buildpack, **one** `web` dyno
+  and safe env defaults (below).
+- **`.python-version`:** `3.15`. Heroku supports Python 3.15 and recommends a major-only
+  version (`3.15`), so each build gets the latest patch (checked against the Heroku Dev
+  Center on 2026-11-10). Python is **not** a blocker.
+- **`requirements.txt`:** the hash-locked runtime deps. Heroku installs only this file.
+- **`/health`:** `GET /health` gives 200 when the DB is readable and valid, and
+  `storage_error` (500) when it isn't. See [Health Check](#health-check).
+
+### Blockers (H5): the data files on an ephemeral filesystem
+
+The DB (`scooter_db.json`), the payments ledger (`data/payments_ledger.jsonl`) and the request
+records (`data/records.jsonl`) are plain files. On Heroku:
+
+- **Every restart wipes them.** Each dyno's filesystem is discarded when it restarts:
+  - on every deploy (a new release);
+  - at least once a day (Heroku cycles dynos every 24 hours, plus up to 216 random minutes).
+
+  After a restart, the DB is back to the committed `scooter_db.json`, and the ledger and
+  records are empty. So:
+  - every ride in progress and every outstanding balance is lost;
+  - the evidence for debugging is lost;
+  - worst, the ledger, which is what stops a ride being charged twice, starts empty. For
+    example, the committed DB's `legacy-33` ride can be charged again after every restart.
+- **No sharing between dynos.** Each dyno has its own files, so two web dynos would be two
+  separate databases. Run exactly one web dyno (`app.json` sets `quantity: 1`). Don't scale it.
+- **Reconcile can't run from Heroku Scheduler.** Scheduled jobs run in one-off dynos, which
+  have their own filesystem and can't see the web dyno's files.
+- **Records have no rotation.** The file grows until the next restart wipes it.
+
+Recommended persistence options. Picking one is the H5 decision:
+
+1. **A managed database** (for example Heroku Postgres) for the scooters, outstanding balances
+   and the ledger. A transaction replaces the file lock, "at most one charge per key" becomes
+   a unique constraint, and reconcile can run from Scheduler. Records go to the log stream
+   (stdout, kept by a log drain) or to a table. This is the most work: `app.py`'s storage
+   layer and `payments.py`'s ledger are rewritten.
+2. **A single instance with a persistent disk** (for example a small VM, or a platform with
+   attached volumes). Point `SCOOTER_DB_PATH`, `SCOOTER_RECORDS_PATH` and
+   `SCOOTER_PAYMENTS_LEDGER_PATH` at the volume and run reconcile from cron on the same
+   machine. This needs no code change, but it's one instance only, and you need backups.
+   (Restoring an old DB backup without its ledger is the rollback case in AGENTS.md.)
+
+SQLite (H8's alternative) doesn't help on Heroku: it's still a file on the same
+ephemeral disk.
+
+### Other blockers and limits
+
+- **The payment gateway is simulated** (`payments.py`). Nothing real is charged. A real
+  gateway client has to replace `payments.charge`, and it must support idempotency keys.
+- **The DB lock is held across the gateway call** (AGENTS.md, Payment state machine). That's
+  safe with the simulator's 20 ms calls. A real gateway that takes seconds would make every
+  other start or end wait, and they'd get `storage_busy` after `SCOOTER_DB_LOCK_TIMEOUT`.
+  Before using a real gateway, split the end into three steps:
+  1. save `payment_pending` under the lock;
+  2. charge without holding the lock (the idempotency key already prevents a double charge);
+  3. finish under the lock, re-checking the state, so a concurrent retry or reconcile can't
+     finish the same ride twice.
+
+  Then size gunicorn's `--timeout` above the lock wait plus the gateway's own timeout.
+- **State-changing `GET`s and no authentication** (H4): kept for README compatibility. Anyone
+  who can reach the app can start and end rides.
+- **The `git_*` fields in request records are `null` on Heroku.** The deployed slug has no
+  `.git`.
+- **Request ids:** Heroku's router passes an `X-Request-ID` to the app (its log examples
+  show 32 hex characters), and the app keeps any id of 1–64 `[A-Za-z0-9._-]`, so router
+  logs and records share ids. Heroku also accepts client-supplied ids of up to 200
+  characters containing `+`, `/` or `=`. The app replaces those (the record notes
+  `client_value_rejected`), so the two ids differ for that request.
+
+### Required environment
+
+| Variable | Production value | Notes |
+|---|---|---|
+| `PORT` | set by Heroku | Never set it yourself. |
+| `WEB_CONCURRENCY` | `2` (`app.json`) | gunicorn workers. Never empty. |
+| `ENABLE_FAULT_INJECTION` | **unset** | With `1`, any client could force payment faults with the `X-Payment-Fault` header. `app.json` doesn't set it. |
+| `PAYMENT_FAULT` | `none` (`app.json`) | Any other value makes the simulator fail payments on purpose. |
+| `SCOOTER_DB_LOCK_TIMEOUT` | `5` (`app.json`) | Keep it well below the Procfile's `--timeout 20`. |
+| `RECONCILE_MAX_ATTEMPTS`, `RECONCILE_MAX_AGE_MINUTES` | `3`, `15` (`app.json`) | H3's terminal rule for stuck payments. |
+| `SCOOTER_DB_PATH`, `SCOOTER_RECORDS_PATH`, `SCOOTER_PAYMENTS_LEDGER_PATH` | the defaults (`scooter_db.json`, `data/…`) | Relative to the app directory. With persistent storage (option 2), point all three at it. |
+| `PAYMENT_SEED`, `PAYMENT_FAULT_RATE`, `PAYMENT_TIMEOUT_DELAY_MS` | unset | Simulator settings for tests. |
+
+### Reconcile scheduling
+
+`python -m reconcile` settles rides left `payment_pending` by a timeout or a gateway error
+(AGENTS.md, Reconcile). Nothing runs it automatically: without it, those scooters stay
+reserved until the rider retries. It must run **against the same files as the web
+process**, every minute or so.
+- With option 2, use a cron line on the same machine (AGENTS.md has one).
+- With option 1, use Heroku Scheduler (every 10 minutes at most) or a `worker` process that
+  loops.
+
+Today on Heroku, neither works, because the files aren't shared. `/health`'s
+`payment_pending` count is the signal that reconcile isn't running.
+
+### Not part of the deployed app
+
+- **The dev dependencies** (`requirements-dev.txt`: pytest, pip-tools, jsonschema and the
+  `mcp` SDK) aren't installed. Heroku installs `requirements.txt` only.
+- **The agent tooling** isn't run on Heroku:
+  - `.mcp.json` and `mcp_server.py` (the agent-tools MCP server; it can't even import
+    without `mcp`);
+  - `.claude/`;
+  - `scripts/agent.sh`;
+  - `tests/`.
+
+  These files are in the slug, but nothing runs them. A `.slugignore` could leave them out.
+
+### Steps (once the blockers are resolved)
+
+Documented only; none of this has been run.
+
+```sh
+heroku create <app-name>                  # or "Deploy to Heroku" with app.json
+heroku config:set PAYMENT_FAULT=none WEB_CONCURRENCY=2   # app.json sets these on a button deploy
+heroku config:unset ENABLE_FAULT_INJECTION
+git push heroku master                    # builds with Python 3.15 and requirements.txt
+heroku ps:scale web=1                     # exactly one web dyno (the data files are per dyno)
+curl https://<app-name>.herokuapp.com/health
+```
+
+### Local production smoke test
+
+Run the Procfile command against scratch files, with fault injection off. Bind to
+`127.0.0.1` locally rather than every interface.
+
+```sh
+S=$(mktemp -d) && cp scooter_db.json "$S/db.json"
+env -u ENABLE_FAULT_INJECTION PORT=8195 PAYMENT_FAULT=none \
+    SCOOTER_DB_PATH="$S/db.json" SCOOTER_RECORDS_PATH="$S/records.jsonl" \
+    SCOOTER_PAYMENTS_LEDGER_PATH="$S/ledger.jsonl" \
+    .venv/bin/gunicorn --bind 127.0.0.1:8195 --workers 2 --timeout 20 --graceful-timeout 25 --no-control-socket app:app
+curl -s localhost:8195/health
+curl -s -H 'X-Payment-Fault: decline' 'localhost:8195/reservation/end?id=33&lat=24.5&lng=-28'   # 200: header ignored
+make records ARGS="--file $S/records.jsonl recent-failures"
+```
