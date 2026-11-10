@@ -82,6 +82,8 @@ def _charge(**over):
     (_pending(payment_requested_at="2026-11-10T11:44:59.000Z"), [], "end_unpaid"),       # 15 min + 1 s
     (_pending(payment_requested_at="2026-11-10T11:45:01.000Z"), [], "retry"),            # just under
     (_pending(payment_attempts=5), [_charge()], "settle_charged"),           # a charge beats the limits
+    (_pending(payment_attempts=0), [{"idempotency_key": "k", "charged": False}] * 3 + [_charge()],
+     "settle_charged"),                                                   # ... even with >= N ledger entries
     (dict(_pending(), reservation={"reservation_id": "k", "idempotency_key": "k", "payment_state": "active"}), [], "none"),
     (dict(_pending(), reservation={"reservation_id": "k", "idempotency_key": "k", "payment_state": "weird"}), [], "report"),
 ])

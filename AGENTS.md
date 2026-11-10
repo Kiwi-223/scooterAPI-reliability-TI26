@@ -436,7 +436,9 @@ reservation moves through these states, and every arrow is one atomic DB write:
   identity in this API.
 - **Invariants** (`tests/invariants.py`, checked against the DB, the ledger and the
   records):
-  - **I1** no charge without an ended or `payment_pending` ride;
+  - **I1** no charge without an ended or `payment_pending` ride, and no ride both charged
+    **and** owing a balance, checked per `reservation_id` (business identity), not only per
+    idempotency key, so a bug that switches keys can't hide it (PR #20 review);
   - **I2** no ended ride without exactly one charge or one outstanding balance;
   - **I3** at most one charge per reservation, **whatever key it was charged under**
     (checked per idempotency key *and* per `reservation_id`, which every ledger entry
@@ -483,6 +485,11 @@ DB entry, the ledger entries for its key and the time:
 | `payment_pending` | no charge, attempts ≥ N **or** age ≥ T | `end_unpaid` | H3's terminal rule: ends the ride at the stored location with an outstanding balance (`reason: payment_unresolved`); **nothing is charged** |
 | `active` | a charge for this reservation (a restored DB: invariant I1) | `settle_from_ledger` | ends the ride where the ledger says it ended, with the original `txn_id`; no new charge |
 | `active` | a charge that doesn't fit (another scooter or reservation, or an amount that doesn't match the distance from where the scooter stands) | `report` | nothing changes |
+
+`report` is recorded as the failure kind **`reconcile_unsettled`** (409), with a msg naming
+the scooter and the reason, so `make records ARGS="recent-failures"` and `failure-counts`
+show it. Every settling decision records the end coordinates it settles at, which
+`anomalies` (`end_location_not_persisted`) checks against `scooter_after`.
 | free, or `active` with no charge (riding) | — | `none` | nothing |
 
 - **The terminal rule (H3): N attempts or T minutes.**
@@ -942,9 +949,9 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   files. A leading byte-order mark is ignored (`utf-8-sig`). A line that isn't a complete JSON object (e.g. a partially written last line or a
   stray `42`) is skipped with `warning: <file>:<line>: skipped line, …` on stderr; the
   query still answers.
-- **`anomalies`** flags seventeen contradictions. Most are within a single record;
-  `pending_location_changed`, `double_charge` and `scooter_double_charge` also compare
-  records with each other:
+- **`anomalies`** flags eighteen contradictions. Most are within a single record;
+  `pending_location_changed`, `double_charge`, `scooter_double_charge` and
+  `charged_and_owed` also compare records with each other:
   - **`write_not_persisted`:** `db_write.ok` is true but `scooter_after` ≠
     `scooter_in_memory`. The code changed the scooter, but the written data didn't contain
     the change.
@@ -955,10 +962,11 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     reserved.
   - **`end_left_reserved`:** `/reservation/end` returned 200 but `scooter_after` is still
     reserved.
-  - **`end_location_not_persisted`:** `/reservation/end` returned 200 but `scooter_after`'s
-    `lat`/`lng` differ from where the ride ended: the stored end location (the payment
-    `requested` decision's `end_lat`/`end_lng`, since PLAN PR 14), or for older records the
-    requested coordinates. They're compared as floats, the
+  - **`end_location_not_persisted`:** `/reservation/end` returned 200 (or a `/reconcile`
+    record freed the scooter) but `scooter_after`'s `lat`/`lng` differ from where the ride
+    ended: the stored end location (the payment `requested` decision's `end_lat`/`end_lng`,
+    since PLAN PR 14; for reconcile, its `reconcile` decision's `end_lat`/`end_lng`), or for
+    older records the requested coordinates. They're compared as floats, the
     way the app parses them, so `+23.01` equals `23.01`. This one also catches code that
     never moves the scooter at all, where in-memory and written state agree.
   - **`reservation_flag_mismatch`:** `scooter_after` breaks the DB invariant
@@ -1001,6 +1009,11 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     the scooter becoming free, under **any** reservation or key, in the order requests took
     effect. This catches a bug that swaps in a new reservation (new id and key) before
     charging, which `double_charge` (per reservation) can't label (PLAN PR 15).
+  - **`charged_and_owed`:** a reservation that a record shows charged also has an outstanding
+    balance recorded (in that record or any other), whatever keys the charge and the balance
+    were made under: the rider paid **and** owes for one ride. (PR #20 review: a reconcile
+    bug that switched keys produced exactly this, and only `payment_key_mismatch` hinted
+    at it.)
   - **`reconcile_not_settled`:** a `/reconcile` record says it ended a ride (status 200,
     an action other than `none`) but `scooter_after` is still reserved; or it ended one
     unpaid (`end_unpaid`) without a `payment_unresolved` balance for that reservation.
@@ -1025,6 +1038,8 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   | a decline's balance recorded as 0 | `decline_not_settled` |
   | **a new idempotency key per attempt** (a charged timeout plus a retry charges the ride twice: a **double charge**) | `double_charge`, `payment_key_mismatch` |
   | a decline's balance recorded under the wrong key | `decline_not_settled` |
+  | (in `reconcile.py`) settling a charged ride under a new key: it ends charged **and** owing | `charged_and_owed`, `payment_key_mismatch` |
+  | (in `reconcile.py`) settling a restored ride at the scooter's current position, not the ledger's | `end_location_not_persisted` |
 
   The same scenarios on the real app give no anomalies.
 
@@ -1153,6 +1168,7 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `payment_conflict` | 409 | The reservation's idempotency key already has a charge for a different ride (scooter, reservation, end location or amount differ): a restored DB ended elsewhere, even at the same distance. Nothing is charged; the ride is `active` again (not ended, not pending). Body adds `ride_ended: false`. The record's `existing_charge` shows the earlier charge. |
 | `route_not_found` | 404 | No endpoint at that path. |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
+| `reconcile_unsettled` | 409 | **Not an API response:** recorded on a `make reconcile` `/reconcile` record when reconcile leaves a ride unchanged for a human (a charge that doesn't fit, an unreadable ledger, a conflict). The msg says which scooter and why, so `make records ARGS="recent-failures"` / `failure-counts` show it. |
 | `storage_busy` | 503 | A mutating request (`/reservation/*`) couldn't get the DB lock within `SCOOTER_DB_LOCK_TIMEOUT` (default 5 s), because another request held it. **Nothing was read or written**, so it's safe to retry; the response has `Retry-After: 1`. The record has a `db_lock: timeout` decision with `wait_ms`. A separate kind from `storage_error` because it's transient and retryable, and agents counting failures should see "contention" apart from "broken DB". |
 | `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable, or has the wrong shape: the top level must be a list of objects, each with a unique string `id`, finite-number `lat`/`lng` in range and a boolean `is_reserved`, plus a valid `reservation` consistent with `is_reserved` when that key is present, and unique reservation ids and idempotency keys (see Database schema; extra fields are allowed and kept). Also: start/end on a scooter whose reservation is in a `payment_state` this server version doesn't handle (only that scooter is affected). The msg names the cause without a path, e.g. `(FileNotFoundError)` or `(entry 3: lat is not a finite number)`. The **server log** line `storage error: … (db=<path>)` carries the path and the original exception's traceback. |
 | `internal_error` | 500 | Anything else, i.e. a bug, including `abort(500)` and a write refused because the code produced an invalid DB state (`db_write.error: "InvalidDbState"`). The msg is generic; the **traceback is in the server log** (`unhandled exception`). Any other HTTP error raised by the framework (unreachable today) also gets this kind but keeps its own status. |

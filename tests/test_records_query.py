@@ -801,3 +801,23 @@ def test_scooter_history_is_in_lock_order_where_known():
     # b locked 8 min ago, c (no lock) started 7 min ago, a locked 5 min ago
     assert [r["request_id"] for r in history] == ["b", "c", "a"]
     assert rq.acquired_at(no_lock) is None and rq.acquired_at(started_first_locked_second) is not None
+
+
+
+# ---- charged and owed for one reservation (PLAN PR 15 review) ---------------------------------
+
+def test_anomaly_charged_and_owed_across_records_and_keys():
+    key, rid = RES["idempotency_key"], RES["reservation_id"]
+    charged = _end_rec("a", [PENDING_D, WRITE_OK, REQUESTED_D,
+                             _d("payment", "failed", gateway_outcome="timeout_charged", idempotency_key=key, reservation_id=rid,
+                                simulator={"charged": True, "ledger_txn_id": "t1"}), WRITE_OK],
+                       status=504, kind="payment_timeout", scooter_before=TAKEN12, minutes_ago=120)
+    owed = rec("b", 1, path="/reconcile", scooter="18", status=200, db_write=WROTE, scooter_before=TAKEN12,
+               decisions=[_d("reconcile", "end_unpaid"), _d("balance", "recorded", reservation_id=rid, amount=10,
+                                                            reason="payment_unresolved")])
+    assert "charged_and_owed" in _types([charged, owed])
+    assert "charged_and_owed" in _types([charged, owed], since=NOW - datetime.timedelta(minutes=60))  # charge out of window
+    assert "charged_and_owed" in _types([owed, charged])                     # either order in the file
+    other = rec("c", 1, path="/reconcile", scooter="18", status=200, db_write=WROTE, scooter_before=TAKEN12,
+                decisions=[_d("balance", "recorded", reservation_id="another", amount=10)])
+    assert "charged_and_owed" not in _types([charged, other])

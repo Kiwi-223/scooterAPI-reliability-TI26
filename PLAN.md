@@ -186,3 +186,4 @@ These need a person. The agents use the default shown unless told otherwise.
   - **Unresolved balances** carry `reason: payment_unresolved`.
   - **Records:** every action is a `/reconcile` request record.
   - **New anomaly rules:** `reconcile_not_settled` and `scooter_double_charge` (#18's NIT).
+- 2026-11-10: PR 15 review fixes (PR #20). I1's "charged and owes a balance" is now checked per `reservation_id`, and there's a new anomaly rule `charged_and_owed` (a key switch had hidden it). `end_location_not_persisted` now covers `/reconcile` records, whose decisions carry their end coordinates. A reconcile `report` is recorded as the new failure kind `reconcile_unsettled`. The reviewer's two tool-silent reconcile bugs are now planted tests (R1, R2). There's a new `decide()` row for "a charge wins even with ≥ N ledger entries".

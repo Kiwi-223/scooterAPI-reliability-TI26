@@ -32,6 +32,7 @@ SHIPPED = {
     "method_not_allowed": 405,
     "storage_error": 500,
     "storage_busy": 503,
+    "reconcile_unsettled": 409,
     "internal_error": 500,
 }
 
@@ -64,6 +65,22 @@ def _conflicting_end(c, mp, tmp):
     return c.get("/reservation/end?id=18&lat=2&lng=2")
 
 
+def _reconcile_cannot_settle(c, mp, tmp):
+    # a pending ride whose key the ledger shows charged for a different ride: reconcile reports it
+    import reconcile
+    key = c.get("/reservation/start?id=18").get_json()["reservation_id"]
+    mp.setenv("PAYMENT_FAULT", "error")
+    c.get("/reservation/end?id=18&lat=1&lng=1")
+    mp.setenv("PAYMENT_FAULT", "none")
+    with open(os.environ["SCOOTER_PAYMENTS_LEDGER_PATH"], "a") as ledger:
+        ledger.write(json.dumps({"ts": "2026-11-10T00:00:00.000Z", "idempotency_key": key, "attempt": 9,
+                                 "outcome": "success", "charged": True, "txn_id": "x", "scooter_id": "18",
+                                 "reservation_id": key, "end_lat": 9.0, "end_lng": 9.0, "amount": 1}) + "\n")
+    import datetime
+    rc = reconcile.make_app(lambda: datetime.datetime.now(datetime.UTC), 3, datetime.timedelta(minutes=15))
+    return rc.test_client().get("/reconcile?id=18")
+
+
 def _start_while_payment_pending(c, mp, tmp):
     c.get("/reservation/start?id=18")
     mp.setenv("PAYMENT_FAULT", "error")
@@ -94,6 +111,7 @@ TRIGGERS = {
     FailureKind.SCOOTER_ALREADY_RESERVED: lambda c, mp, tmp: c.get("/reservation/start?id=33"),
     FailureKind.NO_ACTIVE_RESERVATION: lambda c, mp, tmp: c.get("/reservation/end?id=18&lat=0&lng=0"),
     FailureKind.SCOOTER_PAYMENT_PENDING: _start_while_payment_pending,
+    FailureKind.RECONCILE_UNSETTLED: _reconcile_cannot_settle,
     FailureKind.PAYMENT_FAILED: _end_with_fault("error"),
     FailureKind.PAYMENT_DECLINED: _end_with_fault("decline"),
     FailureKind.PAYMENT_TIMEOUT: _end_with_fault("timeout_not_charged"),
@@ -117,6 +135,7 @@ EXTRA_KEYS = {
     FailureKind.PAYMENT_TIMEOUT: {"ride_ended"},
     FailureKind.PAYMENT_FAILED: {"ride_ended"},
     FailureKind.PAYMENT_CONFLICT: {"ride_ended"},
+    FailureKind.RECONCILE_UNSETTLED: {"scooter_id", "action", "reason", "result"},
 }
 
 

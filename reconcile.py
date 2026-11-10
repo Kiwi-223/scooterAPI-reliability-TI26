@@ -45,7 +45,7 @@ from geopy.distance import distance as geodesic
 import app as app_module
 import payments
 import records
-from failures import StorageBusy, StorageError
+from failures import FailureKind, StorageBusy, StorageError
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_AGE_MINUTES = 15.0
@@ -98,17 +98,18 @@ def decide(entry, key_entries, now, max_attempts=DEFAULT_MAX_ATTEMPTS, max_age=d
             if payments._matches(charge, entry["id"], reservation["reservation_id"], reservation["end_lat"],
                                  reservation["end_lng"], reservation["amount"]):
                 return {"action": "settle_charged", "reason": "the ledger has a charge for this ride",
-                        "txn_id": charge.get("txn_id")}
+                        "txn_id": charge.get("txn_id"), "end_lat": reservation["end_lat"], "end_lng": reservation["end_lng"]}
             return {"action": "report", "reason": "the ledger has a charge under this key for a different ride",
                     "txn_id": charge.get("txn_id")}
         attempts = max(reservation.get("payment_attempts") or 0, len(key_entries))
         started = _parse_ts(reservation.get("payment_requested_at"))
+        stored = {"end_lat": reservation["end_lat"], "end_lng": reservation["end_lng"]}
         if attempts >= max_attempts:
-            return {"action": "end_unpaid", "attempts": attempts,
+            return {"action": "end_unpaid", "attempts": attempts, **stored,
                     "reason": f"no charge after {attempts} attempt(s) (limit {max_attempts})"}
         if started is not None and now - started >= max_age:
             minutes = round((now - started).total_seconds() / 60, 1)
-            return {"action": "end_unpaid", "attempts": attempts,
+            return {"action": "end_unpaid", "attempts": attempts, **stored,
                     "reason": f"no charge {minutes} min after payment started (limit {max_age.total_seconds() / 60:g} min)"}
         return {"action": "retry", "attempts": attempts, "reason": f"no charge yet; attempt {attempts + 1} of {max_attempts}"}
     if state == "active":
@@ -161,6 +162,15 @@ def _respond(status, body):
     return json.dumps(body), status, {"Content-Type": "application/json"}
 
 
+def _report(scooter_id, reason):
+    # left for a human: a recorded failure (reconcile_unsettled), so recent-failures and
+    # failure-counts show it, with what reconcile decided and why
+    return app_module.error_response(FailureKind.RECONCILE_UNSETTLED,
+                                     f"Reconcile left scooter {scooter_id} unchanged: {reason}.",
+                                     extra={"scooter_id": scooter_id, "action": "report", "reason": reason,
+                                            "result": "unchanged"})
+
+
 def _reconcile_one():
     scooter_id = request.args["id"]
     records.scooter(scooter_id=scooter_id)
@@ -179,10 +189,14 @@ def _reconcile_one():
         action = decision["action"]
         records.note("reconcile", action, **{k: v for k, v in decision.items() if k != "action"})
         body = {"scooter_id": scooter_id, **decision}
-        if action in ("none", "report"):
+        if action == "none":
             records.scooter(in_memory=scooter.to_dict())
             records.unchanged()
-            return _respond(200 if action == "none" else 409, dict(body, result="unchanged"))
+            return _respond(200, dict(body, result="unchanged"))
+        if action == "report":
+            records.scooter(in_memory=scooter.to_dict())
+            records.unchanged()
+            return _report(scooter_id, decision["reason"])
         if action == "end_unpaid":
             amount = reservation["amount"]
             app_module.record_outstanding_balance(scooter, reason="payment_unresolved")
@@ -218,8 +232,7 @@ def _reconcile_one():
         if outcome == "conflict":
             records.scooter(in_memory=scooter.to_dict())
             records.unchanged()
-            return _respond(409, dict(body, action="report", result="unchanged", gateway_outcome=outcome,
-                                      reason="the gateway reports a charge for a different ride"))
+            return _report(scooter_id, "the gateway reports a charge for a different ride")
         app_module.note_payment_attempt(scooter, outcome)
         app_module.write_db(txn.db, txn.path)
         records.scooter(in_memory=scooter.to_dict())
@@ -264,7 +277,7 @@ def run(now=None, max_attempts=None, max_age=None, dry_run=False, only=None):
         for n, (sid, _) in enumerate(planned):
             resp = client.get(PATH, query_string={"id": sid}, headers={"X-Request-ID": f"reconcile-{run_id}-{n}"})
             body = resp.get_json() or {}
-            if "error" in body:      # the request failed (e.g. storage_error): nothing was done, report it
+            if "error" in body and "action" not in body:   # it failed (e.g. storage_error): nothing was done
                 body = {"action": "report", "result": "unchanged", "reason": body.get("msg"),
                         "error_kind": (body.get("error") or {}).get("kind")}
             results.append(dict(body, scooter_id=sid, status=resp.status_code, request_id=resp.headers.get("X-Request-ID")))

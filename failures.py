@@ -61,6 +61,14 @@ class FailureKind(StrEnum):
                         "(scooter, reservation, end location or amount); nothing was charged and the "
                         "ride is open again (payment_state active).")
 
+    # ---- reconcile (PLAN PR 15) ----------------------------------------------------------
+    # Not an API response: recorded on `make reconcile`'s /reconcile records when it leaves a
+    # ride as it was for a human (a charge that doesn't fit, an unreadable ledger, a conflict),
+    # so `recent-failures` / `failure-counts` show "reconcile couldn't settle scooter 9".
+    RECONCILE_UNSETTLED = ("reconcile_unsettled", HTTPStatus.CONFLICT,
+                           "make reconcile couldn't safely settle this ride and left it unchanged for a human; "
+                           "the reason says why.")
+
     # ---- framework / infrastructure ----------------------------------------------------
     ROUTE_NOT_FOUND = ("route_not_found", HTTPStatus.NOT_FOUND,
                        "No endpoint exists at this path.")

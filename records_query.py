@@ -202,6 +202,20 @@ def _finding(r, kind, detail):
             "scooter_id": r.get("scooter_id"), "status": r.get("status"), "detail": detail}
 
 
+def _reconciled_end(decisions):
+    """Where a /reconcile record said the ride ends: its reconcile decision's end_lat/end_lng,
+    or the payment it requested (PLAN PR 15)."""
+    for d in decisions:
+        if d.get("step") == "reconcile":
+            detail = d.get("detail") or {}
+            if "end_lat" in detail and "end_lng" in detail:
+                return _float_pair(detail["end_lat"], detail["end_lng"])
+    _, requested = _decision(decisions, "payment", "requested")
+    if requested and "end_lat" in requested:
+        return _float_pair(requested.get("end_lat"), requested.get("end_lng"))
+    return None
+
+
 def anomalies(records, since=None):
     """Records whose own fields contradict each other. Each finding is a dict with
     `type`, `request_id`, `ts`, `path`, `scooter_id`, `status` and `detail`.
@@ -244,6 +258,9 @@ def anomalies(records, since=None):
     - scooter_double_charge: two charges on one scooter between a successful start and the
       scooter becoming free, under any reservation or key (PLAN PR 15). Checked across
       records, in the order they took effect.
+    - charged_and_owed: a reservation that a record shows charged also has an outstanding
+      balance recorded (by this or another record), whatever keys they were made under:
+      the rider paid AND owes for one ride (PR #20 review). Checked across records.
     - reconcile_not_settled: a /reconcile record (PLAN PR 15) says it ended the ride (status
       200, an action other than none) but scooter_after is still reserved; or it ended it
       unpaid without an outstanding balance for that reservation.
@@ -264,6 +281,7 @@ def anomalies(records, since=None):
     retries = []            # (key, values, flag) checked against pending_by_key at the end
     charged_by_reservation = {}   # reservation_id -> the first txn a record shows charged for it
     scooter_events = []           # (effect time, scooter, started, charged, freed, record, in window)
+    owed_by_reservation = {}      # reservation_id -> first record that recorded a balance for it
     for r in records:
         decisions = [d for d in r.get("decisions") or [] if isinstance(d, dict)]
         pending_at, pending = _decision(decisions, "payment", "pending")
@@ -294,6 +312,15 @@ def anomalies(records, since=None):
             if started or freed or simulator.get("charged") is True:
                 scooter_events.append((_effect_key(r), r.get("scooter_id"), started, simulator.get("charged") is True,
                                        freed, r, in_window(r, since)))
+        charged_and_owed = None
+        owed = [(d.get("detail") or {}).get("reservation_id") for d in decisions
+                if d.get("step") == "balance" and d.get("outcome") == "recorded"]
+        for rid in owed:
+            owed_by_reservation.setdefault(rid, r)
+            if rid in charged_by_reservation:
+                charged_and_owed = {"reservation_id": rid, "txn_id": charged_by_reservation[rid]}
+        if simulator.get("charged") is True and charged_rid in owed_by_reservation and charged_and_owed is None:
+            charged_and_owed = {"reservation_id": charged_rid, "txn_id": simulator.get("ledger_txn_id")}
         if not in_window(r, since):
             continue
         db_write = r.get("db_write") or {}
@@ -314,8 +341,9 @@ def anomalies(records, since=None):
             flag("end_left_reserved", {"scooter_after": after})
         if path == "/reservation/start" and status == 200 and isinstance(after, dict) and after.get("is_reserved") is not True:
             flag("start_left_free", {"scooter_after": after})
-        if path == "/reservation/end" and status == 200 and isinstance(after, dict):
-            wanted = _requested_end(r)
+        if path in ("/reservation/end", "/reconcile") and status == 200 and isinstance(after, dict) and \
+                (path == "/reservation/end" or after.get("is_reserved") is False):
+            wanted = _requested_end(r) if path == "/reservation/end" else _reconciled_end(decisions)
             got = _float_pair(after.get("lat"), after.get("lng"))
             if wanted is not None and got != wanted:
                 flag("end_location_not_persisted", {"requested": {"lat": wanted[0], "lng": wanted[1]},
@@ -345,6 +373,8 @@ def anomalies(records, since=None):
                     break
         if double is not None:
             flag("double_charge", double)
+        if charged_and_owed is not None:
+            flag("charged_and_owed", charged_and_owed)
         # (a record with no decisions at all can't say how it paid, so it isn't judged)
         if path == "/reservation/end" and status == 200 and decisions and final != "ok":
             flag("ended_without_payment", {"final_payment": final, "gateway_outcome": (final_detail or {}).get("gateway_outcome")})
