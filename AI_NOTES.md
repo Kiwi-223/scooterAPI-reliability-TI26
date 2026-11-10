@@ -433,3 +433,21 @@ strongest entries.
   clean" are different claims. The cold-agent playbook (PLAN PR 17) should include clearing
   `__pycache__`.
 
+### 23. "528 storage_error on master" understated the damage: the DB was left corrupt
+- **Where:** the PR #13 description (PLAN PR 11), "same hammer against master's code".
+- **What the AI claimed:** running the gunicorn hammer against the old, unlocked code gave
+  "528 × `storage_error`". That was presented as the measure of what the PR fixes.
+- **Reality:** the count was the smaller half of the story. The old in-place writes left
+  the **DB file permanently corrupt**: the final `scooter_db.json` didn't even parse
+  (`JSONDecodeError`), so every later request would fail. The writer's own check script
+  had in fact crashed on that final file and printed nothing, and the writer reported the
+  counts without noticing. The reviewer's independent rerun saw **1,816** errors, so the
+  number also varies a lot from run to run.
+- **How it was caught:** the reviewer's rerun inspected the DB file after the load test,
+  not just the response codes.
+- **What changed:** the finding is recorded here, and the PR 11 verification already
+  checks the final DB state (start/end invariant and an intact file). Lesson: after a load
+  or chaos test, check the **end state** (does the data still load, is it consistent),
+  not only the error counts. And when a verification script prints nothing, treat that
+  as a failure.
+
