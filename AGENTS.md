@@ -23,9 +23,10 @@ exist yet, so don't go looking for them.
 You've been handed a one-line symptom ("I ended my ride on scooter 18 but it still shows
 as reserved") and possibly a bug someone planted. The goal: **name the root cause, back it
 with evidence the system recorded, and write a failing test.** Follow these steps in
-order; every command is copy-pasteable from the repo root.
+order; every command is copy-pasteable from the repo root. (Two blind dry runs by the
+PR #24 reviewer, with bugs this doc had never seen, each took about 10 commands.)
 
-**0. Set up** (once): `make setup`. The MCP tools (step 4) need it too.
+**0. Set up** (once): `make setup`. The MCP tools (step 5) need it too.
 
 **1. Read the symptom.** Note the scooter id, the endpoint (`/reservation/end`,
 `/view_all_available`, …) and what was expected vs seen.
@@ -37,14 +38,24 @@ git log --oneline -5                      # or a recent commit
 ```
 Every request record carries `git_dirty` / `git_dirty_paths` too: which code files differed
 from `HEAD` when that server started (see Request records). Note them, but **don't
-conclude from reading the diff**: step 3 gets the evidence.
+conclude from reading the diff**: steps 3–5 get the evidence.
 
-**3. Reproduce on an isolated instance.** A fresh checkout has no records, so make some:
+**3. Run the test suite: the fastest signal.**
+```sh
+make test ARGS="-x -q"           # or the MCP tool run_tests (asks first)
+```
+A planted bug often breaks an existing test, and its name usually points straight at the
+cause (`test_a_scooter_waiting_for_payment_cannot_be_reserved_or_found`,
+`test_after_n_attempts_the_ride_ends_unpaid`, …). Read that test: it's a ready-made
+reproduction. A green suite doesn't clear the code, though; carry on.
+
+**4. Reproduce on an isolated instance.** A fresh checkout has no records, so make some:
 ```sh
 make scenario                    # lists the scenarios
 make scenario NAME=rides         # start/end rides and check /view_all_available (the ACTIVITY symptom)
-make scenario NAME=all           # every scenario: rides, errors, payment-faults, retry-settle,
-                                 # decline, concurrent, restore, reconcile
+make scenario NAME=all           # every scenario: rides, errors, payment-faults (incl. a pending
+                                 # scooter must not be listed or found), retry-settle, decline,
+                                 # concurrent, restore, reconcile (both terminal rules: N attempts, T minutes)
 ```
 - Each run uses the **working-tree code** (a fresh interpreter with its own bytecode
   cache, so a stale `__pycache__` can't hide a planted bug) against its own DB, records
@@ -59,7 +70,7 @@ make scenario NAME=all           # every scenario: rides, errors, payment-faults
   server (Configuration, "Recipes" in Payments & fault injection), or look at the live
   records (`data/records.jsonl`) if the symptom happened there.
 
-**4. Query the evidence.** MCP tools first (`scenario="<name>"` reads a scenario run;
+**5. Query the evidence.** MCP tools first (`scenario="<name>"` reads a scenario run;
 omit it for the live files); the CLI is the fallback and needs no approval.
 
 | Question | MCP tool | CLI |
@@ -72,7 +83,7 @@ omit it for the live files); the CLI is the fallback and needs no approval.
 | DB + ledger + records consistent? | `check_invariants` | `SCOOTER_DB_PATH=data/scenarios/rides/db.json SCOOTER_RECORDS_PATH=data/scenarios/rides/records.jsonl SCOOTER_PAYMENTS_LEDGER_PATH=data/scenarios/rides/ledger.jsonl .venv/bin/python tests/invariants.py` |
 | What's in the DB now? | `scooter_state(scooter_id="18")` | `cat data/scenarios/rides/db.json` |
 
-**5. Locate the bad code path** with the record's three snapshots and its decisions:
+**6. Locate the bad code path** with the record's three snapshots and its decisions:
 - `scooter_before`: what the request read. `scooter_after`: what is **on disk** after it.
   `scooter_in_memory`: what the code **believed** when it finished.
 - `in_memory` right but `after` wrong, with `db_write: ok` → the code changed the scooter
@@ -83,11 +94,15 @@ omit it for the live files); the CLI is the fallback and needs no approval.
 - `db_write: refused` with a problem, or an `exception` field → the code built an invalid
   state, or crashed; the message names the field.
 - `params: ok` on input that should have been rejected → validation.
+- a listing (`/view_all_available`'s `filter`, `/search`'s `search` decision) records the
+  ids it showed (`listed` / `matches`) and the reserved ones with why
+  (`unavailable: {"15": "payment_pending"}`); anomaly `listed_unavailable` flags a scooter
+  in both.
 - `payment` decisions: `gateway_outcome`, `fault` (why that outcome) and
   `simulator.charged` (did money move) → payment-path bugs. Then grep for the decision
   that went wrong: each `records.note('<step>', '<outcome>', …)` call in `app.py` names it.
 
-**6. Write a failing test** that reproduces it through the API and checks the persisted
+**7. Write a failing test** that reproduces it through the API and checks the persisted
 state. The fixtures are in `tests/conftest.py` (see Test): `client`, `read_db`,
 `read_records`, `read_ledger`; every test gets its own DB, records and ledger. Template
 (`tests/test_<symptom>.py`):
@@ -107,7 +122,7 @@ Payment faults: `monkeypatch.setenv("PAYMENT_FAULT", "decline")` (or `timeout_ch
 `timeout_not_charged`, `error`). Run it: `make test ARGS="tests/test_<symptom>.py"`; it
 must **fail** on the buggy code, for the reason you found.
 
-**7. Fix it and confirm** the test passes, then `make test` (everything) and
+**8. Fix it and confirm** the test passes, then `make test` (everything) and
 `make scenario NAME=all` (no `UNEXPECTED`, exit 0).
 
 ### Worked examples: "I ended my ride on scooter 18 but it still shows as reserved"
@@ -781,8 +796,10 @@ show it. Every settling decision records the end coordinates it settles at, whic
      ```
      It reads the same `SCOOTER_DB_PATH` / `SCOOTER_PAYMENTS_LEDGER_PATH` /
      `SCOOTER_RECORDS_PATH` as the app (a missing ledger or records file counts as empty).
-     The current DB stands in for the "initial" one, so a ride from before the records
-     began counts only while it's still in the DB. A
+     The current DB stands in for the "initial" one, and every reservation a record saw
+     (in `scooter_before`/`scooter_after`) counts as having existed, so a ride older than
+     the records, such as the committed DB's `legacy-33`, isn't mistaken for a charge under
+     a key nobody owned (PR #24 review). A
      `"I1 a reservation was charged and also owes a balance"` means a paid balance is still
      open: run `make reconcile`.
   6. **"What did the last restore erase?"** (PLAN PR 15c) An
@@ -1185,7 +1202,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: "reserved" \| "payment_pending"}` for the reserved scooters, at most 50, always including any that was listed; PR #24 review), and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -1237,7 +1254,7 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   files. A leading byte-order mark is ignored (`utf-8-sig`). A line that isn't a complete JSON object (e.g. a partially written last line or a
   stray `42`) is skipped with `warning: <file>:<line>: skipped line, …` on stderr; the
   query still answers.
-- **`anomalies`** flags eighteen contradictions. Most are within a single record;
+- **`anomalies`** flags nineteen contradictions. Most are within a single record;
   `pending_location_changed`, `double_charge`, `scooter_double_charge` and
   `charged_and_owed` also compare records with each other:
   - **`write_not_persisted`:** `db_write.ok` is true but `scooter_after` ≠
@@ -1314,6 +1331,11 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     when a settled record exists. The human output labels it `[historical: resolved]`.
     Resolved means "no longer owed in the DB", not "never happened": the rider was
     declined and then charged for that ride.
+  - **`listed_unavailable`:** a `/view_all_available` (`filter` decision) or `/search`
+    (`search` decision) listed a scooter that the same decision records as unavailable
+    (`unavailable: {id: "reserved" | "payment_pending"}`, computed from the DB it read,
+    separately from the filter). A listing filter bug (PR #24 review: a planted
+    "list pending scooters" bug left only a count to reason about).
   - **`reconcile_not_settled`:** a `/reconcile` record says it ended a ride (status 200,
     an action other than `none` or `clear_paid_balance`) but `scooter_after` is still
     reserved; or it ended one unpaid (`end_unpaid`) without a `payment_unresolved`

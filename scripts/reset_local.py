@@ -95,6 +95,12 @@ def main(argv=None):
     if out.returncode != 0:
         print(f"reset-local: git restore failed: {out.stderr.strip()} (the backup is in {backup})", file=sys.stderr)
         return 1
+    # a fresh clone has data/.gitkeep (tracked); put it back if data/ was missing or emptied
+    (root / "data").mkdir(exist_ok=True)
+    if not (root / "data" / ".gitkeep").exists():
+        restored = subprocess.run(["git", "restore", "--", "data/.gitkeep"], cwd=root, capture_output=True)
+        if restored.returncode != 0:
+            (root / "data" / ".gitkeep").touch()
     print(f"reset-local: done. {DB_NAME} is the committed file; data/ is empty. "
           f"Undo: move the files back from {os.path.relpath(backup, root)}/.")
     return 0

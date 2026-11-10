@@ -34,12 +34,20 @@ def _reservation(entry):
 
 
 def started_keys(records, initial_db):
-    """Every reservation's idempotency key that ever existed: the initial DB's plus every
-    successful start's."""
+    """Every reservation's idempotency key that ever existed: the initial DB's, every
+    successful start's, and every reservation any record saw (its `scooter_before` or
+    `scooter_after`). The last covers rides older than the records, e.g. the committed DB's
+    legacy-33, when the current DB stands in for the initial one (the CLI below, the MCP
+    `check_invariants`): otherwise a ride that started before the records and has ended
+    since looks like a charge under a key nobody owned (PR #24 review)."""
     keys = {r["idempotency_key"] for r in map(_reservation, initial_db) if r}
     for rec in records:
         if rec.get("path") == "/reservation/start" and rec.get("status") == 200:
             keys.add(rec["scooter_after"]["reservation"]["idempotency_key"])
+        for snapshot in (rec.get("scooter_before"), rec.get("scooter_after")):
+            reservation = snapshot.get("reservation") if isinstance(snapshot, dict) else None
+            if isinstance(reservation, dict) and reservation.get("idempotency_key"):
+                keys.add(reservation["idempotency_key"])
     return keys
 
 

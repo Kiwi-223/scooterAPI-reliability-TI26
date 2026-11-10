@@ -96,6 +96,8 @@ def payment_faults(d):
     for sid in ("15", "9", "14"):
         d.expect_db(sid, lambda s: s["is_reserved"] and s["reservation"]["payment_state"] == "payment_pending",
                     f"{sid}'s ride is payment_pending after a timeout or error")
+        d.expect_available(sid, False, f"{sid} isn't listed while its payment is pending")
+        d.expect_found(sid, False, f"{sid} isn't found by search while its payment is pending")
         d.req(f"/reservation/start?id={sid}", (422, "scooter_payment_pending"), f"{sid} can't be started while pending")
     for sid in ("15", "9", "14"):
         d.req(f"/reservation/end?id={sid}&lat=5&lng=5", 200, f"a retry settles {sid} (at the stored location)")
@@ -160,16 +162,30 @@ def restore(d):
 
 
 def reconcile_stuck(d):
-    """Stuck rides: reconcile settles a charged timeout and ends an unresolved one unpaid."""
-    d.req("/reservation/start?id=18", 200, "start 18")
-    d.req("/reservation/end?id=18&lat=23.01&lng=19.01", (502, "payment_failed"), "18 stays pending", fault="error")
+    """Stuck rides: a charged timeout settles; N failed attempts end unpaid (no N+1th call); a
+    fresh failure is retried; an old one ends unpaid by age."""
     d.req("/reservation/start?id=15", 200, "start 15")
     d.req("/reservation/end?id=15&lat=0.01&lng=-129.01", (504, "payment_timeout"), "15 was charged, then timed out",
           fault="timeout_charged")
-    d.reconcile("reconcile an hour later (H3's terminal rule applies to 18)", hours_later=1)
+    d.req("/reservation/start?id=9", 200, "start 9")
+    for n in (1, 2, 3):
+        d.req("/reservation/end?id=9&lat=-14.01&lng=-153.01", (502, "payment_failed"), f"9's payment fails ({n} of 3)",
+              fault="error")
+    d.req("/reservation/start?id=18", 200, "start 18")
+    d.req("/reservation/end?id=18&lat=23.01&lng=19.01", (502, "payment_failed"), "18's payment fails once", fault="error")
+    d.reconcile("reconcile now (N=3 attempts, T=15 min)",
+                expect={"15": "settle_charged", "9": "end_unpaid", "18": "retry"})
     d.expect_db("15", lambda s: not s["is_reserved"] and not open_balances(s), "15 settled with its charge")
-    d.expect_db("18", lambda s: not s["is_reserved"] and [b["reason"] for b in open_balances(s)] == ["payment_unresolved"],
-                "18 ended unpaid with a payment_unresolved balance")
+    d.expect_db("9", lambda s: not s["is_reserved"] and [b["reason"] for b in open_balances(s)] == ["payment_unresolved"],
+                "after 3 failed attempts 9 ended unpaid with a payment_unresolved balance (H3)")
+    d.expect_ledger(lambda entries: sum(e["scooter_id"] == "9" for e in entries) == 3,
+                    "reconcile made no 4th gateway call for 9")
+    d.expect_db("18", lambda s: not s["is_reserved"] and not open_balances(s), "18's retry paid")
+    d.req("/reservation/start?id=14", 200, "start 14")
+    d.req("/reservation/end?id=14&lat=0.01&lng=0.01", (502, "payment_failed"), "14's payment fails once", fault="error")
+    d.reconcile("reconcile an hour later: the age rule (T) ends 14 unpaid", hours_later=1, expect={"14": "end_unpaid"})
+    d.expect_db("14", lambda s: not s["is_reserved"] and [b["reason"] for b in open_balances(s)] == ["payment_unresolved"],
+                "14 ended unpaid by age")
 
 
 SCENARIOS = {"rides": rides, "errors": errors, "payment-faults": payment_faults, "retry-settle": retry_settle,
@@ -256,6 +272,17 @@ class Driver:
                           problem=None if ok else f"expected scooter {sid} {'listed' if yes else 'not listed'}, "
                                                   f"but it {'is' if listed else 'is not'}")
 
+    def expect_found(self, sid, yes, why):
+        """Search right around the scooter's current position: is it in the results?"""
+        s = self.db()[sid]
+        url = f"/search?lat={s['lat']}&lng={s['lng']}&radius=1000"
+        rid, status, kind, body = self._request(url)
+        found = status == 200 and isinstance(body, list) and sid in [r.get("id") for r in body]
+        ok = found is yes
+        return self._step(kind="request", request_id=rid, request=f"GET {url}", status=status, error_kind=kind,
+                          why=why, ok=ok, problem=None if ok else f"expected scooter {sid} {'found' if yes else 'not found'}, "
+                                                                  f"but it {'is' if found else 'is not'}")
+
     def concurrent(self, urls, why):
         results = [None] * len(urls)
         barrier = threading.Barrier(len(urls))
@@ -281,13 +308,18 @@ class Driver:
         shutil.copyfile(self.out / f"snapshot-{name}.json", os.environ["SCOOTER_DB_PATH"])
         return self._step(kind="restore", why=why, ok=True, problem=None)
 
-    def reconcile(self, why, hours_later=0):
+    def reconcile(self, why, hours_later=0, expect=None):
+        """One reconcile run; expect: {scooter_id: the action reconcile must take for it}."""
         import reconcile
         later = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=hours_later)
         summary = reconcile.run(now=lambda: later)
-        return self._step(kind="reconcile", why=why, ok=not reconcile.remaining(summary),
-                          problem=None if not reconcile.remaining(summary) else "reconcile left something",
-                          detail=[{k: r.get(k) for k in ("scooter_id", "action", "result", "request_id")}
+        actions = {r.get("scooter_id"): r.get("action") for r in summary["results"]}
+        problems = [f"scooter {sid}: expected {want}, reconcile did {actions.get(sid, 'nothing')}"
+                    for sid, want in (expect or {}).items() if actions.get(sid) != want]
+        if reconcile.remaining(summary):
+            problems.append("reconcile left something (exit 1)")
+        return self._step(kind="reconcile", why=why, ok=not problems, problem="; ".join(problems) or None,
+                          detail=[{k: r.get(k) for k in ("scooter_id", "action", "result", "reason", "request_id")}
                                   for r in summary["results"]])
 
 

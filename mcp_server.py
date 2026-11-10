@@ -187,7 +187,7 @@ def scooter_state(scooter_id: str = "all", scenario: str | None = None) -> dict[
 
 @server.tool()
 def anomalies(since: str | None = None, scenario: str | None = None) -> dict[str, Any]:
-    """Records whose fields contradict each other (the 18 rules in AGENTS.md). `unresolved`
+    """Records whose fields contradict each other (the 19 rules in AGENTS.md). `unresolved`
     is what needs attention; a resolved finding is history (`make records ARGS="anomalies"`)."""
     records, read = _records(scenario)
     path = data_paths(scenario)["db"]

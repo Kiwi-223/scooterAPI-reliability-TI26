@@ -801,3 +801,38 @@ strongest entries.
   against the real code, so it can't rot. Lesson: **run every snippet you document,
   against both the broken and the fixed code**; "it fails on the bug" proves nothing until
   it also passes without it.
+
+### 41. The documented "is everything consistent?" command was wrong on clean data
+- **Where:** PLAN PR 17, the playbook's step 4 (`tests/invariants.py` on a scenario's files)
+  and MCP `check_invariants(scenario=…)`.
+- **What the AI claimed:** the command answers "DB + ledger + records consistent?".
+- **Reality:** on every clean `rides` run it reported
+  `I3 charged under a key no reservation owned` for `legacy-33`. The CLI uses the current
+  DB as the "initial" one, the scenario ends 33's committed legacy ride, and no start
+  record exists for it. The scenario's own summary used the real initial DB and said 0,
+  so the two disagreed. A cold agent would have chased a double charge that didn't exist.
+- **How it was caught:** the PR #24 reviewer ran every documented step-4 command after a
+  clean scenario. I had tested the scenario's summary, not the commands I told readers to
+  run.
+- **What changed:** `started_keys` also counts every reservation a record saw (right for
+  live data too: a ride older than the records still existed), and a test runs every
+  documented step-5 command (CLI and MCP) on every clean scenario. Lesson: **test the
+  commands the docs tell people to run, exactly as written**, not an internal equivalent.
+
+### 42. Scenarios gave false coverage, and the playbook order hid the strongest signal
+- **Where:** PLAN PR 17, `scenarios.py` and the playbook's step order.
+- **What the AI claimed:** the scenarios cover normal rides, each fault, retries,
+  reconcile and so on, so a planted bug shows up in their evidence.
+- **Reality:** the reviewer planted "view_all lists payment_pending scooters" and "the
+  reconcile attempt limit is `>` not `>=`". All 8 scenarios passed for both: none
+  checked a pending scooter's visibility, and the reconcile scenario only exercised the
+  age rule. The existing test suite failed on both immediately, with test names pointing
+  at the cause, but the playbook only mentioned `make test` after the fix.
+- **How it was caught:** the reviewer's two blind cold-agent dry runs.
+- **What changed:** the playbook runs `make test` first ("the fastest signal").
+  `payment-faults` asserts a pending scooter isn't listed or found, and `reconcile`
+  exercises N attempts (no N+1th call). Listings record what they showed and what was
+  unavailable, with a new `listed_unavailable` anomaly. Both reviewer plants are now
+  tests. Lesson: **a scenario only covers the expectations it states**: list the rules
+  (both terminal rules, every listing) and check each has an expectation, and put the
+  cheapest strong signal (the existing tests) first.

@@ -57,7 +57,7 @@ def records_of(summary):
 
 # ---- the scenarios are clean on the real code ---------------------------------------------------
 
-def test_every_scenario_is_clean_on_the_real_code(scenarios_dir):
+def test_every_scenario_is_clean_on_the_real_code_by_every_documented_command(scenarios_dir):
     code, summaries = run_scenario("all")
     bad = {s["scenario"]: (s["unexpected"], s["anomalies"], s["invariant_violations"]) for s in summaries if not s["clean"]}
     assert code == 0 and bad == {}
@@ -65,6 +65,22 @@ def test_every_scenario_is_clean_on_the_real_code(scenarios_dir):
                                                   "concurrent", "restore", "reconcile"}
     assert all(Path(s["dir"]).parent == scenarios_dir for s in summaries)
     assert sum(s["requests"] for s in summaries) > 60
+    # PR #24 review: the playbook's own step-4 commands must agree with the summary on clean
+    # data (the invariants CLI reported a false I3 for legacy-33 on every clean `rides` run)
+    for s in summaries:
+        d = Path(s["dir"])
+        env = dict(os.environ, SCOOTER_DB_PATH=str(d / "db.json"), SCOOTER_RECORDS_PATH=str(d / "records.jsonl"),
+                   SCOOTER_PAYMENTS_LEDGER_PATH=str(d / "ledger.jsonl"))
+        invariants = subprocess.run([sys.executable, "tests/invariants.py"], cwd=REPO, env=env, capture_output=True, text=True)
+        assert invariants.returncode == 0, (s["scenario"], invariants.stdout)
+        for args in (["anomalies", "--db", str(d / "db.json")],
+                     ["ledger-check", "--ledger", str(d / "ledger.jsonl"), "--min-age", "0"]):
+            cli = subprocess.run([sys.executable, "-m", "records_query", "--file", str(d / "records.jsonl"), *args],
+                                 cwd=REPO, capture_output=True, text=True)
+            assert cli.returncode == 0, (s["scenario"], args[0], cli.stdout)
+        mcp_invariants = _call("check_invariants", {"scenario": s["scenario"]})
+        assert mcp_invariants.structured_content["result"]["ok"], (s["scenario"], mcp_invariants.structured_content)
+        assert _call("anomalies", {"scenario": s["scenario"]}).structured_content["result"]["unresolved"] == 0
 
 
 def test_a_scenario_never_touches_the_live_files_and_keeps_earlier_runs(scenarios_dir):
@@ -147,6 +163,41 @@ def test_the_activity_symptom_finish_ride_keeps_the_flag(tmp_path, scenarios_dir
     [record] = [r for r in records_of(summary) if r["request_id"] == end["request_id"]]
     refused = [d for d in record["decisions"] if (d["step"], d["outcome"]) == ("db_write", "refused")]
     assert "is_reserved is true but reservation is null" in refused[0]["detail"]["error"]
+
+
+def test_reviewer_plant_view_all_lists_pending_scooters(tmp_path, scenarios_dir):
+    """PR #24 review, blind run 1: scenarios missed it; now a step and an anomaly name it."""
+    copy = planted_copy(tmp_path, "app.py",
+                        "\tavailable_scooters = [scooter for scooter in db if not scooter.is_reserved]",
+                        "\tavailable_scooters = [scooter for scooter in db if not scooter.is_reserved"
+                        " or scooter.reservation['payment_state'] == 'payment_pending']")
+    code, summary = run_scenario("payment-faults", copy)
+    assert code == 1
+    assert "15 isn't listed while its payment is pending" in [s["why"] for s in summary["unexpected"]]
+    assert "listed_unavailable" in {a["type"] for a in summary["anomalies"]}
+    [view] = [r for r in records_of(summary) if r["request_id"] == next(
+        s["request_id"] for s in summary["unexpected"] if s["why"] == "15 isn't listed while its payment is pending")]
+    [listing] = [d for d in view["decisions"] if d["step"] == "filter"]
+    assert "15" in listing["detail"]["listed"] and listing["detail"]["unavailable"]["15"] == "payment_pending"
+
+
+def test_search_listing_reserved_scooters_is_named_too(tmp_path, scenarios_dir):
+    copy = planted_copy(tmp_path, "app.py", "\t\tif distance <= search_radius and not scooter.is_reserved:",
+                        "\t\tif distance <= search_radius:")
+    code, summary = run_scenario("payment-faults", copy)
+    assert code == 1
+    assert "15 isn't found by search while its payment is pending" in [s["why"] for s in summary["unexpected"]]
+    assert "listed_unavailable" in {a["type"] for a in summary["anomalies"]}
+
+
+def test_reviewer_plant_reconcile_attempt_limit_off_by_one(tmp_path, scenarios_dir):
+    """PR #24 review, blind run 2: the reconcile scenario only exercised the age rule."""
+    copy = planted_copy(tmp_path, "reconcile.py", "        if attempts >= max_attempts:", "        if attempts > max_attempts:")
+    code, summary = run_scenario("reconcile", copy)
+    assert code == 1
+    problems = [s["problem"] for s in summary["unexpected"]]
+    assert "scooter 9: expected end_unpaid, reconcile did retry" in problems[0]
+    assert "expected: reconcile made no 4th gateway call for 9" in problems
 
 
 def test_a_payment_bug_timeout_ends_the_ride_as_paid(tmp_path, scenarios_dir):
@@ -272,6 +323,12 @@ def test_reset_local_backs_everything_up_and_resets(scratch_repo, capsys):
             continue
         assert (backup / path).read_bytes() == content, path
     assert "Undo: move the files back" in capsys.readouterr().out
+
+
+def test_reset_local_recreates_a_missing_data_dir(scratch_repo):
+    shutil.rmtree(scratch_repo / "data")
+    assert reset_local.main(["--root", str(scratch_repo)]) == 0
+    assert sorted(p.name for p in (scratch_repo / "data").iterdir()) == [".gitkeep"]
 
 
 def test_reset_local_dry_run_changes_nothing(scratch_repo):
