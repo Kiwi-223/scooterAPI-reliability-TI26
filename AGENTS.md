@@ -118,7 +118,7 @@ same command (see CI below).
   - `tests/seed_db.json` is the test-owned seed data: 5 scooters, and `33` starts reserved.
   - `tests/messages.py` holds the exact `msg` strings the API returns today.
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
-    `test_failure_kinds.py`, `test_records.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
+    `test_failure_kinds.py`, `test_records.py`, `test_records_query.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
 - **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
@@ -225,6 +225,7 @@ every pull request and on every push to `master`.
 | `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `find_db_shape_problem`, `write_db`, `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
 | `failures.py` | The failure-kind registry (`FailureKind`) and `StorageError` (see Failure kinds). |
 | `records.py` | Request records: request ids, one JSON line per request (see Request records). |
+| `records_query.py` | Records query functions and CLI (`make records ARGS=…`, `python -m records_query`). |
 | `data/` | Default home of `records.jsonl`. Git-ignored except `.gitkeep`. |
 | `scooter_db.json` | Live JSON database, mutated by the app (see above). |
 | `README.md` | API contract: endpoints, params, responses. |
@@ -232,7 +233,7 @@ every pull request and on every push to `master`.
 | `PLAN.md` | The authoritative staged plan: PR table, human decisions, change log. |
 | `AGENTS.md` | This file. `CLAUDE.md` just imports it. |
 | `AI_NOTES.md` | Log of where the AI was confidently wrong and how it was caught (Outcome 7). |
-| `Makefile` | `setup`, `run`, `test`, `check-settings`, `lock`, `agent`, `clean` and `help`. More targets (`records`, `reconcile`, `scenario`) arrive with later PLAN PRs. |
+| `Makefile` | `setup`, `run`, `test`, `check-settings`, `records`, `lock`, `agent`, `clean` and `help`. More targets (`reconcile`, `scenario`) arrive with later PLAN PRs. |
 | `.claude/settings.json` | Claude Code sandbox and permission rules for this repo (see Agent boundaries). |
 | `scripts/agent.sh` | Headless `claude -p` wrapper with spend, turn and wall-clock caps (`make agent`). |
 | `scripts/check_settings.py`, `schemas/` | `make check-settings`: validates `.claude/settings.json` against the vendored Claude Code settings schema. |
@@ -287,8 +288,9 @@ the evidence to use when debugging. Read the records before reading code.
   that sets `scooter_after` after a write. `records.init_app(app)` adds the before/after/teardown
   hooks. The teardown hook is a safety net that still writes a record if no response was
   produced.
+- **Querying:** use the records CLI (below). jq is the fallback.
 - **Not done yet:** there's no log rotation (future work). The file grows until you move
-  it aside. A query CLI is **coming in PLAN PR 10**.
+  it aside.
 
 ### Schema (`schema: 1`)
 
@@ -324,7 +326,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
 | `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `db_write` (`ok`/`failed`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup. |
-| `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed. |
+| `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
 | `db_write` | `{attempted, ok, error}`. `error` is the exception type. |
 | `status`, `error` | The HTTP status. `error` is `{kind, msg}` on failure (see Failure kinds), otherwise `null`. |
@@ -333,9 +335,71 @@ the evidence to use when debugging. Read the records before reading code.
 | `git_commit`, `git_dirty`, `git_dirty_paths` | The source tree at **server startup**. `git_dirty` is `true` if any *code* file, tracked or untracked (not git-ignored), differed from `HEAD`. That's how a planted, uncommitted bug shows up, and `git_dirty_paths` lists those files (first 20). Data files the app rewrites (`scooter_db.json`) don't count. All are `null` if git isn't available. **They describe the files on disk at startup, not necessarily the code that's running:** restart the server after changing code, and delete `__pycache__/` after planting or reverting a bug (a same-second, same-size revert can leave stale bytecode in use; AI_NOTES #22). |
 | `pid` | The process that served it, so you can tell gunicorn workers and restarts apart. |
 
-### Querying records (until the CLI in PLAN PR 10)
+### Querying records: the records CLI
 
-These recipes are verified with jq 1.7 (`jq` ships with macOS).
+**Use this first.** It's the agent's way to ask questions without reading raw JSONL, and
+it needs no MCP approval. The MCP server (PLAN PR 16) reuses the same functions.
+
+```sh
+make records ARGS="failure-counts --since 1h"      # how many of each kind in the last hour
+make records ARGS="recent-failures --limit 20"     # newest failures first (--since works too)
+make records ARGS="scooter 18"                     # one scooter's history, oldest first by ts
+make records ARGS="request <request_id>"           # the full record(s) for an X-Request-ID
+make records ARGS="anomalies"                      # records whose fields contradict each other
+make records ARGS="--json failure-counts"          # machine-readable output (global flags go first)
+.venv/bin/python -m records_query --help           # same CLI without make
+```
+
+- **File:** `--file PATH`, else `$SCOOTER_RECORDS_PATH`, else `data/records.jsonl`.
+- **`--since`:** a duration (`30s`, `15m`, `1h`, `2d`, `1h30m`) or an ISO-8601 time (naive
+  means UTC). The window is inclusive (`ts >= since`). A record without a valid `ts` is
+  outside every window. A duration too large for a date (e.g. `99999999d`) is a bad
+  argument (exit 2).
+- **Output:** human-readable by default; `--json` prints exactly one JSON value on stdout.
+  Warnings go to stderr.
+- **Exit codes:**
+  - 0: success, including "0 failures".
+  - 1: `scooter`/`request` found nothing, or `anomalies` found at least one, like `grep`
+    and linters.
+  - 2: bad arguments, or the records file is missing or unreadable.
+
+  `make` turns any non-zero exit into its own error (exit 2), so call
+  `.venv/bin/python -m records_query` when the exact code matters.
+- **Robustness:** reading streams the file line by line, so memory stays flat on large
+  files. A leading byte-order mark is ignored (`utf-8-sig`). A line that isn't a complete JSON object (e.g. a partially written last line or a
+  stray `42`) is skipped with `warning: <file>:<line>: skipped line, …` on stderr; the
+  query still answers.
+- **`anomalies`** flags five contradictions, each within a single record:
+  - **`write_not_persisted`:** `db_write.ok` is true but `scooter_after` ≠
+    `scooter_in_memory`. The code changed the scooter, but the written data didn't contain
+    the change.
+  - **`success_without_write`:** a `/reservation/*` request returned 200 without
+    attempting a DB write. (PLAN PR 14's idempotent end retries will need an exemption
+    here.)
+  - **`start_left_free`:** `/reservation/start` returned 200 but `scooter_after` isn't
+    reserved.
+  - **`end_left_reserved`:** `/reservation/end` returned 200 but `scooter_after` is still
+    reserved.
+  - **`end_location_not_persisted`:** `/reservation/end` returned 200 but `scooter_after`'s
+    `lat`/`lng` differ from the requested end coordinates. They're compared as floats, the
+    way the app parses them, so `+23.01` equals `23.01`. This one also catches code that
+    never moves the scooter at all, where in-memory and written state agree.
+
+  Tested to have zero false positives on every legitimate flow: start, end, re-reserve
+  after end, refused starts and ends, an unknown scooter, lenient-float coordinates, a
+  failed payment, search, view, and 404. Every rule is also tested on records from a
+  planted bug.
+  - **Deliberately not included: a cross-record continuity check** ("this request's
+    `scooter_before` equals the previous `scooter_after`"). Concurrent workers,
+    `git restore` of the DB and manual edits all break that chain legitimately, so it would
+    mostly be noise. The per-record rules catch persistence bugs inside the request that
+    caused them. For a manual continuity view, use `make records ARGS="scooter <id>"`,
+    which prints before/after for each request in `ts` order.
+- **Code:** `records_query.py`. These are pure functions over any iterable of records:
+  `read_records(path, warn)`, `parse_since`, `failure_counts`, `recent_failures`,
+  `scooter_history`, `find_requests`, `anomalies`. `main()` is the CLI.
+
+**Fallback: jq.** These recipes are verified with jq 1.7 (`jq` ships with macOS).
 
 ```sh
 R=data/records.jsonl     # or "$SCOOTER_RECORDS_PATH"
@@ -401,8 +465,8 @@ Every error response is JSON with a human message and a **stable failure kind**:
   `HTTPException`), and a catch-all for `Exception`. Because the catch-all is registered
   for `Exception` rather than `500`, it also runs with `TESTING=True`.
 - **Counting failures:** group by `error.kind`, never by parsing `msg`. Every request
-  record carries the same `error.kind`; see "Request records" for the jq recipe, and the
-  records CLI (PLAN PR 10) will wrap it.
+  record carries the same `error.kind`: `make records ARGS="failure-counts --since 1h"`
+  (see "Request records").
 - **Tests:** `tests/test_failure_kinds.py` pins the shipped ids and statuses and produces
   **every** kind through a real request. Adding a kind to `failures.py` without adding it
   to `SHIPPED` and `TRIGGERS` there fails the suite. Update this table and README.md in the
@@ -410,8 +474,8 @@ Every error response is JSON with a human message and a **stable failure kind**:
 
 ## Agent tools (MCP)
 
-**Coming in PLAN PR 16.** An MCP server over records and state, with a CLI fallback from
-PLAN PR 10.
+**Coming in PLAN PR 16.** An MCP server over records and state. Until then, and as the
+fallback afterwards, use the records CLI (`make records`, see "Request records").
 
 ## Debugging a symptom
 

@@ -12,7 +12,7 @@ PIP_COMPILE := CUSTOM_COMPILE_COMMAND="make lock" $(BIN)/pip-compile --quiet \
 	--allow-unsafe --generate-hashes --strip-extras
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run test check-settings lock agent clean
+.PHONY: help setup run test check-settings records lock agent clean
 
 help: ## List available targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*## ' $(MAKEFILE_LIST) | \
@@ -36,6 +36,9 @@ test: $(STAMP) ## Run the test suite (pass pytest options with ARGS="-k search -
 
 check-settings: $(STAMP) ## Validate .claude/settings.json against the vendored Claude Code settings schema
 	$(BIN)/python scripts/check_settings.py
+
+records: $(STAMP) ## Query request records: make records ARGS="failure-counts --since 1h" (see AGENTS.md)
+	@$(BIN)/python -m records_query $(ARGS)
 
 # TASK, BUDGET_USD, MAX_TURNS, TIMEOUT_MIN, WORKTREE and DRY_RUN given on the make command line reach
 # the script through the environment, so the task text needs no extra quoting here.
