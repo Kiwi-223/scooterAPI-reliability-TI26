@@ -66,7 +66,7 @@ Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blo
 | # | PR | Scope | Status |
 |---|---|---|---|
 | 9 | `feat`: persisted request records | Every request gets a `request_id`, returned as the `X-Request-ID` header. Each request appends one JSON line to `data/records.jsonl` (configurable path, git-ignored, survives restarts). A record holds: UTC ISO-8601 timestamp, git commit plus a `git_dirty` flag (a planted bug may be uncommitted), method, path, params, `scooter_id`, the decisions made, scooter state **before and after**, the DB write result, the payment result once Stage 4 lands, status, failure kind and duration. Each record is written atomically as a single line, so lines from several workers never interleave. Tests isolate the log. Log rotation is noted as future work. | ✅ |
-| 10 | `feat`: records query CLI | `python -m …records` / `make records ARGS=…` with recent failures, failure counts by kind since a time, scooter history and request trace. This is the fallback that works without MCP approval, and the MCP server in Stage 5 reuses the same module. | ⬜ |
+| 10 | `feat`: records query CLI | `python -m …records` / `make records ARGS=…` with recent failures, failure counts by kind since a time, scooter history and request trace. This is the fallback that works without MCP approval, and the MCP server in Stage 5 reuses the same module. | ✅ |
 
 ### Stage 4: State stays consistent and payment can fail safely (Outcome 3)
 | # | PR | Scope | Status |
