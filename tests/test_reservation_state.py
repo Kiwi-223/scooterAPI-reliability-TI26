@@ -402,3 +402,45 @@ def test_a_restored_reservation_is_charged_again_not_ridden_free(client, monkeyp
                if d["step"] == "reservation" and d["outcome"] == "cleared"]
     assert len(cleared) == 2 and cleared[0] == cleared[1]             # the same key, twice
     assert len(calls) == 2 and calls[0] == calls[1] > 0               # and the rider was charged both times
+
+
+
+# ---- the write guard: a write never drops or invents a scooter ---------------------------------
+
+def _rows_hook(monkeypatch, change):
+    real = app_module.convert_db_to_dictlist
+    monkeypatch.setattr(app_module, "convert_db_to_dictlist", lambda db: change(real(db)))
+
+
+@pytest.mark.parametrize("change,problem", [
+    (lambda rows: [r for r in rows if r["id"] != "15"],
+     "the write would remove 1 and add 0 scooter(s) (removed ids ['15'], added ids [])"),
+    (lambda rows: rows + [{"id": "99", "lat": 0, "lng": 0, "is_reserved": False, "reservation": None}],
+     "the write would remove 0 and add 1 scooter(s) (removed ids [], added ids ['99'])"),
+    (lambda rows: [dict(r, id="15b") if r["id"] == "15" else r for r in rows],
+     "the write would remove 1 and add 1 scooter(s) (removed ids ['15'], added ids ['15b'])"),
+])
+@pytest.mark.parametrize("url", ["/reservation/start?id=18", "/reservation/end?id=33&lat=1&lng=1"])
+def test_a_write_that_changes_the_set_of_scooters_is_refused(client, monkeypatch, db_path, read_records, change, problem, url):
+    _rows_hook(monkeypatch, change)
+    before = db_path.read_bytes()
+    assert_envelope(client.get(url), FailureKind.INTERNAL_ERROR)
+    assert db_path.read_bytes() == before                              # scooter 15 is still there
+    r = read_records()[-1]
+    assert r["db_write"]["error"] == "InvalidDbState"
+    assert [d["detail"]["error"] for d in r["decisions"] if d["step"] == "db_write"] == [problem]
+
+
+def test_a_write_of_a_rebuilt_scooter_list_is_refused(client, monkeypatch, db_path):
+    # e.g. a bug that filters the loaded list into a new plain list: the guard can no longer
+    # tell what was loaded, so it refuses rather than trusting it.
+    real = app_module.write_db
+    monkeypatch.setattr(app_module, "write_db", lambda db, path=None: real([s for s in db if s.id != "15"], path))
+    before = db_path.read_bytes()
+    assert_envelope(client.get("/reservation/start?id=18"), FailureKind.INTERNAL_ERROR)
+    assert db_path.read_bytes() == before
+
+
+def test_init_db_records_the_loaded_ids(db_path):
+    db = app_module.init_db(str(db_path))
+    assert db.loaded_ids == {"15", "18", "9", "14", "33"} == {s.id for s in db}

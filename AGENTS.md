@@ -137,6 +137,16 @@ same command (see CI below).
 - **Guard:** the autouse `_guard_real_db` fixture fails a test if the live
   `scooter_db.json` changed while it ran. Never point `SCOOTER_DB_PATH` at the real file in
   a test.
+  - **The guards also see changes made by anything else.** If another process writes the
+    live `scooter_db.json` or `data/records.jsonl` while `make test` runs, whichever test
+    happens to be running fails with one error, `… changed during this test`. Typical
+    sources: a dev server running from the same checkout (`make run` plus `curl`, which
+    rewrites the DB and appends records), a `git restore scooter_db.json`, or another
+    agent working in this checkout.
+  - It looks like a random flaky test, but it isn't one. **Don't run the server from this
+    checkout while tests run.** Give the server a scratch DB and records path (see
+    Configuration) or use another checkout. If you see that error once, check what else
+    touched those files before calling it a flake.
 - **Fixtures for new tests:**
   - `client`: a Flask test client. It sets `TESTING=True` for that test only, through
     `monkeypatch.setitem(app.app.config, "TESTING", True)`; a test can override it with
@@ -290,7 +300,10 @@ every pull request and on every push to `master`.
 - **The app refuses to write a DB that would fail that validation** (for example, a code
   bug that reserves without a reservation, or reuses another scooter's reservation id),
   or that changes a reservation in an unknown payment state (compared with a copy taken
-  at load). `write_db` checks before writing; the request
+  at load), or whose set of scooter ids differs from the set this transaction loaded (a
+  write must never silently drop or add a scooter; `init_db` returns a `ScooterDb` list
+  that carries `loaded_ids`, and a plain list is refused). `write_db` checks before
+  writing; the request
   becomes `internal_error` (500), the file is left as it was, and the record shows
   `db_write: {attempted: true, ok: false, error: "InvalidDbState"}` plus a
   `db_write: refused` decision naming the problem. Without this, one buggy request would

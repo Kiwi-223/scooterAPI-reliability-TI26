@@ -384,7 +384,7 @@ def init_db(path=None):
 		raise StorageError(f'The scooter database is corrupt ({problem}).', path)
 	records.note('db_read', 'ok', db_path=path, scooters=len(db_list))
 	# populate Scooter objects for easier access later
-	db = []
+	db = ScooterDb(scooter['id'] for scooter in db_list)
 	for scooter in db_list:
 		scooter_obj = Scooter(	scooter['id'], 
 								scooter['lat'], 
@@ -595,6 +595,15 @@ def write_db(db, path=None):
 	db_list = convert_db_to_dictlist(db)
 	path = path or get_db_path()
 	problem = find_db_shape_problem(db_list)
+	loaded_ids = getattr(db, 'loaded_ids', None)
+	if not problem and loaded_ids is None:
+		problem = 'the scooters being written were not loaded by init_db (no loaded ids to compare)'
+	if not problem:
+		written_ids = { scooter['id'] for scooter in db_list }
+		removed, added = sorted(loaded_ids - written_ids), sorted(written_ids - loaded_ids)
+		if removed or added:
+			problem = (f'the write would remove {len(removed)} and add {len(added)} scooter(s) '
+				f'(removed ids {removed[:10]}, added ids {added[:10]})')
 	for i, scooter in enumerate(db):
 		# A reservation in a payment state this code doesn't handle is written back exactly as
 		# it was read, never changed (and never created by this code).
@@ -623,6 +632,13 @@ def write_db(db, path=None):
 		records.note('db_write', 'ok', db_path=path)
 	return True
 		
+class ScooterDb(list):
+	# The list of Scooter objects init_db loaded, plus the ids it loaded. write_db refuses to
+	# write a different set of ids: a write must never silently drop or invent a scooter.
+	def __init__(self, loaded_ids):
+		super().__init__()
+		self.loaded_ids = frozenset(loaded_ids)
+
 # class scooter for internal use
 class Scooter:
 	def __init__(self, scooter_id, lat, lng, is_reserved, reservation=None, extra=None):

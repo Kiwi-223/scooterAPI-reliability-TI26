@@ -148,3 +148,4 @@ These need a person. The agents use the default shown unless told otherwise.
   - Reservation ids and idempotency keys must be unique across scooters (`storage_error`, and refused by the write guard).
   - An unknown `payment_state` now affects only its scooter: reads show it as reserved, start/end on it are `storage_error`, and the write guard never changes it.
   - PR 14's scope gains a `charged_without_persisted_end` anomaly rule.
+- 2026-11-09: PR 12 second review fix: `write_db` also refuses a write whose set of scooter ids differs from the set the transaction loaded. Before this, a write that dropped a whole entry passed the guard and the scooter vanished.
