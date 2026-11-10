@@ -5,22 +5,16 @@ changed because of it (ACTIVITY.md Outcome 7). Three roles appear:
 
 - the **writer** (implements each PLAN row),
 - the **reviewer** (adversarial review of each PR),
-- the **plan** (PLAN.md's first draft) and the **orchestrator** (relays reviews and scopes PRs).
+- the **orchestrator** (wrote the PR #1 plan draft; relays reviews and scopes PRs).
 
-Every entry says who was wrong. Tally: writer 38 entries (5 of them shared with the reviewer),
-reviewer 6, plan 5, orchestrator 1 (shared). The log itself was found inaccurate twice (#7, #9).
-PLAN PR 18 re-checked the entries against their sources, the review comments on each PR.
-Entries about the writer's own in-session work (e.g. #13, #20, #26, #33, #37) have no
-review to check against and rest on the writer's logs. The re-check corrected three
-entries (#17, #22, #36) and one claim that turned out overstated (#38, see #44).
-
-Add new entries in the PR where the mistake is caught, under the matching theme, using the
-format at the end.
+Every entry says who was wrong (the tally is after the top five). Add new entries in the
+PR where the mistake is caught, under the matching theme, using the format below.
 
 ## The ones that matter
 
 Five entries worth reading first. Each has a clear confident claim, evidence of how it was
 caught (with links), what changed, and a lesson that transfers beyond this repo.
+**Short on time? Read 1, 3, 2.**
 
 ### 1. ★ Recommended demo story: "same ride" decided by the amount let a second ride go free (#27, #28, #34)
 - **Who was wrong:** both agents. The reviewer recommended matching a ride on
@@ -47,8 +41,20 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 - **Why it's the demo story (3 minutes):** (1) the claim, in one sentence, from the docs;
   (2) the reviewer's four-step repro with the numbers above; (3) why it happened (amount =
   rounded distance, and the reviewer's own recommendation said "amount"); (4) the fix and the
-  test; (5) the pattern recurring in #30 and #34, and the rule it produced. It shows both
+  test; (5) the same mistake recurred twice (#30, #34), so it became a rule. It shows both
   agents confidently wrong, a concrete money bug, and evidence anyone can re-run.
+- **Show live:**
+  - the test: `make test ARGS="tests/test_payments.py::test_an_equidistant_end_after_a_restore_is_a_conflict_not_a_free_ride"`
+    (passes now);
+  - the pre-fix match rule: `git show 10b1064:payments.py` (`_matches`, line 176, compares
+    scooter, reservation and amount only), in
+    [PR #16's first commit](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/commit/10b10646a14bddb12c61ce026878b0d6cb745455);
+    the fix is [33cfc8a](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/commit/33cfc8aeae99ec4408111fd35315dfa4ff8867e2).
+    Make today's `_matches` compare only scooter, reservation and amount again, and the test
+    fails: the south end gets a 200 with the north ride's `txn_id` where it expects a 409
+    (checked in a scratch clone in PLAN PR 18).
+- **Fallback:** if the audience cares most about the cold-agent test, tell #3
+  (`scooter_after`) instead: it maps directly onto the ACTIVITY symptom.
 
 ### 2. The double charge the operator's evidence tool couldn't see (#29, #30)
 - **Who was wrong:** writer.
@@ -58,7 +64,8 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 - **How it was caught:** the [PR #17 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/17#issuecomment-6771634533)
   ran the suite, the invariants and `anomalies` separately against 8 planted bugs: the suite
   caught all 8, `anomalies` named 3. The [PR #18 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/18#issuecomment-6772119841)
-  planted a ninth bug, a new idempotency key per attempt: a charged timeout plus a retry
+  planted four new bugs (N1, N2, N2b, N3). N3, a new idempotency key per attempt (kept as
+  M9), was the worst: a charged timeout plus a retry
   **charged one ride twice**, `anomalies` was silent, and the invariants reported only "I2
   ended without a charge".
 - **What changed:** new anomaly rules (`double_charge`, `payment_key_mismatch`, and three
@@ -85,17 +92,23 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
   has to be read from what was persisted.
 
 ### 4. Text-matched deny rules leaked, one spelling at a time (#14, #15, #17)
-- **Who was wrong:** writer, four review rounds running.
+- **Who was wrong:** writer, three review rounds running. (The
+  [first PR #7 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/7#issuecomment-6648379771)
+  found no deny leaks: `gh api` still asked then. The leaks came with the H10 update,
+  which allowed it.)
 - **The confident claim:** each round presented the deny list as covering the dangerous
-  commands: "deny rules cover the dangerous `gh api` calls", then force-pushes denied "in
-  every spelling we know", then "whole-token quotes are caught".
-- **How it was caught:** the reviewer's command simulations, each round
-  ([PR #7](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/7#issuecomment-6755689638),
-  [PR #7 re-review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/7#issuecomment-6755956778),
-  [PR #8](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/8#issuecomment-6756053310)):
-  `gh api -X PATCH …/git/refs/heads/master -F force=true` was auto-approved with the owner's
-  admin token; `git push --mirror` was allowed; then `'-f'`, `-"f"`, `-\f` (and, in the
-  simulation only, a tab before `-f`) slipped through.
+  commands: "deny rules cover the dangerous `gh api` calls" and force-pushes denied "in
+  every spelling we know" (the H10 update), then the cluster rules, then "whole-token
+  quotes are caught".
+- **How it was caught:** the reviewer's command simulations, one per round:
+  1. [PR #7 re-review 1](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/7#issuecomment-6755689638)
+     (37 commands): `gh api -X PATCH …/git/refs/heads/master -F force=true` was
+     auto-approved with the owner's admin token, `--method=DELETE` slipped past the DELETE
+     denies, and `git push --mirror` / `--all` / `--prune` were allowed.
+  2. [PR #7 re-review 2](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/7#issuecomment-6755956778):
+     three-letter short-flag clusters such as `-fqu` were auto-approved (fixed in PR #8).
+  3. [PR #8 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/8#issuecomment-6756053310):
+     `'-f'`, `-"f"`, `-\f` (and, in the simulation only, a tab before `-f`) slipped through.
 - **What changed:** API writes now ask; push rules start from `git push -h`'s full option
   list; and the writer **stopped** chasing spellings. The remaining gaps are pinned as
   "known gap" tests and documented, and the real controls are named: branch protection (H2)
@@ -128,11 +141,29 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
   you loosen a checker, plant a bug aimed at the loosened case before claiming other checks
   cover it, whoever proposed the loosening.
 
+## Tally, and how this log was checked
+
+Counted from the "Who was wrong" lines of all 45 entries; an entry naming two or three
+agents counts for each of them.
+- **Writer: 39** (every entry except #1–#5 and #22). 6 of them are shared with the
+  reviewer: #9, #28, #34, #38, #43, #44. #34 counts as shared because its line names the
+  reviewer's #28 as part of the pattern.
+- **Reviewer: 7** (those 6, plus #22).
+- **Orchestrator: 6** (#1–#5, the PR #1 plan draft, and #44, shared with both agents).
+
+The log itself was found inaccurate several times (#7, #9, #45). PLAN PR 18 re-checked the
+entries against their sources, the review comments on each PR. Entries about the writer's
+own in-session work (e.g. #13, #20, #26, #33, #37) have no review to check against and rest
+on the writer's logs. The re-check corrected two entries (#17, #36) and one claim that
+turned out overstated (#38, see #44). The PR #25 review then corrected the re-check
+itself: the PR #1 draft's author (#45), a #22 detail it had wrongly dropped, the deny-rule
+round count (#17), and status lines in #3–#5 that had gone stale.
+
 ## Entry format
 
 ```md
 #### N. <short title>
-- **Who was wrong:** <writer | reviewer | plan | orchestrator, and in what>
+- **Who was wrong:** <writer | reviewer | orchestrator, and in what>
 - **Where:** <PR / file / plan section>
 - **What the AI claimed:** <the confident statement or design, as it was presented>
 - **Reality:** <what was actually true, with evidence>
@@ -188,6 +219,7 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 | 42 | Scenarios gave false coverage, and the playbook order hid the strongest signal | Tests that passed for the wrong reason |
 | 43 | Both agents loosened a checker and each claimed the other checks still covered it | Identity and integrity checks |
 | 44 | The reviewer called a guardrail missing without checking the platform's built-in protections | Security boundaries and guardrails |
+| 45 | The attribution roles turned a document ("plan") into a party, hiding who wrote the plan draft | Process slips |
 
 ## All entries, by theme
 
@@ -196,10 +228,10 @@ elsewhere ("AI_NOTES #27") still work. Within a theme, related entries sit toget
 
 ### Planning before any code
 
-Plan-level claims from the first draft (PR #1), caught by reviewing the plan.
+Claims in the PR #1 plan draft (written by the orchestrator), caught by reviewing the plan.
 
 #### 1. "Python 3.14 is the current stable release"
-- **Who was wrong:** plan (the PR #1 draft).
+- **Who was wrong:** orchestrator (wrote the PR #1 plan draft).
 - **Where:** PLAN.md toolchain section, first draft (PR #1).
 - **What the AI claimed:** Python 3.14 was "current stable", so it was the right target.
 - **Reality:** Python 3.15 came out on 2026-10-09 (latest 3.15.2). The machine's 3.14.7
@@ -210,7 +242,7 @@ Plan-level claims from the first draft (PR #1), caught by reviewing the plan.
   `.python-version` = 3.15 and a Makefile that checks the venv's version.
 
 #### 2. "Turn debug off", plus a whole PR for unchecked breakage
-- **Who was wrong:** plan (the PR #1 draft).
+- **Who was wrong:** orchestrator (wrote the PR #1 plan draft).
 - **Where:** PLAN.md PR 2, first draft (PR #1).
 - **What the AI claimed:** the first draft's PR 2 was "`fix`: app runs on modern stack". It
   said to "Fix anything that breaks on Flask 3 / geopy 2", which was hedged, and to "Turn
@@ -226,7 +258,7 @@ Plan-level claims from the first draft (PR #1), caught by reviewing the plan.
   and through gunicorn.
 
 #### 3. "Deterministic outcome per idempotency key" + "retry with the same key" is safe
-- **Who was wrong:** plan (the PR #1 draft).
+- **Who was wrong:** orchestrator (wrote the PR #1 plan draft).
 - **Where:** PLAN.md payment design (PRs 13/14/15), first revision of PR #1.
 - **What the AI claimed:** making each fake-gateway outcome a deterministic function of
   the idempotency key, and retrying with that same key, gave safe and reproducible payments.
@@ -238,11 +270,13 @@ Plan-level claims from the first draft (PR #1), caught by reviewing the plan.
   of reading each one on its own.
 - **What changed:** PLAN.md was revised. The planned outcome function now takes the
   attempt number (seed, key, attempt), and the planned reconcile has a terminal rule: after
-  N attempts or T minutes with no charge, the ride ends with an outstanding balance. None
-  of this is built yet; it lands in PLAN PRs 13–15.
+  N attempts or T minutes with no charge, the ride ends with an outstanding balance.
+  At the time: "None of this is built yet; it lands in PLAN PRs 13–15." **Now:** built.
+  The seeded draw takes (seed, key, attempt) (`payments.draw`, PLAN PR 13), and
+  `make reconcile` applies the N/T terminal rule (PLAN PR 15).
 
 #### 4. Bash deny patterns "enforce" no network and no push to master
-- **Who was wrong:** plan (the PR #1 draft).
+- **Who was wrong:** orchestrator (wrote the PR #1 plan draft).
 - **Where:** PLAN.md agent-boundaries PR (now PLAN PR 6), first draft (PR #1).
 - **What the AI claimed:** permission deny patterns on Bash commands would enforce "no
   network except localhost" and "no pushes to master".
@@ -252,11 +286,15 @@ Plan-level claims from the first draft (PR #1), caught by reviewing the plan.
 - **How it was caught:** the adversarial review of the plan.
 - **What changed:** the plan now relies on the harness **sandbox** (OS-level filesystem
   and network limits, PLAN PR 6) plus GitHub **branch protection** on `master` (H2) for
-  enforcement. Deny patterns are planned as only a first line. Neither control is in place
-  yet: PR 6 hasn't landed, and branch protection is still waiting on a human (H2).
+  enforcement. Deny patterns are planned as only a first line. At the time: "Neither
+  control is in place yet: PR 6 hasn't landed, and branch protection is still waiting on a
+  human (H2)." **Now:** PR 6 has landed and the sandbox is configured, but it was observed
+  **not** running in the agents' subagent sessions (unverified, with the human; see
+  AGENTS.md). Branch protection (H2) is still off. The deny patterns did leak (#14, #15,
+  #17).
 
 #### 5. "Decline → ride stays open" is safe for Outcome 3
-- **Who was wrong:** plan (the PR #1 draft).
+- **Who was wrong:** orchestrator (wrote the PR #1 plan draft).
 - **Where:** PLAN.md human decision H3, first draft (PR #1).
 - **What the AI claimed:** after a declined payment, keeping the ride open with no charge
   met Outcome 3 ("nothing gets corrupted").
@@ -265,7 +303,9 @@ Plan-level claims from the first draft (PR #1), caught by reviewing the plan.
 - **How it was caught:** the adversarial review of the plan.
 - **What changed:** PLAN.md's H3 default is now "end the ride, free the scooter, take no
   charge, record an outstanding balance". Keeping the ride open with an expiry is listed as
-  the alternative. The policy is implemented in PLAN PR 14; it doesn't exist in code yet.
+  the alternative. At the time: "The policy is implemented in PLAN PR 14; it doesn't exist
+  in code yet." **Now:** implemented in PLAN PR 14: a decline ends the ride with an
+  `outstanding_balances` entry (AGENTS.md, Payment state machine).
 
 ### Identity and integrity checks
 
@@ -344,8 +384,10 @@ Which ride, which reservation, "at most one": checks keyed on the wrong thing, o
   `tests/test_planted_payment_bugs.py`.
 - **What the AI claimed:** with every one of PR #17's 8 planted bugs named by `anomalies`,
   the cold agent's evidence tool now covered the end-ride state machine's failure modes.
-- **Reality:** the reviewer planted a ninth, plausible bug: a new idempotency key per
-  attempt. A charged timeout followed by a retry then charged **one ride twice**, the
+- **Reality:** the [PR #18 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/18#issuecomment-6772119841)
+  planted four new bugs (N1, N2, N2b, N3). One of them, N3 (kept as M9), was plausible and
+  the worst: a new idempotency key per attempt. A charged timeout followed by a retry then
+  charged **one ride twice**, the
   worst outcome Outcome 3 exists to rule out.
   - `anomalies` was silent.
   - The invariants misreported it as "I2 ended without a charge", because the charges
@@ -835,7 +877,9 @@ Text-matched rules, validators and approvals presented as stronger than they wer
   `--branches`, `--delete`/`-d` and `--receive-pack`/`--exec` (which run a program). Git
   also accepts unique abbreviations (`--mirr`), and `'HEAD:master'` in quotes defeated the
   `*:master` rule.
-- **How it was caught:** the reviewer's simulation of `--mirror`, `--all` and `--prune`.
+- **How it was caught:** the reviewer's simulation of `--mirror`, `--all` and `--prune`,
+  in the same [PR #7 re-review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/7#issuecomment-6755689638)
+  as #14.
 - **What changed:**
   - Every dangerous flag from `git push -h` (git 2.54) is denied by its shortest unique
     prefix, anywhere in the command.
@@ -865,16 +909,18 @@ Text-matched rules, validators and approvals presented as stronger than they wer
   made by the behavioural tests themselves, before review.
 
 #### 17. Text-matched deny rules kept leaking, one spelling at a time
-- **Who was wrong:** writer, four rounds running.
+- **Who was wrong:** writer, three review rounds running.
 - **Where:** the `git push` and `gh api` deny rules across PRs #7 and #8.
 - **What the AI claimed:** each round of fixes presented the deny list as covering the
   dangerous spellings, first "every spelling we know" and then "whole-token quotes are
   caught".
-- **Reality:** every review found another variant that got through. In turn these were:
-  - `--mirror`, `--all`, `--prune` and git's abbreviations (#15)
-  - `--method=DELETE` (#14)
-  - three-letter short-flag clusters such as `-fqu` (PR #8)
-  - quoting and escaping of short flags (`'-f'`, `"-uf"`, `-"f"`, `-\f`), and a tab
+- **Reality:** every review from the H10 update on found another variant that got through
+  (the first PR #7 review found none: `gh api` still asked then). In turn these were:
+  - PR #7 re-review 1: `--mirror`, `--all`, `--prune` (#15) and `gh api` writes including
+    `--method=DELETE` (#14), all in one comment
+  - PR #7 re-review 2: three-letter short-flag clusters such as `-fqu` (fixed in PR #8,
+    PLAN 6b)
+  - PR #8's review: quoting and escaping of short flags (`'-f'`, `"-uf"`, `-"f"`, `-\f`), and a tab
     instead of a space. The tab case comes from the reviewer's **simulation** with the
     policy-test matcher; whether the real CLI normalises whitespace was never checked
     (the reviewer said so; AGENTS.md dropped the qualifier until PLAN PR 18)
@@ -1082,10 +1128,12 @@ How the agents worked, not what they built.
   saw no change, so the server kept running the planted bug's bytecode while the source,
   and `git_dirty: false`, said the code was clean.
 - **How it was caught:** the reviewer saw its own probe keep behaving like the planted
-  bug while `git_dirty` said `false`, and reported it as a NIT in the
-  [PR #11 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/11#issuecomment-6756623263).
-  (An earlier version of this entry said the reviewer *disassembled* the `.pyc`; its report
-  doesn't say how it confirmed the stale bytecode, so that detail was dropped in PLAN PR 18.)
+  bug while `git_dirty` said `false`, disassembled the cached `.pyc` and found the planted
+  bug's code still in it. It reported this as a NIT in the
+  [PR #11 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/11#issuecomment-6756623263),
+  which doesn't say how it was confirmed; the reviewer confirmed the disassembly in the
+  [PR #25 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/25#issuecomment-6777665397).
+  (PLAN PR 18's first pass dropped that detail for lack of a source.)
 - **What changed:** AGENTS.md now says that `git_dirty` describes the source tree at
   startup, not the code that's actually running. Delete `__pycache__/` after planting or
   reverting bugs, and restart the server. The planted-bug test runs its subprocess with
@@ -1146,3 +1194,24 @@ How the agents worked, not what they built.
   `Exception` handler was the one returning HTML. It was written from a paraphrase of the
   review, not from the probe's recorded output, and the reviewer caught it. Lesson:
   fact-check log entries against recorded output, not against someone's summary of it.
+
+#### 45. The attribution roles turned a document into a party, hiding who wrote the plan draft
+- **Who was wrong:** writer.
+- **Where:** PLAN PR 18 (PR #25, commit `a362ad6`): the role list, the tally, entries #1–#5,
+  the theme blurb, the entry template and the PLAN change log line.
+- **What the AI claimed:** that a "**plan** (PLAN.md's first draft)" was one of the parties
+  that could be wrong, next to the writer, the reviewer and the orchestrator. Entries #1–#5
+  said "**Who was wrong:** plan (the PR #1 draft)", and the tally said "plan 5,
+  orchestrator 1".
+- **Reality:** a document can't be confidently wrong; whoever wrote it can. The PR #1 plan
+  draft was written by the **orchestrator**, so those five claims belong to it, and the
+  orchestrator's count was 6, not 1. A log whose point is saying *who* was wrong had hidden
+  the author of its first five entries behind the document's name. The same pass also
+  left three "not built yet" status lines stale (#3–#5) and miscounted the deny-rule
+  review rounds (#17).
+- **How it was caught:** the [PR #25 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/25#issuecomment-6777665397)
+  counted every "Who was wrong" line and checked who wrote the PR #1 draft.
+- **What changed:** #1–#5 say "orchestrator (wrote the PR #1 plan draft)"; "plan" is gone as
+  a role from the role list, theme blurb, template and PLAN log; the tally is recounted
+  from the "Who was wrong" lines and says how shared entries count. Lesson: the "who" in an
+  attribution must be an agent that made a claim; a document or file is the *where*.
