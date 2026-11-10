@@ -310,14 +310,14 @@ def committed_db():
 
 def prepare(out, live_paths):
     """A fresh directory for one run; an earlier run there is moved aside, never deleted."""
-    out = Path(out)
+    out = Path(out).resolve()
+    paths = {k: out / v for k, v in FILES.items()}
+    if any(str(paths[k]) in live_paths for k in ("db", "records", "ledger")):     # before touching anything
+        raise SystemExit("scenario: refusing to run where a live data file is (pick another --out)")
     if out.exists():
         stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%fZ")
         out.rename(out.with_name(f"{out.name}.{stamp}"))
     out.mkdir(parents=True)
-    paths = {k: (out / v).resolve() for k, v in FILES.items()}
-    if any(str(paths[k]) in live_paths for k in ("db", "records", "ledger")):
-        raise SystemExit("scenario: refusing to write over a live data file")
     paths["db"].write_text(committed_db())
     return paths
 

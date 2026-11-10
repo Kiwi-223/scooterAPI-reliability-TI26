@@ -785,3 +785,19 @@ strongest entries.
   scenario runs together, deleting nothing, and every reset instruction now points at it.
   Lesson: **when you add durable state outside the DB, re-check every reset, restore and
   "start fresh" instruction**, because each one silently changes meaning.
+
+### 40. The playbook's own "failing test" template failed on correct code
+- **Where:** PLAN PR 17, AGENTS.md "Debugging a symptom", step 6's test template.
+- **What the AI claimed:** a copy-pasteable template that fails on the buggy code and
+  passes once it's fixed. It checked `read_records()[-1]["scooter_after"]`.
+- **Reality:** the template had just made a `/view_all_available` request, which writes
+  its own record with no scooter. So the "last record" wasn't the end, and the test failed
+  with a `TypeError` on correct code. A cold agent copying it would have "reproduced" a bug
+  that wasn't there.
+- **How it was caught:** following the playbook literally in a fresh clone: plant, write
+  the template test, see it fail, revert the plant, see it **still** fail.
+- **What changed:** the template finds the record by the response's `X-Request-ID`, the
+  doc says why, and `tests/test_playbook.py` executes the template straight from AGENTS.md
+  against the real code, so it can't rot. Lesson: **run every snippet you document,
+  against both the broken and the fixed code**; "it fails on the bug" proves nothing until
+  it also passes without it.

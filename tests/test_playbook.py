@@ -75,6 +75,35 @@ def test_a_scenario_never_touches_the_live_files_and_keeps_earlier_runs(scenario
     # (the conftest guards fail this test if the live scooter_db.json / data/ files changed)
 
 
+def test_a_scenario_refuses_to_run_where_a_live_file_is(tmp_path, monkeypatch, scenarios_dir):
+    live = tmp_path / "guarded"
+    live.mkdir()
+    (live / "db.json").write_text("LIVE")
+    monkeypatch.setenv("SCOOTER_DB_PATH", str(live / "db.json"))
+    out = subprocess.run([sys.executable, str(REPO / "scenarios.py"), "rides", "--out", str(live)], cwd=REPO,
+                         capture_output=True, text=True, timeout=120)
+    assert out.returncode != 0 and "refusing to run where a live data file is" in out.stderr
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name.startswith("guarded")) == ["guarded"]
+    assert (live / "db.json").read_text() == "LIVE"
+
+
+def test_an_anomaly_alone_makes_a_run_unclean(tmp_path):
+    spec = importlib.util.spec_from_file_location("scenarios_mod", REPO / "scenarios.py")
+    scenarios = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(scenarios)
+    db = json.loads((REPO / "tests" / "seed_db.json").read_text())
+    paths = {k: tmp_path / v for k, v in scenarios.FILES.items()}
+    paths["db"].write_text(json.dumps(db))
+    free, reserved = dict(db[1], is_reserved=False), dict(db[1], is_reserved=True)
+    record = {"ts": "2026-11-10T00:00:00.000Z", "request_id": "r", "path": "/reservation/start", "status": 400,
+              "scooter_id": "18", "decisions": [], "db_write": {"attempted": True, "ok": True, "error": None},
+              "scooter_before": free, "scooter_after": free, "scooter_in_memory": reserved}
+    paths["records"].write_text(json.dumps(record) + "\n")
+    summary = scenarios.analyse("x", paths, db, steps=[])
+    assert summary["unexpected"] == [] and [a["type"] for a in summary["anomalies"]] == ["write_not_persisted"]
+    assert summary["clean"] is False
+
+
 def test_the_report_says_where_the_evidence_is_and_how_to_query_it(scenarios_dir):
     out = subprocess.run([sys.executable, str(REPO / "scenarios.py"), "rides"], cwd=REPO, capture_output=True,
                          text=True, timeout=300)
@@ -163,6 +192,22 @@ def test_stale_bytecode_cant_hide_a_planted_bug(tmp_path, scenarios_dir):
     assert code == 1 and any(s["why"] == "end with lat out of range" for s in summary["unexpected"])
 
 
+# ---- the playbook's failing-test template is real code ---------------------------------------------
+
+def _template():
+    text = (REPO / "AGENTS.md").read_text()
+    start = text.index("```python\ndef test_ending_a_ride_frees_the_scooter")
+    return text[start + len("```python\n"):text.index("```", start + 3)]
+
+
+def test_the_playbook_template_passes_on_the_real_code(client, read_db, read_records):
+    # the fresh-clone walkthrough caught the first version of this template failing on
+    # correct code (it took the LAST record, which was the /view_all_available check)
+    namespace = {}
+    exec(_template(), namespace)
+    namespace["test_ending_a_ride_frees_the_scooter"](client, read_db, read_records)
+
+
 # ---- the MCP tools read a scenario run ------------------------------------------------------------
 
 def _call(name, args):
@@ -244,8 +289,11 @@ def test_reset_local_refuses_while_the_db_lock_is_held(scratch_repo):
     assert _files(scratch_repo) == before
 
 
-def test_two_resets_never_share_a_backup(scratch_repo):
+def test_two_resets_never_share_a_backup(scratch_repo, monkeypatch):
+    monkeypatch.setattr(reset_local, "_stamp", lambda: "20261110T000000Z")     # the same second
     assert reset_local.main(["--root", str(scratch_repo)]) == 0
-    (scratch_repo / "data" / "records.jsonl").write_text("{}\n")
+    (scratch_repo / "data" / "records.jsonl").write_text("second\n")
     assert reset_local.main(["--root", str(scratch_repo)]) == 0
-    assert len(list((scratch_repo / "local-backups").iterdir())) == 2
+    backups = sorted(p.name for p in (scratch_repo / "local-backups").iterdir())
+    assert backups == ["20261110T000000Z", "20261110T000000Z-1"]
+    assert (scratch_repo / "local-backups" / backups[1] / "data" / "records.jsonl").read_text() == "second\n"

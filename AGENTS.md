@@ -97,10 +97,12 @@ def test_ending_a_ride_frees_the_scooter(client, read_db, read_records):
     resp = client.get("/reservation/end?id=18&lat=23.01&lng=19.01")
     assert resp.status_code == 200
     assert read_db()["18"]["is_reserved"] is False                        # what's on disk
+    [record] = [r for r in read_records() if r["request_id"] == resp.headers["X-Request-ID"]]
+    assert record["scooter_after"]["is_reserved"] is False                # what the system recorded
     assert "18" in [s["id"] for s in client.get("/view_all_available").get_json()]   # what the user sees
-    record = read_records()[-1]                                           # what the system recorded
-    assert record["scooter_after"]["is_reserved"] is False
 ```
+Find the record by the response's `X-Request-ID`: every request (the `/view_all_available`
+check too) appends one, so "the last record" is rarely the one you mean.
 Payment faults: `monkeypatch.setenv("PAYMENT_FAULT", "decline")` (or `timeout_charged`,
 `timeout_not_charged`, `error`). Run it: `make test ARGS="tests/test_<symptom>.py"`; it
 must **fail** on the buggy code, for the reason you found.
@@ -127,8 +129,11 @@ $ make records ARGS="--file data/scenarios/rides/records.jsonl scooter 18"
 ```
 The end returned 200 and charged, the code believed the scooter was free
 (`in_memory=free`), but what was written still has the ride (`after=reserved`):
-`write_not_persisted`. Root cause: the DB write happens before `finish_ride` clears the
-reservation. The test template above fails on `read_db()["18"]["is_reserved"]`.
+`write_not_persisted`. `make records ARGS="--file … request scn-rides-004"` shows the
+order: `… payment ok, db_write ok, reservation cleared`, i.e. the write happened
+**before** the ride was cleared, and `git_dirty_paths: ["app.py"]` says where to look.
+Root cause: in `end_reservation`, `write_db` runs before `finish_ride`. The test template
+above fails on `read_db()["18"]["is_reserved"]`.
 
 **B. `finish_ride` forgets `is_reserved = False`** (the write guard refuses the invalid
 state).

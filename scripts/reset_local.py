@@ -46,6 +46,10 @@ def lock_is_held(lock_path):
     return False
 
 
+def _stamp():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
 def plan(root):
     """[(source, destination name, how)] for everything that moves; how is 'move' or 'copy'."""
     items = [(root / DB_NAME, DB_NAME, "copy")] if (root / DB_NAME).exists() else []
@@ -70,7 +74,7 @@ def main(argv=None):
         print("reset-local: the DB lock is held (a server or reconcile is mid-transaction); stop it and retry",
               file=sys.stderr)
         return 1
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    stamp = _stamp()
     backup = root / "local-backups" / stamp
     n = 0
     while backup.exists():                       # two resets in one second: never overwrite a backup
