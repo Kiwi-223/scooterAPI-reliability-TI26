@@ -263,6 +263,24 @@ PLAN PR 10.
 
 ## Agent boundaries
 
+### Escalation policy (decided by the repo owner)
+
+> "I don't want every push, PR creation, merge, and comment to need human intervention;
+> only when a decision is unclear from documentation or if agents disagree on the solution
+> do I want human intervention."
+
+So agents **act autonomously within the rules below**: branch, commit, push feature
+branches, open, comment on, review and squash-merge PRs, and edit code, `Makefile`,
+`requirements*` and `scripts/`. They **escalate to a human only** in two cases:
+
+1. **The docs don't settle a decision.** The docs are README.md, ACTIVITY.md, PLAN.md
+   (including its Human decisions table) and this file.
+2. **The writer and the reviewer disagree** on the solution.
+
+Escalating means stopping and asking the human in chat, and saying which document left the
+question open or what the two positions are. The few prompts that remain (below) are for
+changes to the guardrails themselves, unsandboxed commands and destructive local git.
+
 The boundaries live in three places:
 
 - **`.claude/settings.json`**: committed, project scope, the Claude Code sandbox plus
@@ -270,7 +288,9 @@ The boundaries live in three places:
   repo root, including worktrees of this repo.
 - **`scripts/agent.sh` / `make agent`**: the budget, turn and time wrapper for headless
   runs.
-- **GitHub settings that only a human can change:** branch protection (H2).
+- **GitHub settings that only a human should change:** branch protection (H2). Agents
+  are denied the `gh api` calls that would change it, but that's a text-match rule; see
+  below.
 
 The settings use only keys documented at <https://code.claude.com/docs> (settings
 reference, permissions, sandboxing) for Claude Code 2.1.310.
@@ -287,7 +307,12 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
   - a permission rule that doesn't fit the rule pattern, such as an unknown tool name or
     an unbalanced parenthesis
 - **Tests:** `tests/test_settings_schema.py` plants each of those mistakes and checks that
-  they're rejected.
+  they're rejected. It also pins the policy itself:
+  - every required deny rule is present
+  - `.claude/**` and `.github/**` edits, unsandboxed retries and destructive git still ask
+  - the sandbox and fail-closed settings are on and bypass mode is off
+
+  So `make test` fails if an edit loosens these.
 - **`claude doctor` is not a validator.** It reports malformed JSON, wrong value types and
   some rule errors. It stays **silent on unknown keys** (for example a misspelled sandbox
   key) and on many malformed rules (AI_NOTES #11).
@@ -297,19 +322,30 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 > **Honesty first:** permission rules match the command *text*. They're a speed bump for
 > the usual spelling of a command, not a security boundary. The sandbox is OS-enforced
 > (Seatbelt on macOS, bubblewrap on Linux) and is the real control for files and network
-> inside a session. Branch protection is the real control for `master`, and **it is not on
-> yet** (H2).
+> inside a session.
+>
+> **Merging to `master` is now automated:** agents squash-merge their own PRs without a
+> human. The only things that gate what reaches `master` are the adversarial reviewer's
+> verdict (a process rule, not a technical control), CI, and GitHub branch protection.
+> Branch protection makes the `test` check required and blocks direct and force pushes.
+> **It is not enabled yet (H2).** Until it is, nothing technical stops a merge with red CI
+> or a push to `master` spelled in a way the deny rules don't catch.
 
 ### Blast radius: the worst a confused agent could do here
 
 - **Rewrite shared history:** push to `master` or force-push, losing work.
-- **Merge without review:** merge its own PR.
+- **Merge something bad:** agents merge their own PRs by design, so a wrong change can land
+  on `master` without a human seeing it. Today's safeguards are the reviewer's verdict and
+  CI. CI only *blocks* a merge once branch protection (H2) is on.
+- **Disable the safety net:** remove branch protection or rulesets through the GitHub API.
+  The `gh` token belongs to the repo owner, so it has admin rights.
 - **Destroy uncommitted work** in this shared checkout (other agents work here too):
   `rm -rf`, `git reset --hard`, `git clean`. Or kill another agent's server.
 - **Leak credentials** such as the `gh` token, `~/.ssh` or git credentials, by sending them
   to an arbitrary host.
-- **Weaken its own guardrails** by editing `.claude/settings.json`, `.github/`, the
-  `Makefile` or `scripts/agent.sh`, then running the edited code.
+- **Weaken its own guardrails** by editing `.claude/settings.json` or `.github/` (these
+  still ask first). It could also edit `Makefile` or `scripts/` (allowed) and then run the
+  edited code; what `make` runs stays inside the sandbox.
 - **Burn money:** a headless run that loops forever.
 
 ### What's enforced, and how strongly
@@ -317,14 +353,15 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 | Control | Mechanism | Strength / known bypasses |
 |---|---|---|
 | **Writes** limited to this checkout and `$TMPDIR` | Sandbox (`sandbox.enabled`, `failIfUnavailable: true`) | **OS-enforced** for every Bash command and its children: `python -c`, `make` and anything else. Inside the checkout, the sandbox still protects `.claude/settings*.json`, `.git/hooks` and `.git/config`. Bypasses: Claude's own Edit/Write tools run outside the sandbox and follow permission rules instead; excluded commands (below); approved unsandboxed retries. |
-| **Network** limited to `pypi.org`, `files.pythonhosted.org`, `github.com`, `api.github.com`, `localhost` | Sandbox proxy (`network.allowedDomains`) | **OS-enforced** for all sandboxed processes, including `python -c "urllib..."`. Per the docs, any other host prompts in Manual / `acceptEdits` mode and is refused in `dontAsk` mode, in auto mode (unless the classifier approves), and in `make agent`. Not exercised here. Residual risk: GitHub is allowlisted, so data could still be sent *to GitHub*. The proxy doesn't inspect TLS. The WebFetch tool isn't sandboxed; it follows its own permission prompts. |
+| **Network** limited to `pypi.org`, `files.pythonhosted.org`, `github.com`, `api.github.com`, `localhost`, plus the docs hosts `code.claude.com`, `docs.github.com`, `endoflife.date`, `raw.githubusercontent.com` and `json.schemastore.org` | Sandbox proxy (`network.allowedDomains`) | **OS-enforced** for all sandboxed processes, including `python -c "urllib..."`. Per the docs, any other host prompts in Manual / `acceptEdits` mode and is refused in `dontAsk` mode, in auto mode (unless the classifier approves), and in `make agent`. Not exercised here. Residual risk: every allowlisted host can receive data (even a GET carries a URL), so data could still be sent *to GitHub* or a docs host. `raw.githubusercontent.com` serves any public repo's files, so sandboxed code can download arbitrary content (as `git clone` from `github.com` already can). The proxy doesn't inspect TLS. The WebFetch tool isn't sandboxed; it follows its own permission prompts. |
 | **Localhost** (`make run` + `curl localhost:8080`) | `network.allowLocalBinding: true` (macOS) | Needed for manual endpoint checks. Trade-off: sandboxed commands can reach **any** service listening on localhost. |
 | **Secrets** unreadable: `.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, `~/.netrc`, `~/.config/gh`, `~/.git-credentials` | `Read(...)` deny rules, which Claude Code also feeds into the sandbox's `denyRead` | Enforced for the Read tool **and** OS-enforced for sandboxed commands. It doesn't cover the excluded `gh` / `git push` commands, which need their credentials. |
 | **Unsandboxed retry** (`dangerouslyDisableSandbox`) needs a human | ask rule `Bash(dangerouslyDisableSandbox:true)` | This prompt also appears in auto and bypass modes. Headless (`make agent`) can't answer it, so the retry is denied. |
 | **No bypass mode** | `permissions.disableBypassPermissionsMode: "disable"` | `--dangerously-skip-permissions` is rejected in this repo. |
-| **Asks first** before `git push`, `gh pr create/merge/comment/edit/review/close`, `gh api`, `git -C`, `git -c`, `git reset --hard`, `git clean`, `git branch -D`, and before editing `.claude/**`, `.github/**`, `Makefile`, `requirements*` or `scripts/**` | `ask` rules | Text match only. `/usr/bin/git push`, `sh -c 'git push'` or a Python `subprocess` aren't matched. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('Makefile','w')"`. |
-| **Denied:** force-push, push to `master`, `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `rm -rf` (common spellings) | `deny` rules | Text match only, **defence in depth, bypassable.** A push to `master` is caught as `git push <remote> master` and `git push <remote> <src>:master`. It isn't caught as `git push` while on `master`, `git -C . push ...`, or through an alias or a script. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
-| **`master` can't be pushed or force-pushed** | GitHub branch protection | **Not enabled.** It's a human decision (H2) and agents don't change it. This is the only real control on `master`. Recommended now that CI (check name `test`) exists. |
+| **Allowed without a prompt** (escalation policy): `git push` of branches, `gh pr create/comment/edit/review`, `gh pr merge --squash`, `gh api`, `git -C <path> worktree/fetch/status/log/diff`, edits to `Makefile`, `requirements*` and `scripts/**` | `allow` rules | Deny rules below still win over these. Other merge styles (`--merge`, `--rebase`) and `gh pr close` have no allow rule, so they fall back to the session's permission mode. |
+| **Asks first** before editing `.claude/**` (an agent can't loosen its own boundaries) or `.github/**` (CI integrity), before any unsandboxed retry, and before `git -c`, `git reset --hard`, `git clean` and `git branch -D` | `ask` rules | Text match only. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('.github/x','w')"`. `.claude/settings*.json` is **also** write-protected by the sandbox, which is OS-enforced. |
+| **Denied:** force-push (every spelling we know), push to `master`, `git -C … push`, `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `gh api` calls that touch `*protection*` / `*rulesets*` or use `DELETE`, `gh auth *` (which would print the token), `rm -rf` (common spellings) | `deny` rules | Text match only, **defence in depth, bypassable.** A push to `master` is caught as `git push <remote> master` and `git push <remote> <src>:master`. It isn't caught as a plain `git push` while `master` is checked out, or through an alias or a script. The `gh api` denies don't catch a request whose body or path is built indirectly, such as `gh api --input file.json`, a `graphql` mutation, or the URL in a variable. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
+| **`master` can't be pushed or force-pushed, and merges need green CI** | GitHub branch protection: require PRs, require the `test` check, block force-push | **Not enabled.** It's a human decision (H2), and agents are denied the API calls that change it. With merges automated, this is **the** control on `master`. Turn it on before relying on autonomous merges. |
 | **Spend and time caps** for headless runs | `make agent` → `scripts/agent.sh` | `--max-budget-usd` is a client-side estimate, so spend can pass it a little. The wall clock is enforced by the script's watchdog. Interactive sessions have no cap from this repo. |
 
 ### The specific bypasses, and whether they're closed
@@ -333,23 +370,25 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
   The sandbox applies to child processes, so Python goes through the same proxy and
   `denyRead`.
   - **Still open:** allowlisted hosts, and anything that runs outside the sandbox:
-    the excluded `gh *` / `git push *`, an approved unsandboxed retry, Claude's
-    WebFetch tool, hooks and MCP servers.
+    the excluded `gh *` / `git push *` (now allowed without a prompt), an approved
+    unsandboxed retry, Claude's WebFetch tool, hooks and MCP servers.
   - **Stricter option:** drop `github.com` / `api.github.com` from `allowedDomains` and
     also exclude `git fetch *` / `git pull *`. Then only excluded, permission-checked
     commands can reach GitHub.
 - **`git push origin HEAD:master`: caught only by text matching.**
-  - The deny rules match it, and the `git push *` ask rule makes a human see every
-    spelled-out push.
-  - **Still open:** a sandboxed `git -C . push ...` (now an ask rule), a script, or a
-    plain `git push` while `master` is checked out can still reach `github.com`.
+  - The deny rules match it, and `git -C … push` is denied outright. Pushes are otherwise
+    allowed without a prompt (escalation policy), so no human sees them.
+  - **Still open:** a script, an alias, or a plain `git push` while `master` is checked
+    out.
   - **The real fix is branch protection (H2).**
-- **Edit the `Makefile`, then run `make`: partly closed.**
-  - Editing it with Claude's file tools, or with a redirect, `sed` or `tee`, asks first.
-  - Rewriting it from inside a sandboxed process (e.g. `python -c`) doesn't. However,
-    whatever `make` then runs is **still sandboxed**, so it gets the same write, network
+- **Edit the `Makefile`, then run `make`: allowed by policy, contained by the sandbox.**
+  - Editing `Makefile`, `requirements*` and `scripts/**` is allowed, because later PRs
+    need it routinely.
+  - Whatever `make` then runs is **still sandboxed**, so it gets the same write, network
     and secret limits.
-  - The change also shows up in `git diff` and in review.
+  - The change shows up in `git diff`, in the reviewer's check and in CI.
+  - `scripts/agent.sh` is the one exception that matters: editing it can change the caps
+    for *future* headless runs. That's visible in review, not prevented.
   - Adding `./Makefile` to `sandbox.filesystem.denyWrite` would close this, but sandboxed
     `git checkout` / `git pull` would then fail whenever a branch changes the Makefile.
 
@@ -357,7 +396,7 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 
 | Rule | Commands |
 |---|---|
-| **Allow** (no prompt) | `make help/setup/test/run/lock`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); read-only `gh` (`pr view/list/diff/checks`, `run list/view/watch`) |
+| **Allow** (no prompt) | `make help/setup/test/run/lock/check-settings/clean`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); `git push`; `git -C <path> worktree/fetch/status/log/diff`; `gh pr view/list/diff/checks/create/comment/edit/review`; `gh pr merge --squash`; `gh run list/view/watch`; `gh api`; edits to `Makefile`, `requirements*`, `scripts/**` |
 | **Ask** | everything in the "Asks first" row above |
 | **Deny** | the "Denied" row above, plus the secret reads |
 
@@ -374,10 +413,13 @@ dialog. The project allow rules only apply once you accept it.
 
 - **`gh *`:** on macOS, Go programs like `gh` can fail TLS verification under Seatbelt
   (documented limitation).
-- **`git push *`:** so it can use the keychain credential helper. Every push still asks
-  first.
+- **`git push *`:** so it can use the keychain credential helper. Pushes are allowed
+  without a prompt. The force-push and push-to-`master` deny rules still apply.
 
 Excluded commands run with your full access, subject only to the permission rules above.
+Because `gh *` is excluded **and** `gh api` is allowed, `gh api` can call any GitHub
+endpoint the owner's token can reach. The `gh api` deny rules cover the dangerous ones
+only by text.
 
 **An exclusion applies only when the whole Bash call is that one command.** A loop, pipe,
 `cd`, redirect or `$(...)` keeps the call sandboxed, and then `gh` may fail TLS on macOS.
@@ -434,8 +476,11 @@ scripts/agent.sh --help
 - **`WORKTREE` names:** letters, digits, `.`, `_` and `-`, starting with a letter or digit.
   `..`, a leading `.` and any `/` are rejected.
 - **Effect:** edits inside the repo are accepted. Anything that would prompt is denied,
-  because nobody is watching: `git push`, `gh pr create`, unsandboxed retries, hosts outside
-  the allowlist.
+  because nobody is watching. That includes `git push` and `gh pr create`: the project
+  allow rules for them don't apply in `-p` mode, and `agent.sh` deliberately doesn't
+  re-grant them. It also includes unsandboxed retries and hosts outside the allowlist. A
+  headless run therefore leaves its work as local commits for a normal session to push
+  and review.
 - **Wall clock:** a portable watchdog, needed because macOS has no `timeout(1)`. It sends
   TERM to the agent's whole process group after `TIMEOUT_MIN`, and KILL 15 s later. The
   script then exits with **124**. Limitation: a process the agent started in its *own*
@@ -473,8 +518,12 @@ these:
   changes, edit PLAN.md in the same PR and add a Change log line.
 - **Branch:** start from a fresh `master` (`git checkout master && git pull`), then
   `git checkout -b stage-<N>/<slug>`, where N is the PR number in PLAN.md's table.
-- **Never commit to or push `master`, never force-push, never merge your own PR, and never
-  deploy.**
+- **Never commit to or push `master`, never force-push, and never deploy.**
+- **Merge only** after the reviewer's comment ends in `VERDICT: APPROVE` **and** CI is
+  green. Use a squash merge (`gh pr merge <n> --squash --delete-branch --repo ...`).
+  Merging is autonomous (see Agent boundaries → Escalation policy).
+- **Escalate to the human only** when the docs don't settle a decision, or when the writer
+  and reviewer disagree.
 - **This repo is a fork.** Open PRs only against the fork, never the upstream
   `KaranErry/scooterAPI-reliability`:
   `gh pr create --repo Kiwi-223/scooterAPI-reliability-TI26 --base master ...`.

@@ -62,3 +62,37 @@ def _mutate(path, value):
 ])
 def test_planted_mistakes_are_rejected(tmp_path, path, value):
     assert problems(_mutate(path, value), tmp_path), f"{path}={value!r} was not rejected"
+
+
+# ---- policy invariants (AGENTS.md "Agent boundaries" / PLAN.md H10) --------------------
+# These pin the escalation policy so a loosening edit to .claude/settings.json fails CI.
+PERM = SETTINGS["permissions"]
+
+
+@pytest.mark.parametrize("rule", [
+    "Bash(git push --force *)", "Bash(git push -f *)", "Bash(git push * --force)",
+    "Bash(git push * --force-with-lease*)", "Bash(git push * +*)",
+    "Bash(git push * master)", "Bash(git push *:master)", "Bash(git -C * push*)",
+    "Bash(gh pr merge * --admin*)", "Bash(gh pr merge --admin*)",
+    "Bash(gh repo delete *)", "Bash(gh release delete *)",
+    "Bash(gh api *protection*)", "Bash(gh api *rulesets*)", "Bash(gh auth *)",
+    "Bash(rm -rf *)", "Read(.env)", "Read(~/.ssh/**)", "Read(~/.config/gh/**)",
+])
+def test_required_denies_present(rule):
+    assert rule in PERM["deny"]
+
+
+@pytest.mark.parametrize("rule", [
+    "Edit(/.claude/**)", "Edit(/.github/**)", "Bash(dangerouslyDisableSandbox:true)",
+    "Bash(git reset --hard*)", "Bash(git clean *)", "Bash(git branch -D *)",
+])
+def test_guardrail_changes_still_ask(rule):
+    assert rule in PERM["ask"]
+    assert rule not in PERM["allow"]
+
+
+def test_sandbox_and_bypass_settings():
+    assert SETTINGS["sandbox"]["enabled"] is True
+    assert SETTINGS["sandbox"]["failIfUnavailable"] is True
+    assert PERM["disableBypassPermissionsMode"] == "disable"
+    assert not any(r.startswith("Edit(/.claude") or r.startswith("Edit(/.github") for r in PERM["allow"])

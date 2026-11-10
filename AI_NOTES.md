@@ -215,3 +215,32 @@ strongest entries.
   workflow under it. Docs and guardrails drift apart when they're written in separate
   passes.
 
+### 13. An unquoted heredoc ran documentation text as shell commands
+- **Where:** the writer, while updating the PR #7 description (2026-11-04). It ran a Python
+  string-replacement script through `python3 - <<EOF ... EOF`.
+- **What the AI assumed:** the replacement text (Markdown full of backticked commands)
+  would reach Python unchanged.
+- **Reality:** with an *unquoted* `EOF`, the shell does command substitution inside the
+  heredoc, so every `` `...` `` in the Markdown ran as a shell command in the main
+  checkout, in order:
+  - `claude --help` printed its help into the string.
+  - `--max-turns`, `MAX_TURNS`, `--max-turns` and `--help` failed with
+    `command not found`.
+  - `python3 -m json.tool` then blocked waiting on stdin.
+
+  Further down the text were `make check-settings`, `make clean && make test`, `rm -rf`
+  (no operands) and `claude doctor`. They never ran, because the hang stopped the script
+  first. The main checkout was on `master`, where `clean` and `check-settings` didn't even
+  exist yet.
+- **How it was caught:** the `command not found: --max-turns` lines in the output, and the
+  command hanging until the harness moved it to the background. The writer stopped the
+  task before the rest of the substitutions ran, then checked:
+  - no processes were left
+  - the main checkout was unchanged (`master`, clean, `.venv` intact)
+  - the worktree was clean and the PR text file untouched
+- **What changed:** the edit was redone with a quoted heredoc (`<<'EOF'`), with values
+  passed in through environment variables. Lesson: any heredoc whose body contains
+  backticks or `$` must be quoted (`<<'EOF'`). Text you mean as data must never pass
+  through shell expansion. That matters more here because the denied commands (`rm -rf`)
+  and the allowed ones (`make clean`) were sitting in that very text.
+
