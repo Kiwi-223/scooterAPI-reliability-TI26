@@ -1,5 +1,14 @@
 # AGENTS.md
 
+> **Cold start: debugging a symptom?** Start with the section **"Debugging a symptom (start
+> here)"** below (about 12.5 KB); the rest of this file is reference. This file is about
+> 160 KB (with ACTIVITY.md and AI_NOTES.md, about 250 KB), and if you're a Claude Code
+> session it's already loaded in full through CLAUDE.md's import: this note only says where
+> to look first. To print just that section:
+> `sed -n '/^## Debugging a symptom/,/^## Setup/{/^## Setup/!p;}' AGENTS.md`. Come back to
+> the other sections (Request records, Database schema, Payment state machine, …) when a
+> step points you there.
+
 Onboarding for anyone, human or AI agent, who opens this repo with no prior context.
 Keep it accurate: every PR that changes setup, commands, layout or data locations updates
 this file in the same PR.
@@ -15,8 +24,9 @@ Keep it backwards compatible.
 
 The repo is being modernised and made debuggable by an agent with no context, following
 [PLAN.md](PLAN.md), in one focused PR at a time. [ACTIVITY.md](ACTIVITY.md) has the goals
-("Required outcomes"). Many sections below say **coming in PLAN PR n**. Those things don't
-exist yet, so don't go looking for them.
+("Required outcomes"). Every PLAN row through the cold-agent rehearsal (step 20) has
+landed, so everything this file describes exists. A mention like "(PLAN PR 14)" says which
+PR added or changed something, not that it's still to come.
 
 ## Debugging a symptom (start here)
 
@@ -42,11 +52,18 @@ conclude from reading the diff**: steps 3–5 get the evidence.
 
 **3. Run the test suite: the fastest signal.**
 ```sh
-make test ARGS="-x -q"           # or the MCP tool run_tests (asks first)
+make test ARGS="-q"              # or the MCP tool run_tests (asks first); about a minute
 ```
-A planted bug often breaks an existing test, and its name usually points straight at the
-cause (`test_a_scooter_waiting_for_payment_cannot_be_reserved_or_found`,
-`test_after_n_attempts_the_ride_ends_unpaid`, …). Read that test: it's a ready-made
+Run it **without `-x`**, and read the **list of failing test names** at the end (the
+`FAILED …` lines), not just the first failure. A planted bug usually breaks several tests.
+The **targeted** ones name the cause (`test_a_scooter_waiting_for_payment_cannot_be_reserved_or_found`,
+`test_after_n_attempts_the_ride_ends_unpaid`, `test_end_frees_scooter_at_new_location_and_persists_it`, …);
+the broad ones (soaks, random histories, "every scenario is clean", "no false positives")
+fail as a side effect of almost any bug and say little about which. The first failure in
+file order is often one of those: with PLAN step 20's swapped-`lat`/`lng` plant, `-x`
+stopped at `test_a_random_fault_soak_keeps_every_invariant`, while the full list also had
+`test_end_frees_scooter_at_new_location_and_persists_it` and
+`test_ended_scooter_is_available_at_new_location`. Read the most specific failing test: it's a ready-made
 reproduction. A green suite doesn't clear the code, though; carry on.
 
 **4. Reproduce on an isolated instance.** A fresh checkout has no records, so make some:
@@ -63,8 +80,12 @@ make scenario NAME=all           # every scenario: rides, errors, payment-faults
   and ledger in `data/scenarios/<name>/`. The live files are never touched. A previous run
   is moved to `data/scenarios/<name>.<timestamp>/`.
 - Every step states what it expected. It prints **`UNEXPECTED`** for each step that
-  didn't happen as specified, then the anomalies, the invariant violations, where the
-  evidence is, and the exact commands to query it. It exits 1 if anything is off.
+  didn't happen as specified, with **expected vs actual** (e.g.
+  `expected at=(23.01, 19.01), got at=(19.01, 23.01)`), then the anomalies (with a
+  one-line summary where the rule has one), the invariant violations, where the evidence
+  is, and the exact commands to query it. It exits 1 if anything is off.
+- `make scenario` with no `NAME` only lists the scenarios and installs nothing. With a
+  `NAME`, the first run installs the dependencies (it says so; one-time).
 - Faults are forced per request, so a re-run makes the same requests with the same
   request ids (`scn-<name>-<n>`); only reservation ids (uuids) differ.
 - If the symptom needs something no scenario does, make the requests by hand on a scratch
@@ -85,7 +106,7 @@ show 0 for a request whose write was refused (its `db_write: refused` decision a
 | Which records contradict themselves? | `anomalies` | `make records ARGS="--file data/scenarios/rides/records.jsonl anomalies --db data/scenarios/rides/db.json"` |
 | Payments vs records | `ledger_check`, `payment_lookup` | `make records ARGS="--file data/scenarios/rides/records.jsonl ledger-check --ledger data/scenarios/rides/ledger.jsonl --min-age 0"` |
 | DB + ledger + records consistent? | `check_invariants` | `SCOOTER_DB_PATH=data/scenarios/rides/db.json SCOOTER_RECORDS_PATH=data/scenarios/rides/records.jsonl SCOOTER_PAYMENTS_LEDGER_PATH=data/scenarios/rides/ledger.jsonl .venv/bin/python tests/invariants.py` |
-| What's in the DB now? | `scooter_state(scooter_id="18")` | `cat data/scenarios/rides/db.json` |
+| What's in the DB now? | `scooter_state(scooter_id="18")` | `jq 'map(select(.id=="18"))' data/scenarios/rides/db.json` (the file is a JSON **list** of scooters, not keyed by id) |
 
 **6. Locate the bad code path** with the record's three snapshots and its decisions:
 - `scooter_before`: what the request read. `scooter_after`: what is **on disk** after it.
@@ -95,6 +116,12 @@ show 0 for a request whose write was refused (its `db_write: refused` decision a
   `write_not_persisted`.
 - `in_memory` wrong too → the logic itself is wrong; read the `decisions` in order to see
   which step went the wrong way.
+- anomaly `end_location_not_persisted` → the scooter isn't where the ride ended. Despite
+  the name, read its `cause`, not the name: `logic` means `in_memory` is at the same wrong
+  place as `after` (the code computed the wrong location and saved it faithfully, e.g.
+  swapped `lat`/`lng`: read the code that sets the scooter's position, `finish_ride`);
+  `persistence` means the right location was in memory but not written. Its `summary`
+  gives the expected and actual coordinates.
 - `db_write: refused` with a problem, or an `exception` field → the code built an invalid
   state, or crashed; the message names the field.
 - `params: ok` on input that should have been rejected → validation.
@@ -1224,7 +1251,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: "reserved" \| "payment_pending"}` for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, or `degraded` when a reservation is in an unknown payment state, with `readable`, `scooters`, `reserved`, `payment_pending` and `unsupported`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: reason}`, the reason `"reserved"` or `"payment_pending"`, for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, or `degraded` when a reservation is in an unknown payment state, with `readable`, `scooters`, `reserved`, `payment_pending` and `unsupported`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -1295,7 +1322,14 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     since PLAN PR 14; for reconcile, its `reconcile` decision's `end_lat`/`end_lng`), or for
     older records the requested coordinates. They're compared as floats, the
     way the app parses them, so `+23.01` equals `23.01`. This one also catches code that
-    never moves the scooter at all, where in-memory and written state agree.
+    never moves the scooter at all, where in-memory and written state agree. **The name
+    is historical (kept, because tests and docs reference it): it fires for a wrong
+    location however it got there.** The detail says which (PLAN PR 20a): `cause` is
+    `logic` when `scooter_in_memory` is at the same wrong place (the code computed it: a
+    swapped `lat`/`lng`, a missing move), `persistence` when the in-memory location was
+    right but the written one isn't, `unknown` with no in-memory snapshot. It also has
+    `expected` and `actual` (`{lat, lng}`), `in_memory`, and a one-line `summary`, which
+    the CLI and `make scenario` print.
   - **`reservation_flag_mismatch`:** `scooter_after` breaks the DB invariant
     (`is_reserved` true without a `reservation`, or false with one). `write_db` refuses
     such writes, so this flags records from older code or from a broken guard.
@@ -1586,7 +1620,7 @@ a message saying what to fix); the server keeps running.
 | `failure_counts(since?)` | none | failures per `error.kind` | `make records ARGS="failure-counts"` |
 | `scooter_history(scooter_id)` | none | one scooter's records, in the order they took effect | `make records ARGS="scooter <id>"` |
 | `request_trace(request_id)` | none | the full record(s) for one `X-Request-ID` | `make records ARGS="request <id>"` |
-| `scooter_state(scooter_id \| "all")` | none | the DB's current state (reservation, payment state, balances), validated like an app read | `cat scooter_db.json` |
+| `scooter_state(scooter_id)` (an id, or `"all"`) | none | the DB's current state (reservation, payment state, balances), validated like an app read | `cat scooter_db.json` |
 | `anomalies(since?)` | none | records that contradict themselves; `unresolved` is what needs attention | `make records ARGS="anomalies"` |
 | `ledger_check(min_age_s?)` | none | ledger vs records: double charges, foreign keys, orphans | `make records ARGS="ledger-check"` |
 | `rollback_check(since?)` | none | what a DB rollback erased (lost balances, free rides) | `make records ARGS="rollback-check"` |
@@ -1778,7 +1812,7 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 | **Secrets** unreadable: `.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, `~/.netrc`, `~/.config/gh`, `~/.git-credentials` | `Read(...)` deny rules, which Claude Code also feeds into the sandbox's `denyRead` | Enforced for the Read tool **and** OS-enforced for sandboxed commands. It doesn't cover the excluded `gh` / `git push` commands, which need their credentials. |
 | **Unsandboxed retry** (`dangerouslyDisableSandbox`) needs a human | ask rule `Bash(dangerouslyDisableSandbox:true)` | This prompt also appears in auto and bypass modes. Headless (`make agent`) can't answer it, so the retry is denied. |
 | **No bypass mode** | `permissions.disableBypassPermissionsMode: "disable"` | `--dangerously-skip-permissions` is rejected in this repo. |
-| **Allowed without a prompt** (escalation policy): pushes of the shape `git push [-u\|-q\|--set-upstream] origin stage-…`; `gh pr create/comment/edit/review`; `gh pr merge --squash`; `gh api` **reads**; edits to `Makefile`, `requirements*` and `scripts/**` | `allow` rules | Deny and ask rules below still win over these. Any other push shape (a bare `git push`, `git push origin HEAD`, other branch prefixes), other merge styles (`--merge`, `--rebase`) and `gh pr close` have no allow rule, so the session's permission mode decides (Manual prompts; auto mode asks the classifier, not a human). `git -C <path> …` has no allow rule either: it isn't excluded, so it runs **sandboxed** and the sandbox auto-approves it. |
+| **Allowed without a prompt** (escalation policy): pushes of the shape `git push -u origin stage-…` (or with `-q` or `--set-upstream` instead of `-u`, or none); `gh pr create/comment/edit/review`; `gh pr merge --squash`; `gh api` **reads**; edits to `Makefile`, `requirements*` and `scripts/**` | `allow` rules | Deny and ask rules below still win over these. Any other push shape (a bare `git push`, `git push origin HEAD`, other branch prefixes), other merge styles (`--merge`, `--rebase`) and `gh pr close` have no allow rule, so the session's permission mode decides (Manual prompts; auto mode asks the classifier, not a human). `git -C <path> …` has no allow rule either: it isn't excluded, so it runs **sandboxed** and the sandbox auto-approves it. |
 | **Asks first:** `gh api` writes (`-X`/`--method` anything, `-f`/`-F` incl. `--field`/`--raw-field`, `--input`), edits to `.claude/**` (an agent can't loosen its own boundaries), `.github/**` (CI integrity) or `.mcp.json` / `mcp_server.py` (what the unsandboxed MCP server runs), any unsandboxed retry, and `git -c`, `git reset --hard`, `git clean`, `git branch -D` | `ask` rules | Text match only. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('.github/x','w')"`. `.claude/settings*.json` is **also** write-protected by the sandbox, which is OS-enforced. |
 | **Denied (`git push`):** every dangerous flag in `git push -h` (git 2.54), matched anywhere in the command, including git's unique-prefix abbreviations: `--force`/`--force-with-lease`/`--force-if-includes` (`--for…`), `--mirror` (`--mi…`), `--all` (`--al…`), `--branches` (`--br…`), `--prune` (`--pru…`), `--delete` (`--de…`), `--receive-pack`/`--exec` (they run a program). Also any short-flag cluster in which `f` or `d` appears within its first three letters, mixed with `u q v n` (e.g. `-f`, `-uf`, `-qud`, `-fquv`; PLAN 6b), a `+` refspec, a `:branch` delete refspec, any `refs/…` refspec, **any mention of `master`**, and `git -C … push` | `deny` rules | Text match only, **defence in depth, bypassable.** Not caught: a plain `git push` / `git push origin HEAD` while `master` is checked out (no allow rule, so the mode decides); short-flag clusters where `f`/`d` first appears at the 4th letter or later (`-uqvf`) or that mix in `-4`/`-6` (`-4uf`); for those, the real control is branch protection (H2) plus PR review; quoted or escaped spellings, because the rules match the raw command text. The substring rules (`master`, `refs/`, long flags) still catch whole-token quotes such as `'HEAD:master'` or `"--mirror"`, but split quotes (`--mi"rror"`, `"mas"ter`) defeat them. The short-flag rules are defeated by **any** quoting or escaping of the flag (`'-f'`, `"-uf"`, `-"f"`, `-\f`), and, **unverified**, by a tab instead of a space before it (that case comes from the reviewer's simulation with the policy-test matcher; whether the real CLI normalises whitespace before matching wasn't checked). Also not caught: aliases, scripts and `sh -c`. Side effect: a branch whose name contains `master` can't be pushed. |
 | **Denied (other):** `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `gh api` calls touching `*protection*` / `*rulesets*` or containing `DELETE` (any of `-X DELETE`, `-XDELETE`, `--method DELETE`, `--method=DELETE`), `gh auth *` (would print the token), `rm -rf` (common spellings) | `deny` rules | Text match only. A lowercase `-X delete` is still an API write, so it asks rather than being denied. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
@@ -1828,7 +1862,7 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 
 | Rule | Commands |
 |---|---|
-| **Allow** (no prompt) | the 12 read-only `scooter` MCP tools (`mcp__scooter__…`); `make help/setup/test/run/lock/check-settings/clean`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); `git push [-u\|-q\|--set-upstream] origin stage-…`; `gh pr view/list/diff/checks/create/comment/edit/review`; `gh pr merge --squash`; `gh run list/view/watch`; `gh api` reads; edits to `Makefile`, `requirements*`, `scripts/**` |
+| **Allow** (no prompt) | the 12 read-only `scooter` MCP tools (`mcp__scooter__…`); `make help/setup/test/run/lock/check-settings/clean`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); `git push -u origin stage-…` (or `-q`, `--set-upstream`, or no flag); `gh pr view/list/diff/checks/create/comment/edit/review`; `gh pr merge --squash`; `gh run list/view/watch`; `gh api` reads; edits to `Makefile`, `requirements*`, `scripts/**` |
 | **Ask** | everything in the "Asks first" row above, plus the `scooter` MCP tools `run_tests`, `replay_fault` and `reconcile_run`, and edits to `.mcp.json` and `mcp_server.py` |
 | **Deny** | the "Denied" row above, plus the secret reads |
 

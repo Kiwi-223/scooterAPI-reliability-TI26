@@ -161,6 +161,32 @@ def _float_pair(lat, lng):
         return None
 
 
+def _end_location_detail(wanted, got, in_memory, after):
+    """end_location_not_persisted's detail: where the ride should have ended, where the
+    scooter is on disk, and which kind of bug that points at (PLAN PR 20a: the name says
+    "not persisted", but the cold-agent rehearsal's bug persisted a wrong location that the
+    code itself had computed). `cause`:
+    - "logic": scooter_in_memory is at the same wrong place as scooter_after, so the code
+      computed the wrong location and the write faithfully saved it (e.g. swapped lat/lng,
+      or never moving the scooter): read the code that sets lat/lng.
+    - "persistence": scooter_in_memory is at the right place but scooter_after isn't, so
+      the change was made but not written (see also write_not_persisted).
+    - "unknown": no in-memory snapshot, or it's somewhere else again."""
+    mem = _float_pair((in_memory or {}).get("lat"), (in_memory or {}).get("lng")) if isinstance(in_memory, dict) else None
+    if mem is not None and mem == got:
+        cause, why = "logic", "the code computed this location itself (in_memory = after): a logic error, not a lost write"
+    elif mem is not None and mem == wanted:
+        cause, why = "persistence", "the code had the right location in memory, but what was written differs"
+    else:
+        cause, why = "unknown", "no in-memory snapshot to tell a logic error from a lost write"
+    pair = lambda p: None if p is None else {"lat": p[0], "lng": p[1]}
+    expected_s = f"({wanted[0]}, {wanted[1]})"
+    actual_s = "unparseable" if got is None else f"({got[0]}, {got[1]})"
+    return {"summary": f"expected the scooter at {expected_s}, it's at {actual_s} on disk; cause: {cause} ({why})",
+            "cause": cause, "requested": pair(wanted), "expected": pair(wanted), "actual": pair(got),
+            "in_memory": pair(mem), "scooter_after": after}
+
+
 def _requested_end(record):
     """Where an end request's ride ended, as the app decided it. Since PLAN PR 14 that's the
     location stored when payment started (the payment `requested` decision's end_lat/end_lng):
@@ -371,7 +397,9 @@ def anomalies(records, since=None, db=None, db_path=None):
     - start_left_free: /reservation/start returned 200 but scooter_after isn't reserved
     - end_location_not_persisted: /reservation/end returned 200 but scooter_after's lat/lng
       differ from where the ride ended (the stored end location since PLAN PR 14, else the
-      requested coordinates; compared as floats)
+      requested coordinates; compared as floats). The detail's `cause` says whether the
+      code computed the wrong location ("logic": in_memory is wrong too) or lost a right
+      one ("persistence"), with `expected` and `actual` coordinates and a one-line `summary`
     - reservation_flag_mismatch: scooter_after breaks the DB invariant "is_reserved is true
       exactly when reservation is set" (PLAN PR 12)
     - start_reservation_not_persisted: /reservation/start returned 200 but scooter_after has
@@ -511,8 +539,7 @@ def anomalies(records, since=None, db=None, db_path=None):
             wanted = _requested_end(r) if path == "/reservation/end" else _reconciled_end(decisions)
             got = _float_pair(after.get("lat"), after.get("lng"))
             if wanted is not None and got != wanted:
-                flag("end_location_not_persisted", {"requested": {"lat": wanted[0], "lng": wanted[1]},
-                                                    "scooter_after": after})
+                flag("end_location_not_persisted", _end_location_detail(wanted, got, in_memory, after))
         paid_at = next((n for n, d in enumerate(decisions) if d.get("step") == "payment" and d.get("outcome") == "ok"), None)
         if paid_at is not None:
             lost = [d for d in decisions[paid_at + 1:] if d.get("step") == "db_write" and d.get("outcome") in ("failed", "refused")]
@@ -796,7 +823,8 @@ def _print_human(command, result, args):
         for a in result:
             label = "  [historical: resolved]" if a.get("resolved") else ""
             print(f"  {a['type']:22} {a['ts']} {a['path']} id={a['request_id']} scooter={a['scooter_id']}{label}\n"
-                  f"      {json.dumps(a['detail'])}")
+                  + (f"      {a['detail']['summary']}\n" if isinstance(a.get("detail"), dict) and a["detail"].get("summary") else "")
+                  + f"      {json.dumps(a['detail'])}")
         if result and getattr(args, "db_problem", None):
             print(f"  (DB not read, so charged_and_owed can't say whether it is still owed: {args.db_problem})")
     elif command == "rollback-check":

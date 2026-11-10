@@ -382,6 +382,26 @@ def test_anomaly_end_location_not_persisted():
     assert found[0]["detail"]["requested"] == {"lat": 23.01, "lng": 19.01}
 
 
+def test_end_location_finding_tells_a_logic_error_from_a_lost_write():
+    # PLAN PR 20a (the cold-agent rehearsal): the name says "not persisted", but a swapped
+    # lat/lng is persisted faithfully; the detail says which, with both coordinate pairs.
+    swapped = {"id": "18", "lat": 19.01, "lng": 23.01, "is_reserved": False, "reservation": None}
+    [logic] = rq.anomalies([_end(swapped)])                       # in_memory == after: the code is wrong
+    assert logic["detail"]["cause"] == "logic"
+    assert (logic["detail"]["expected"], logic["detail"]["actual"]) == ({"lat": 23.01, "lng": 19.01},
+                                                                       {"lat": 19.01, "lng": 23.01})
+    assert logic["detail"]["summary"].startswith("expected the scooter at (23.01, 19.01), it's at (19.01, 23.01) on disk; cause: logic")
+    right = {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False, "reservation": None}
+    lost = rec("x", 1, path="/reservation/end", scooter="18", db_write=WROTE, params={"id": "18", "lat": "23.01", "lng": "19.01"},
+               scooter_before=TAKEN, scooter_after=dict(FREE), scooter_in_memory=right)
+    [persistence] = [a for a in rq.anomalies([lost]) if a["type"] == "end_location_not_persisted"]
+    assert persistence["detail"]["cause"] == "persistence" and persistence["detail"]["in_memory"] == {"lat": 23.01, "lng": 19.01}
+    unknown = rec("x", 1, path="/reservation/end", scooter="18", db_write=WROTE, params={"id": "18", "lat": "23.01", "lng": "19.01"},
+                  scooter_before=TAKEN, scooter_after=swapped, scooter_in_memory=None)
+    [u] = rq.anomalies([unknown])
+    assert u["detail"]["cause"] == "unknown" and u["detail"]["in_memory"] is None
+
+
 @pytest.mark.parametrize("lat,lng", [("23.01", "19.01"), ("+23.01", " 19.010 "), (["23.01", "1"], "19.01")])
 def test_end_location_compares_as_floats_like_the_app(lat, lng):
     after = {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}

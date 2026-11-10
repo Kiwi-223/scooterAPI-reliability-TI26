@@ -83,6 +83,15 @@ def test_every_scenario_is_clean_on_the_real_code_by_every_documented_command(sc
         assert _call("anomalies", {"scenario": s["scenario"]}).structured_content["result"]["unresolved"] == 0
 
 
+def test_the_listing_prints_one_line_per_scenario():
+    # PR #27 review: two-line docstrings wrapped into the next column-less line.
+    import scenarios
+    out = subprocess.run([sys.executable, str(REPO / "scenarios.py")], cwd=REPO, capture_output=True, text=True,
+                         timeout=60, check=True).stdout.splitlines()
+    assert out[0].startswith("scenarios (") and len(out) == 1 + len(scenarios.SCENARIOS)
+    assert [line.split()[0] for line in out[1:]] == list(scenarios.SCENARIOS)
+
+
 def test_a_scenario_never_touches_the_live_files_and_keeps_earlier_runs(scenarios_dir):
     run_scenario("decline")
     run_scenario("decline")                            # the first run is moved aside, not deleted
@@ -165,6 +174,28 @@ def test_the_activity_symptom_finish_ride_keeps_the_flag(tmp_path, scenarios_dir
     assert "is_reserved is true but reservation is null" in refused[0]["detail"]["error"]
 
 
+def test_rehearsal_plant_swapped_lat_lng_prints_expected_vs_actual(tmp_path, scenarios_dir):
+    """PLAN step 20, the cold-agent rehearsal: finish_ride swapped lat/lng. The agent found it,
+    but the step said only "expected: 18 is free at (23.01, 19.01)" and the anomaly's name
+    suggested a lost write. Now both name the actual values and the kind of bug (PLAN PR 20a)."""
+    copy = planted_copy(tmp_path, "app.py", "\tscooter.lat, scooter.lng = end_lat, end_lng\n",
+                        "\tscooter.lat, scooter.lng = end_lng, end_lat\n")
+    code, summary = run_scenario("rides", copy)
+    assert code == 1
+    problems = {s["why"]: s["problem"] for s in summary["unexpected"]}
+    assert problems["18 is free at (23.01, 19.01) in the DB"] == "expected at=(23.01, 19.01), got at=(19.01, 23.01)"
+    assert problems["search near 18"] == "expected: the search finds 18; got []"
+    [found] = [a for a in summary["anomalies"] if a["type"] == "end_location_not_persisted"
+               and a["request_id"] == "scn-rides-004"]
+    assert found["summary"].startswith("expected the scooter at (23.01, 19.01), it's at (19.01, 23.01) on disk; "
+                                       "cause: logic")
+    out = subprocess.run([sys.executable, str(copy / "scenarios.py"), "rides"], cwd=copy, capture_output=True, text=True,
+                         timeout=300, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    assert "UNEXPECTED step 6: 18 is free at (23.01, 19.01) in the DB: expected at=(23.01, 19.01), got at=(19.01, 23.01)" \
+        in out.stdout, out.stdout
+    assert "cause: logic" in out.stdout
+
+
 def test_reviewer_plant_view_all_lists_pending_scooters(tmp_path, scenarios_dir):
     """PR #24 review, blind run 1: scenarios missed it; now a step and an anomaly name it."""
     copy = planted_copy(tmp_path, "app.py",
@@ -197,7 +228,7 @@ def test_reviewer_plant_reconcile_attempt_limit_off_by_one(tmp_path, scenarios_d
     assert code == 1
     problems = [s["problem"] for s in summary["unexpected"]]
     assert "scooter 9: expected end_unpaid, reconcile did retry" in problems[0]
-    assert "expected: reconcile made no 4th gateway call for 9" in problems
+    assert "expected calls_for_9=3, got calls_for_9=4" in problems          # the actual count, not just the claim
 
 
 def test_reviewer_plant_f2_a_new_reservation_and_key_per_attempt(tmp_path, scenarios_dir):
@@ -276,6 +307,27 @@ def test_stale_bytecode_cant_hide_a_planted_bug(tmp_path, scenarios_dir):
 
 
 # ---- the playbook's failing-test template is real code ---------------------------------------------
+
+def test_no_agent_facing_command_has_an_escaped_pipe():
+    # PR #27 review: `jq '.[] \| select(...)'` in a markdown table renders as a pipe, but an agent
+    # reading the raw file copies the backslash, and jq rejects it. Code spans in AGENTS.md must
+    # be runnable exactly as written in the raw text (AI_NOTES #48).
+    import re
+    spans = re.findall(r"`[^`\n]*\\\|[^`\n]*`", (REPO / "AGENTS.md").read_text())
+    assert spans == []
+
+
+def test_the_cold_start_sed_prints_exactly_the_debugging_section():
+    # Run the one-liner as AGENTS.md's raw text spells it (PR #27 review NIT: it printed one line too many).
+    import re
+    text = (REPO / "AGENTS.md").read_text()
+    [command] = re.findall(r"`(sed -n '/\^## Debugging a symptom/[^`]*AGENTS\.md)`", text)
+    out = subprocess.run(["bash", "-c", command], cwd=REPO, capture_output=True, text=True, check=True).stdout
+    assert out.startswith("## Debugging a symptom (start here)\n") and "\n## Setup" not in out
+    assert out.rstrip().endswith("`make scenario NAME=payment-faults` shows the same flow working as specified.")
+    [stated] = re.findall(r"\(about ([0-9.]+) KB\); the rest of this file is reference", text)
+    assert abs(float(stated) - len(out.encode()) / 1000) <= 1.5, "update the cold-start note's size"
+
 
 def _template():
     text = (REPO / "AGENTS.md").read_text()

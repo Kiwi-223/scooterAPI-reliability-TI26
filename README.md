@@ -277,6 +277,12 @@ never renamed; new ones may be added.
 - **`requirements.txt`:** the hash-locked runtime deps. Heroku installs only this file.
 - **`/health`:** `GET /health` gives 200 when the DB is readable and valid, and
   `storage_error` (500) when it isn't. See [Health Check](#health-check).
+  - **Alerting monitors must check the body, not only the status.** Alert unless the
+    JSON's `"status"` is `"ok"`. A `"degraded"` answer (a reservation in a payment state
+    this version doesn't handle) is still HTTP 200, so a monitor that only checks for 200
+    misses it. Alerting on `db.payment_pending` staying above 0 also catches reconcile not
+    running. A platform restart check (e.g. a load balancer's) can keep using the status
+    code: restarting doesn't help in the degraded case.
 
 ### Blockers (H5): the data files on an ephemeral filesystem
 
