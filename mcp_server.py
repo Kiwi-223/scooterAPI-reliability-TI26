@@ -64,8 +64,19 @@ def _path(env, default):
     return Path(os.environ.get(env) or default)
 
 
-def data_paths():
-    """The live data files, exactly as the app and the CLIs resolve them."""
+SCENARIO_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
+
+
+def data_paths(scenario=None):
+    """The live data files, exactly as the app and the CLIs resolve them; or, with
+    `scenario`, the isolated files of the latest `make scenario NAME=<scenario>` run
+    (data/scenarios/<scenario>/, PLAN PR 17)."""
+    if scenario:
+        base = Path(os.environ.get("SCOOTER_SCENARIOS_DIR") or REPO / "data" / "scenarios") / scenario
+        if not SCENARIO_RE.match(scenario) or not base.is_dir():
+            raise ToolError(f"no scenario run {scenario!r} under data/scenarios/; run `make scenario NAME={scenario}`"
+                            if SCENARIO_RE.match(scenario) else "scenario: lowercase letters, digits and - only")
+        return {"db": base / "db.json", "records": base / "records.jsonl", "ledger": base / "ledger.jsonl"}
     return {"db": _path("SCOOTER_DB_PATH", app_module.DEFAULT_DB_PATH),
             "records": Path(rq.records_path()),
             "ledger": Path(payments.ledger_path())}
@@ -76,9 +87,9 @@ def _file(path):
     return {"path": str(path.resolve()), "exists": path.exists()}
 
 
-def _records():
+def _records(scenario=None):
     """All records (a missing file means none yet) -> (records, files_read entry)."""
-    path = data_paths()["records"]
+    path = data_paths(scenario)["records"]
     warnings = []
     try:
         records = list(rq.read_records(path, warn=lambda n, reason: warnings.append(f"line {n}: {reason}")))
@@ -89,16 +100,16 @@ def _records():
     return records, dict(_file(path), records=len(records), skipped_lines=warnings[:20])
 
 
-def _db_raw():
-    path = data_paths()["db"]
+def _db_raw(scenario=None):
+    path = data_paths(scenario)["db"]
     db, problem = rq.read_db(str(path))
     if problem:
         raise ToolError(f"cannot read the DB: {problem}")
     return db, _file(path)
 
 
-def _ledger():
-    path = data_paths()["ledger"]
+def _ledger(scenario=None):
+    path = data_paths(scenario)["ledger"]
     try:
         entries = payments.all_entries(str(path))
     except ValueError as exc:
@@ -122,34 +133,35 @@ def _result(result, **files):
 # ---- read-only tools --------------------------------------------------------------------------
 
 @server.tool()
-def recent_failures(since: str | None = None, limit: int = 20) -> dict[str, Any]:
+def recent_failures(since: str | None = None, limit: int = 20, scenario: str | None = None) -> dict[str, Any]:
     """What failed recently: the newest failed requests (error != null), newest first.
-    since: a duration (30s, 15m, 1h, 2d) or an ISO-8601 time. Same as `make records ARGS="recent-failures"`."""
+    since: a duration (30s, 15m, 1h, 2d) or an ISO-8601 time. Same as `make records ARGS="recent-failures"`.
+    scenario (every read-only tool): read a `make scenario NAME=<scenario>` run instead of the live files."""
     if not 1 <= limit <= 500:
         raise ToolError("limit must be between 1 and 500")
-    records, read = _records()
+    records, read = _records(scenario)
     return _result(rq.recent_failures(records, _since(since), limit), records=read)
 
 
 @server.tool()
-def failure_counts(since: str | None = None) -> dict[str, Any]:
+def failure_counts(since: str | None = None, scenario: str | None = None) -> dict[str, Any]:
     """How many failures of each error.kind, most frequent first (`make records ARGS="failure-counts"`)."""
-    records, read = _records()
+    records, read = _records(scenario)
     return _result(rq.failure_counts(records, _since(since)), records=read)
 
 
 @server.tool()
-def scooter_history(scooter_id: str) -> dict[str, Any]:
+def scooter_history(scooter_id: str, scenario: str | None = None) -> dict[str, Any]:
     """What happened to one scooter: every record about it, in the order the requests took
     effect (lock order), with before/after state and decisions (`make records ARGS="scooter <id>"`)."""
-    records, read = _records()
+    records, read = _records(scenario)
     return _result(rq.scooter_history(records, scooter_id), records=read)
 
 
 @server.tool()
-def request_trace(request_id: str) -> dict[str, Any]:
+def request_trace(request_id: str, scenario: str | None = None) -> dict[str, Any]:
     """The full record(s) for one X-Request-ID: every decision the request made (`make records ARGS="request <id>"`)."""
-    records, read = _records()
+    records, read = _records(scenario)
     found = rq.find_requests(records, request_id)
     if not found:
         raise ToolError(f"no record with request_id {request_id!r} in {read['path']}")
@@ -157,10 +169,10 @@ def request_trace(request_id: str) -> dict[str, Any]:
 
 
 @server.tool()
-def scooter_state(scooter_id: str = "all") -> dict[str, Any]:
+def scooter_state(scooter_id: str = "all", scenario: str | None = None) -> dict[str, Any]:
     """The DB's current state of one scooter (or "all"), as the app loads it: reservation,
     payment state, outstanding balances. Validated like every app read; read-only, no lock."""
-    path = data_paths()["db"]
+    path = data_paths(scenario)["db"]
     try:
         db = app_module.init_db(str(path))
     except StorageError as exc:
@@ -174,11 +186,11 @@ def scooter_state(scooter_id: str = "all") -> dict[str, Any]:
 
 
 @server.tool()
-def anomalies(since: str | None = None) -> dict[str, Any]:
+def anomalies(since: str | None = None, scenario: str | None = None) -> dict[str, Any]:
     """Records whose fields contradict each other (the 18 rules in AGENTS.md). `unresolved`
     is what needs attention; a resolved finding is history (`make records ARGS="anomalies"`)."""
-    records, read = _records()
-    path = data_paths()["db"]
+    records, read = _records(scenario)
+    path = data_paths(scenario)["db"]
     db, problem = rq.read_db(str(path))
     found = rq.anomalies(records, _since(since), db, db_path=str(path))
     return _result({"findings": found, "unresolved": len(rq.unresolved(found)), "db_problem": problem},
@@ -186,11 +198,11 @@ def anomalies(since: str | None = None) -> dict[str, Any]:
 
 
 @server.tool()
-def ledger_check(min_age_s: float = 5.0) -> dict[str, Any]:
+def ledger_check(min_age_s: float = 5.0, scenario: str | None = None) -> dict[str, Any]:
     """The payments ledger against the records: double charges, charges under foreign keys,
     requests that died mid-payment (orphans). `problems` is true if any needs attention."""
-    records, read = _records()
-    path = data_paths()["ledger"]
+    records, read = _records(scenario)
+    path = data_paths(scenario)["ledger"]
     try:
         entries = rq.read_ledger(str(path))
     except FileNotFoundError:
@@ -203,12 +215,12 @@ def ledger_check(min_age_s: float = 5.0) -> dict[str, Any]:
 
 
 @server.tool()
-def rollback_check(since: str | None = None) -> dict[str, Any]:
+def rollback_check(since: str | None = None, scenario: str | None = None) -> dict[str, Any]:
     """What a DB rollback (git restore scooter_db.json, a backup) erased: lost balances
     (reconcile rebuilds them), rides erased in progress (free rides) and records-only balances."""
-    records, read = _records()
-    db, db_read = _db_raw()
-    entries, ledger_read = _ledger()
+    records, read = _records(scenario)
+    db, db_read = _db_raw(scenario)
+    entries, ledger_read = _ledger(scenario)
     result = rq.rollback_check(records, db, entries, _since(since))
     return _result(dict(result, problems=rq.rollback_problems(result)), records=read, db=db_read, ledger=ledger_read)
 
@@ -221,12 +233,12 @@ def _invariants_module():
 
 
 @server.tool()
-def check_invariants() -> dict[str, Any]:
+def check_invariants(scenario: str | None = None) -> dict[str, Any]:
     """The end-ride invariants I1-I5 across the DB, the ledger and the records (as
     `.venv/bin/python tests/invariants.py`). An empty `violations` list means all hold."""
-    records, read = _records()
-    db, db_read = _db_raw()
-    entries, ledger_read = _ledger()
+    records, read = _records(scenario)
+    db, db_read = _db_raw(scenario)
+    entries, ledger_read = _ledger(scenario)
     inv = _invariants_module()
     found = inv.violations(db, entries, inv.started_keys(records, db), inv.pending_amounts(records))
     return _result({"violations": [list(v) for v in found], "ok": not found},
@@ -234,10 +246,10 @@ def check_invariants() -> dict[str, Any]:
 
 
 @server.tool()
-def payment_lookup(idempotency_key: str) -> dict[str, Any]:
+def payment_lookup(idempotency_key: str, scenario: str | None = None) -> dict[str, Any]:
     """Every ledger entry for one idempotency key (= reservation_id), in order: each
     attempt's outcome, whether it charged, and why (`make payments ARGS="lookup <key>"`)."""
-    entries, read = _ledger()
+    entries, read = _ledger(scenario)
     return _result([e for e in entries if e.get("idempotency_key") == idempotency_key], ledger=read)
 
 
@@ -407,15 +419,16 @@ def replay_env(fault, override=None):
 
 
 @server.tool()
-def replay_fault(request_id: str, fault: str | None = None) -> dict[str, Any]:
+def replay_fault(request_id: str, fault: str | None = None, scenario: str | None = None) -> dict[str, Any]:
     """Reproduce a recorded /reservation/end payment failure on an ISOLATED temp instance
     (temp DB, records and ledger; the live files are only read). It rebuilds the scooter as
     the record saw it and the key's earlier ledger entries, re-applies the record's fault
     provenance (env, header or seeded draw), and returns the replayed record. fault:
-    optionally force another outcome instead ("what if it had been a decline?")."""
+    optionally force another outcome instead ("what if it had been a decline?"). scenario:
+    replay a request from a `make scenario` run."""
     if fault is not None and fault not in payments.FAULT_MODES:
         raise ToolError(f"fault must be one of {list(payments.FAULT_MODES)}")
-    records, read = _records()
+    records, read = _records(scenario)
     original = next((r for r in rq.find_requests(records, request_id) if r.get("path") == "/reservation/end"), None)
     if original is None:
         raise ToolError(f"no /reservation/end record with request_id {request_id!r} in {read['path']}")
@@ -423,14 +436,14 @@ def replay_fault(request_id: str, fault: str | None = None) -> dict[str, Any]:
     before = original.get("scooter_before")
     if call is None or not isinstance(before, dict) or not call.get("idempotency_key"):
         raise ToolError("that request never called the payment gateway, so there's no fault to replay")
-    db, db_read = _db_raw()
+    db, db_read = _db_raw(scenario)
     if not any(isinstance(s, dict) and s.get("id") == before.get("id") for s in db):
         raise ToolError(f"scooter {before.get('id')!r} isn't in the current DB")
-    ledger, ledger_read = _ledger()
+    ledger, ledger_read = _ledger(scenario)
     key, attempt = call["idempotency_key"], call.get("attempt") or 1
     earlier = [e for e in ledger if e.get("idempotency_key") == key][:attempt - 1]
     env_fault, header = replay_env(call.get("fault"), fault)
-    live = {str(p.resolve()) for p in data_paths().values()}
+    live = {str(p.resolve()) for p in [*data_paths().values(), *data_paths(scenario).values()]}
     with tempfile.TemporaryDirectory(prefix="scooter-replay-") as tmp:
         tmp = Path(tmp).resolve()
         paths = {"SCOOTER_DB_PATH": tmp / "db.json", "SCOOTER_RECORDS_PATH": tmp / "records.jsonl",

@@ -767,3 +767,21 @@ strongest entries.
   `run_tests`, and the residual risk documented. Lesson: **every new auto-approval needs
   its source file guarded**: when you approve something by name, path or pattern, ask who
   can change what that name points to, and guard that too.
+
+### 39. Durable state outside the DB quietly changed what "reset" means
+- **Where:** AGENTS.md's reset instructions (`git restore scooter_db.json`), across PLAN PRs
+  13, 15b and 15c; fixed in PLAN PR 17 (`make reset-local`).
+- **What the AI claimed:** `git restore scooter_db.json` resets local state. It was written
+  in "Where data lives", the Reversibility table and the known-behaviour notes, and it was
+  true when the DB was the only state.
+- **Reality:** PR 13 added the payments ledger and PR 15c made it a source of truth for
+  debts, while the request records were always durable. After that, restoring only the
+  DB is a **rollback**: reconcile rebuilds old debts from the ledger, and
+  `rollback-check` lists every past ride as erased. The instruction kept its old wording
+  through three PRs that each changed what it did.
+- **How it was caught:** PR #22's review: following the documented reset and then running
+  reconcile rebuilt balances from rides that "no longer existed".
+- **What changed:** `make reset-local` backs up and moves the DB, records, ledger and
+  scenario runs together, deleting nothing, and every reset instruction now points at it.
+  Lesson: **when you add durable state outside the DB, re-check every reset, restore and
+  "start fresh" instruction**, because each one silently changes meaning.
