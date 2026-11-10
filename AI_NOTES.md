@@ -169,3 +169,149 @@ strongest entries.
   `Exception` handler was the one returning HTML. It was written from a paraphrase of the
   review, not from the probe's recorded output, and the reviewer caught it. Lesson:
   fact-check log entries against recorded output, not against someone's summary of it.
+
+### 10. "`--max-turns` isn't in `--help`, so there is no turn cap"
+- **Where:** `scripts/agent.sh` and AGENTS.md "Budget", first version (PR #7). The idea
+  came in from an earlier review note, and the writer adopted it.
+- **What the AI claimed:** the installed CLI has no `--max-turns` flag, because
+  `claude --help` doesn't list it. So the wrapper could only cap money and time.
+- **Reality:** the flag exists and is supported. It's in the official CLI reference, which
+  the writer had **already downloaded** while researching this PR and saw listed. The
+  2.1.310 binary defines it with `.hideHelp()`: "Maximum number of agentic turns in
+  non-interactive mode". It's hidden, not missing.
+- **How it was caught:** the reviewer checked the docs and grepped the CLI binary for the
+  option definition.
+- **What changed:** `MAX_TURNS` (default 40) is now passed to `--max-turns`, and the docs
+  are corrected. Lesson: `--help` isn't the full interface. When `--help` and the official
+  reference disagree, check the binary or the reference before treating a flag as absent.
+
+### 11. `claude doctor` was presented as validating the settings file
+- **Where:** AGENTS.md "Agent boundaries" and the PR #7 description, first version.
+- **What the AI claimed:** `claude doctor` "reports no invalid entries", which implied the
+  settings were validated. The writer's two negative tests seemed to back this up: doctor
+  flagged a wrong type and one malformed MCP rule.
+- **Reality:** doctor stays silent on unknown or misspelled keys, both top-level and inside
+  `sandbox`, and on many malformed rules. The writer's own negative test had already shown
+  it ignoring `Bash(command:rm *)`, and the writer generalised from the two cases it did
+  catch. A misspelled `sandbox.enabeld` would have passed "validation" and silently left
+  the sandbox off.
+- **How it was caught:** the reviewer planted bad entries (unknown keys, malformed rules)
+  and watched doctor say nothing.
+- **What changed:** a new `make check-settings` (`scripts/check_settings.py`) validates
+  against the vendored SchemaStore schema, with the top level made strict. CI runs it, and
+  `tests/test_settings_schema.py` plants nine kinds of mistake and checks that each is
+  rejected. AGENTS.md now says what doctor does and doesn't check. Lesson: a negative test
+  has to cover the failure you care about (here, a typo that disables a guardrail), not
+  just *a* failure.
+
+### 12. AGENTS.md recommended a command that the same PR denies
+- **Where:** AGENTS.md Setup and Reversibility, PR #7.
+- **What the AI claimed:** "to reset the venv, run `rm -rf .venv && make setup`".
+- **Reality:** the same PR added a `Bash(rm -rf *)` deny rule, so an agent following the
+  onboarding doc would be blocked by the repo's own policy.
+- **How it was caught:** the reviewer ran the documented commands against the new rules.
+- **What changed:** a new `make clean` target removes `.venv`, and the docs now say
+  `make clean && make setup`. Lesson: after changing a policy, re-run the documented
+  workflow under it. Docs and guardrails drift apart when they're written in separate
+  passes.
+
+### 13. An unquoted heredoc ran documentation text as shell commands
+- **Where:** the writer, while updating the PR #7 description (2026-11-04). It ran a Python
+  string-replacement script through `python3 - <<EOF ... EOF`.
+- **What the AI assumed:** the replacement text (Markdown full of backticked commands)
+  would reach Python unchanged.
+- **Reality:** with an *unquoted* `EOF`, the shell does command substitution inside the
+  heredoc, so every `` `...` `` in the Markdown ran as a shell command in the main
+  checkout, in order:
+  - `claude --help` printed its help into the string.
+  - `--max-turns`, `MAX_TURNS`, `--max-turns` and `--help` failed with
+    `command not found`.
+  - `python3 -m json.tool` then blocked waiting on stdin.
+
+  Further down the text were `make check-settings`, `make clean && make test`, `rm -rf`
+  (no operands) and `claude doctor`. They never ran, because the hang stopped the script
+  first. The main checkout was on `master`, where `clean` and `check-settings` didn't even
+  exist yet.
+- **How it was caught:** the `command not found: --max-turns` lines in the output, and the
+  command hanging until the harness moved it to the background. The writer stopped the
+  task before the rest of the substitutions ran, then checked:
+  - no processes were left
+  - the main checkout was unchanged (`master`, clean, `.venv` intact)
+  - the worktree was clean and the PR text file untouched
+- **What changed:** the edit was redone with a quoted heredoc (`<<'EOF'`), with values
+  passed in through environment variables. Lesson: any heredoc whose body contains
+  backticks or `$` must be quoted (`<<'EOF'`). Text you mean as data must never pass
+  through shell expansion. That matters more here because the denied commands (`rm -rf`)
+  and the allowed ones (`make clean`) were sitting in that very text.
+
+### 14. `gh api *` allowed, with a deny list "covering the dangerous calls"
+- **Where:** `.claude/settings.json` and AGENTS.md, PR #7 commit `c12c17c` (the H10 update).
+- **What the AI claimed:** allowing `Bash(gh api *)` was fine, because deny rules for
+  `DELETE`, `*protection*` and `*rulesets*` covered the dangerous calls. The only listed
+  bypasses were exotic ones (`--input`, GraphQL, a URL in a variable).
+- **Reality:** the *ordinary* spellings of API writes were all auto-approved, unsandboxed,
+  using the owner's admin token:
+  - `gh api -X PATCH …/git/refs/heads/master -F force=true` (force-moves `master`)
+  - `gh api …/merges -f base=master …`, where `-f` alone makes it a POST (merges into
+    `master` without a PR)
+  - `PUT …/contents/…` (a direct commit) and `PUT …/pulls/N/merge` (a non-squash merge)
+  - `PATCH repos/O/R` (visibility, default branch)
+
+  `--method=DELETE` also slipped past all four DELETE deny rules. And none of this was even
+  in the owner's H10 list (push, PR creation, merge, comment).
+- **How it was caught:** the reviewer simulated 37 commands against the settings using the
+  documented matching rules.
+- **What changed:**
+  - `gh api` **reads** stay allowed. Every write spelling (`-X`/`--method` anything,
+    `-f`/`-F`/`--field`/`--raw-field`, `--input`) is now an `ask` rule, which beats the
+    allow.
+  - Any `gh api` command containing `DELETE` is denied.
+  - `tests/test_settings_policy.py` runs these commands through a matcher and checks the
+    outcome.
+
+  Lesson: enumerate the tool's write and danger flags, and test the *behaviour* of the rule
+  set on real command lines, not the presence of rule strings.
+
+### 15. "Force-push denied in every spelling we know" missed `--mirror`
+- **Where:** AGENTS.md "Denied" row and the push deny rules, PR #7 commit `c12c17c`.
+- **What the AI claimed:** force-pushes and pushes to `master` were denied "in every
+  spelling we know".
+- **Reality:**
+  - `git push --mirror origin` force-updates every remote ref, `master` included, and
+    deletes the other agents' branches.
+  - `git push --all origin` pushes local `master`.
+  - `git push --prune …` deletes remote branches.
+
+  None of them contains `--force`, `+` or `master`, so all three were allowed, unsandboxed,
+  with no prompt. The writer had never read `git push -h`. That listing also shows
+  `--branches`, `--delete`/`-d` and `--receive-pack`/`--exec` (which run a program). Git
+  also accepts unique abbreviations (`--mirr`), and `'HEAD:master'` in quotes defeated the
+  `*:master` rule.
+- **How it was caught:** the reviewer's simulation of `--mirror`, `--all` and `--prune`.
+- **What changed:**
+  - Every dangerous flag from `git push -h` (git 2.54) is denied by its shortest unique
+    prefix, anywhere in the command.
+  - `-f`/`-d` and their two-letter clusters are denied, as are `+`, `:branch` and `refs/`
+    refspecs and any push mentioning `master`.
+  - Only the `git push [-u|-q] origin stage-…` shape is pre-approved.
+  - AGENTS.md now lists what still isn't caught: 3+ letter clusters, quote-split
+    spellings, aliases and scripts.
+  - The behaviour tests include the plain, abbreviated and quoted spellings.
+
+  Lesson: same as #14. Start from the tool's full option list, not from the spellings you
+  remember.
+
+### 16. A deny rule ending in `:*` would never have matched a colon
+- **Where:** the writer's first fix for #15 (not pushed): `Bash(git push* :*)`, meant to
+  deny `git push origin :branch` (delete a remote branch).
+- **What the AI assumed:** that `:*` at the end of a rule is a literal colon followed by a
+  wildcard.
+- **Reality:** the docs define a trailing `:*` as an alias for ` *`. So the rule really
+  meant `git push*  *` (two spaces) and would never catch a `:branch` refspec.
+- **How it was caught:** the new behavioural tests. The matcher implements the documented
+  `:*` rule, and the `git push origin :stage-6/x` rows came back `default` instead of
+  `deny`.
+- **What changed:** those rules now end in `:**`, which isn't the special suffix, and
+  `test_no_rule_ends_in_colon_star` guards against regressions. This is the first catch
+  made by the behavioural tests themselves, before review.
+

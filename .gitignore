@@ -99,3 +99,7 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Claude Code: personal overrides and agent worktrees (the shared .claude/settings.json is committed)
+.claude/settings.local.json
+.claude/worktrees/

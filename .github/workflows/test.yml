@@ -44,3 +44,9 @@ jobs:
           # and asserts it is Python 3.15.
           PYTHON_BIN: ${{ steps.py.outputs.python-path }}
         run: make test PYTHON="$PYTHON_BIN"
+
+      - name: make check-settings
+        # Validates .claude/settings.json against the vendored schema (no network needed).
+        env:
+          PYTHON_BIN: ${{ steps.py.outputs.python-path }}
+        run: make check-settings PYTHON="$PYTHON_BIN"
