@@ -12,6 +12,10 @@ returns every broken invariant (empty list = all hold):
 - I3 at most one charge per reservation (per idempotency key).
 - I4 the scooter is never reserved without an active or payment_pending reservation, and
   never has a reservation while free.
+- I5 every charge (the ledger's `amount` for a charged key) and every outstanding balance's
+  `amount` equals an amount fixed when that ride's payment started: the records' `payment:
+  requested` cost for that key. (Several only after a restore + conflict.) Checked only
+  when `amounts` is given and has the key: I1-I4 check presence, I5 checks the amount.
 """
 from collections import defaultdict
 
@@ -35,7 +39,20 @@ def started_keys(records, initial_db):
     return keys
 
 
-def violations(db, ledger, keys):
+def pending_amounts(records):
+    """{idempotency key: {amounts fixed at pending}} from the records' payment `requested`
+    decisions (the cost the gateway was asked for, which is the stored amount)."""
+    amounts = defaultdict(set)
+    for rec in records:
+        for d in rec.get("decisions") or []:
+            if d.get("step") == "payment" and d.get("outcome") == "requested":
+                detail = d.get("detail") or {}
+                if detail.get("idempotency_key") is not None:
+                    amounts[detail["idempotency_key"]].add(detail.get("cost"))
+    return amounts
+
+
+def violations(db, ledger, keys, amounts=None):
     found = []
     charges = defaultdict(list)
     for entry in ledger:
@@ -60,6 +77,14 @@ def violations(db, ledger, keys):
             found.append(("I1 charged, but the ride is active (not ended, not pending)", key, None))
         if key in balances:
             found.append(("I1 charged, and also recorded as an outstanding balance", key, None))
+    for entry in ledger:
+        key = entry["idempotency_key"]
+        if amounts and key in amounts and entry.get("charged") and entry.get("amount") not in amounts[key]:
+            found.append(("I5 charged an amount that wasn't fixed at pending", key, entry.get("amount")))
+    for key, owed in balances.items():
+        for balance in owed:
+            if amounts and key in amounts and balance.get("amount") not in amounts[key]:
+                found.append(("I5 balance amount differs from the amount fixed at pending", key, balance.get("amount")))
     for key in keys:
         if key in live:
             continue                                   # still riding, or pending (settleable)

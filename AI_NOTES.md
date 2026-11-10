@@ -551,3 +551,31 @@ strongest entries.
   from the event's identity (who, which reservation, where it ended), never from a value
   computed from it, and don't carry a review's wording into code without testing its edge
   cases.
+
+### 29. "Invariants + anomalies prove Outcome 3" overclaimed what was checked
+- **Where:** PR #17 (PLAN PR 14): its description and AGENTS.md "Payment state machine".
+- **What the AI claimed:** the PR presented the invariant checker (I1–I4) plus a clean
+  `anomalies` run after every fault scenario and a soak as the proof that "when payment
+  fails, the system never ends up in a bad state" (ACTIVITY Outcome 3).
+- **Reality:** the *test suite* caught all 8 bugs the reviewer planted, but the evidence
+  tools a cold agent actually has were weaker:
+  - `make records ARGS="anomalies"` was silent on four of the bugs: a timeout ending the
+    ride as paid, the phase-1 write removed, a retry re-pricing the ride, and a decline
+    recorded as a 0-amount balance.
+  - The reviewer's scenario didn't exercise a fifth (a conflict ending the ride). Running
+    the old rules on this PR's scenarios, `anomalies` named only 3 of the 8.
+  - The invariants checked that a charge or balance *existed*, never its amount, so a
+    0-amount balance for a 1 km ride passed I1–I4.
+  - "Proof" was true of the suite, not of what an agent without the code can see.
+- **How it was caught:** the reviewer planted each bug and ran three checks separately:
+  the suite, the invariants and `anomalies`.
+- **What changed (PLAN PR 14b):**
+  - New rules `ended_without_payment`, `charged_before_pending_persisted` and
+    `pending_location_changed`. `decline_not_settled` now checks the amount.
+  - Invariant I5 checks amounts.
+  - `payment-orphans` finds requests that died mid-payment.
+  - `tests/test_planted_payment_bugs.py` requires `anomalies` to name each of the 8 bugs.
+  - AGENTS.md has a "What `anomalies` can't see" list.
+  - Lesson: when claiming proof, say what was checked (presence, ordering, amounts) and
+    with which tool. A suite that catches a bug doesn't mean the operator's tool can see
+    it. Test the evidence tool against the same planted bugs as the code.

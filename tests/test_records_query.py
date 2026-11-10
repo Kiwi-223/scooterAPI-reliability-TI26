@@ -599,3 +599,127 @@ def test_anomaly_failed_payment_not_pending(kind, after, flagged):
                  db_write=WROTE, scooter_before=TAKEN12, scooter_after=after, scooter_in_memory=after)
     types = [a["type"] for a in rq.anomalies([record])]
     assert ("failed_payment_not_pending" in types) is flagged
+
+
+# ---- PLAN PR 14b: rules that make the planted payment bugs visible ------------------------------
+
+def _d(step, outcome, **detail):
+    return {"step": step, "outcome": outcome, "detail": detail}
+
+
+PENDING_D = _d("payment", "pending", end_lat=1.0, end_lng=1.0, distance_m=10, amount=10)
+REQUESTED_D = _d("payment", "requested", idempotency_key="k", cost=10, distance_m=10, end_lat=1.0, end_lng=1.0)
+OK_D = _d("payment", "ok", gateway_outcome="success", txn_id="t")
+FAILED_D = _d("payment", "failed", gateway_outcome="error", txn_id=None)
+WRITE_OK = _d("db_write", "ok")
+
+
+def _end_rec(rid, decisions, status=200, kind=None, minutes_ago=1, **extra):
+    return rec(rid, minutes_ago, path="/reservation/end", scooter="18", status=status, kind=kind,
+               db_write=WROTE, decisions=decisions, **extra)
+
+
+def _types(records, **kwargs):
+    return sorted({a["type"] for a in rq.anomalies(records, **kwargs)})
+
+
+@pytest.mark.parametrize("decisions,status,kind,flagged", [
+    ([PENDING_D, WRITE_OK, REQUESTED_D, FAILED_D, WRITE_OK], 200, None, True),       # ended though the charge failed
+    ([PENDING_D, WRITE_OK, REQUESTED_D, WRITE_OK], 200, None, True),                  # ended with no payment result
+    ([PENDING_D, WRITE_OK, REQUESTED_D, OK_D, WRITE_OK], 200, None, False),
+    ([PENDING_D, WRITE_OK, REQUESTED_D, _d("payment", "failed", gateway_outcome="decline"), WRITE_OK],
+     422, "payment_declined", False),
+    ([PENDING_D, WRITE_OK, REQUESTED_D, _d("payment", "failed", gateway_outcome="error"), WRITE_OK],
+     422, "payment_declined", True),                                                    # "declined" without a decline
+])
+def test_anomaly_ended_without_payment(decisions, status, kind, flagged):
+    assert ("ended_without_payment" in _types([_end_rec("x", decisions, status, kind)])) is flagged
+
+
+@pytest.mark.parametrize("decisions,flagged", [
+    ([PENDING_D, REQUESTED_D, OK_D, WRITE_OK], True),                                  # charged before phase 1 saved
+    ([PENDING_D, _d("db_write", "failed"), REQUESTED_D, OK_D], True),
+    ([PENDING_D, WRITE_OK, REQUESTED_D, OK_D, WRITE_OK], False),
+    ([_d("end", "allowed"), REQUESTED_D, OK_D, WRITE_OK], False),                      # pre-PR-14 record: no pending
+])
+def test_anomaly_charged_before_pending_persisted(decisions, flagged):
+    assert ("charged_before_pending_persisted" in _types([_end_rec("x", decisions)])) is flagged
+
+
+RETRY_D = _d("end", "retry", end_lat=1.0, end_lng=1.0, amount=10, requested_lat=5.0, requested_lng=5.0)
+
+
+def _retry_rec(rid, requested, retry=RETRY_D, extra_decisions=(), minutes_ago=1):
+    return _end_rec(rid, [retry, *extra_decisions, requested, OK_D, WRITE_OK], minutes_ago=minutes_ago)
+
+
+def test_anomaly_pending_location_changed():
+    first = _end_rec("p", [PENDING_D, WRITE_OK, REQUESTED_D, FAILED_D, WRITE_OK], status=502, kind="payment_failed",
+                     minutes_ago=2)
+    moved = dict(REQUESTED_D, detail=dict(REQUESTED_D["detail"], end_lat=5.0, end_lng=5.0))
+    # the retry re-priced inside its own request
+    assert "pending_location_changed" in _types([first, _retry_rec("r", moved, extra_decisions=[PENDING_D, WRITE_OK])])
+    # the retry charged somewhere other than its stored location (seen even without the
+    # phase-1 record, e.g. when that record is in an older, rotated file)
+    assert "pending_location_changed" in _types([first, _retry_rec("r", moved)])
+    assert "pending_location_changed" in _types([_retry_rec("r", moved)])
+    # stored and charged agree in the retry, but differ from what phase 1 fixed for the key
+    shifted = _d("end", "retry", end_lat=5.0, end_lng=5.0, amount=10)
+    assert "pending_location_changed" in _types([first, _retry_rec("r", moved, retry=shifted)])
+    # a phase-1 record outside the --since window still supplies the stored values
+    assert "pending_location_changed" in _types([dict(first, ts=ts(120)), _retry_rec("r", moved, retry=shifted)],
+                                                since=NOW - datetime.timedelta(minutes=60))
+    # legitimate retries: same values; or no phase-1 record known for the key
+    assert _types([first, _retry_rec("r", REQUESTED_D)]) == []
+    assert _types([_retry_rec("r", moved, retry=shifted)]) == []
+
+
+def test_decline_not_settled_checks_the_balance_amount():
+    declined = _d("payment", "failed", gateway_outcome="decline")
+    before = TAKEN12
+    for amount, flagged in ((10, False), (0, True), (11, True)):
+        after = dict(FREE12, outstanding_balances=[{"reservation_id": RES["reservation_id"], "amount": amount}])
+        record = _end_rec("x", [PENDING_D, WRITE_OK, REQUESTED_D, declined, WRITE_OK], status=422,
+                          kind="payment_declined", scooter_before=before, scooter_after=after, scooter_in_memory=after)
+        assert ("decline_not_settled" in _types([record])) is flagged, amount
+
+
+# ---- payment-orphans: a ledger entry whose request left no record -----------------------------
+
+def _ledger_entry(request_id, minutes_ago=1, charged=True):
+    return {"ts": ts(minutes_ago), "idempotency_key": "k", "attempt": 1, "outcome": "success",
+            "charged": charged, "request_id": request_id, "scooter_id": "18"}
+
+
+def test_ledger_orphans():
+    records = [rec("r1", 1)]
+    entries = [_ledger_entry("r1"), _ledger_entry("dead"), _ledger_entry(None),
+               _ledger_entry("young", minutes_ago=0)]
+    found = rq.ledger_orphans(entries, records, now=NOW + datetime.timedelta(seconds=1), min_age_s=5)
+    assert [e["request_id"] for e in found] == ["dead"]                # young may still be running
+
+
+def test_cli_payment_orphans(tmp_path, capsys):
+    records_file = tmp_path / "records.jsonl"
+    records_file.write_text(json.dumps(rec("r1", 1)) + "\n")
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text(json.dumps(_ledger_entry("r1")) + "\n")
+    assert rq.main(["--file", str(records_file), "payment-orphans", "--ledger", str(ledger)], now=NOW) == 0
+    capsys.readouterr()
+    with ledger.open("a") as f:
+        f.write(json.dumps(_ledger_entry("killed-worker")) + "\n")
+    assert rq.main(["--file", str(records_file), "payment-orphans", "--ledger", str(ledger)], now=NOW) == 1
+    out = capsys.readouterr().out
+    assert "1 ledger entr(ies) with no request record" in out and "request_id=killed-worker" in out
+    assert rq.main(["--file", str(records_file), "--json", "payment-orphans", "--ledger", str(ledger)], now=NOW) == 1
+    assert [e["request_id"] for e in json.loads(capsys.readouterr().out)] == ["killed-worker"]
+    assert rq.main(["--file", str(records_file), "payment-orphans", "--ledger", str(tmp_path / "nope")], now=NOW) == 2
+
+
+def test_payment_orphans_on_real_requests_is_clean(client, monkeypatch, records_path, ledger_path, capsys):
+    client.get("/reservation/start?id=18")
+    monkeypatch.setenv("PAYMENT_FAULT", "timeout_charged")
+    client.get("/reservation/end?id=18&lat=1&lng=1")
+    monkeypatch.setenv("PAYMENT_FAULT", "none")
+    client.get("/reservation/end?id=18&lat=1&lng=1")
+    assert rq.main(["--file", str(records_path), "payment-orphans", "--ledger", str(ledger_path), "--min-age", "0"]) == 0
