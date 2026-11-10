@@ -339,7 +339,7 @@ def test_anomalies_catch_a_lost_write_in_real_records(client, monkeypatch, recor
 
 
 def test_anomalies_catch_a_success_without_write_in_real_records(client, monkeypatch, records_path):
-    monkeypatch.setattr(app_module, "write_db", lambda db: True)      # a "forgot to save" bug
+    monkeypatch.setattr(app_module, "write_db", lambda db, path=None: True)   # a "forgot to save" bug
     assert client.get("/reservation/start?id=18").status_code == 200
     assert [a["type"] for a in rq.anomalies(rq.read_records(records_path))] == ["success_without_write"]
 
@@ -441,7 +441,7 @@ def test_real_planted_end_location_bug_is_flagged(client, monkeypatch, records_p
     assert {a["type"] for a in found} == {"end_location_not_persisted", "write_not_persisted"}
 
 
-_LOCATION_LINE = "\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng\n"
+_LOCATION_LINE = "\t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng\n"
 
 
 def test_real_planted_bug_that_never_moves_the_scooter_is_flagged(tmp_path, db_path, records_path):

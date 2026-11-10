@@ -107,3 +107,7 @@ venv.bak/
 # Request records (records.py): local evidence, never committed. Keep the directory.
 data/*
 !data/.gitkeep
+
+# DB lock file and temp files left by an interrupted atomic write (app.py db_transaction/write_db)
+*.lock
+.*.tmp

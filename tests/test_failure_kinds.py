@@ -27,6 +27,7 @@ SHIPPED = {
     "route_not_found": 404,
     "method_not_allowed": 405,
     "storage_error": 500,
+    "storage_busy": 503,
     "internal_error": 500,
 }
 
@@ -38,6 +39,15 @@ def failing_gateway(calls):
         calls.append(cost)
         return {"status": False}
     return gateway
+
+
+def _hold_lock_and_start(c, mp, tmp):
+    # Another holder keeps the DB lock longer than SCOOTER_DB_LOCK_TIMEOUT.
+    import fcntl
+    mp.setenv("SCOOTER_DB_LOCK_TIMEOUT", "0.05")
+    with open(app_module.lock_path_for(app_module.get_db_path()), "a") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        return c.get("/reservation/start?id=18")
 
 
 def _boom(distance):
@@ -62,6 +72,7 @@ TRIGGERS = {
     FailureKind.STORAGE_ERROR: lambda c, mp, tmp: (
         mp.setenv("SCOOTER_DB_PATH", str(tmp / "missing.json")),
         c.get("/view_all_available"))[-1],
+    FailureKind.STORAGE_BUSY: _hold_lock_and_start,
     FailureKind.INTERNAL_ERROR: lambda c, mp, tmp: (
         mp.setattr(app_module, "calculate_cost", _boom),
         c.get("/reservation/start?id=18"),
