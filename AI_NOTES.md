@@ -579,3 +579,29 @@ strongest entries.
   - Lesson: when claiming proof, say what was checked (presence, ordering, amounts) and
     with which tool. A suite that catches a bug doesn't mean the operator's tool can see
     it. Test the evidence tool against the same planted bugs as the code.
+
+### 30. "All 8 planted bugs flagged" was presented as coverage, but the worst failure wasn't in the list
+- **Where:** PR #18 (PLAN PR 14b): its description, AGENTS.md's planted-bug table, and
+  `tests/test_planted_payment_bugs.py`.
+- **What the AI claimed:** with every one of PR #17's 8 planted bugs named by `anomalies`,
+  the cold agent's evidence tool now covered the end-ride state machine's failure modes.
+- **Reality:** the reviewer planted a ninth, plausible bug: a new idempotency key per
+  attempt. A charged timeout followed by a retry then charged **one ride twice**, the
+  worst outcome Outcome 3 exists to rule out.
+  - `anomalies` was silent.
+  - The invariants misreported it as "I2 ended without a charge", because the charges
+    were under keys no reservation owned.
+  - The 8-bug list had been treated as the spec for coverage, rather than the failure
+    classes that matter.
+- **How it was caught:** the reviewer went beyond the listed bugs and asked what bug would
+  produce a double charge.
+- **What changed:**
+  - Payment results record the key and reservation the gateway actually charged under.
+  - New anomalies `payment_key_mismatch` and `double_charge` (checked across records and
+    windows).
+  - I3 now counts charges per `reservation_id` and flags keys no reservation owned.
+  - `ledger-check` finds double charges and foreign keys straight from the ledger.
+  - The bug is now planted as M9, and a decline balance under the wrong key as M10.
+  - AGENTS.md names "double charge" as the failure class.
+  - Lesson: start from the failure class that matters most (here, charging a ride twice).
+    Plant every way you can think of to cause it, not only the bugs someone else listed.

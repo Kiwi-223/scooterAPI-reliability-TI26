@@ -221,8 +221,13 @@ def anomalies(records, since=None):
       stored when payment started (this record's retry decision, or any earlier record's
       `payment: pending` for the same idempotency key)
 
+    - payment_key_mismatch: the payment result says it was charged under an idempotency
+      key (or reservation) other than the reservation's own (scooter_before)
+    - double_charge: a second charge (a different ledger txn) for a reservation that a
+      record already shows charged, i.e. one ride paid twice. Checked across records.
+
     decline_not_settled also requires the balance's amount to equal the amount charged for
-    (the `payment: requested` cost).
+    (the `payment: requested` cost) and its idempotency_key to be the reservation's.
 
     The reservation rules only look at snapshots that have a "reservation" key: records
     written before PLAN PR 12 have none, and aren't flagged for it.
@@ -235,6 +240,7 @@ def anomalies(records, since=None):
     found = []
     pending_by_key = {}     # idempotency key -> {(location, amount)} fixed by phase 1
     retries = []            # (key, values, flag) checked against pending_by_key at the end
+    charged_by_reservation = {}   # reservation_id -> the first txn a record shows charged for it
     for r in records:
         decisions = [d for d in r.get("decisions") or [] if isinstance(d, dict)]
         pending_at, pending = _decision(decisions, "payment", "pending")
@@ -245,6 +251,18 @@ def anomalies(records, since=None):
             values = _ride_values(pending, "amount")
             if values is not None:
                 pending_by_key.setdefault(key, set()).add(values)
+        # charges are tracked across the whole file, so an earlier charge outside --since counts
+        _, paid_detail = _final_payment(decisions)
+        simulator = (paid_detail or {}).get("simulator") or {}
+        charged_rid = (paid_detail or {}).get("reservation_id") or \
+            ((r.get("scooter_before") or {}).get("reservation") or {}).get("reservation_id")
+        double = None
+        if simulator.get("charged") is True and charged_rid is not None:
+            txn = simulator.get("ledger_txn_id")
+            first = charged_by_reservation.setdefault(charged_rid, txn)
+            if first != txn:
+                double = {"reservation_id": charged_rid, "earlier_txn_id": first, "this_txn_id": txn,
+                          "charged_under": paid_detail.get("idempotency_key")}
         if not in_window(r, since):
             continue
         db_write = r.get("db_write") or {}
@@ -283,9 +301,19 @@ def anomalies(records, since=None):
             charged_for = (requested or {}).get("cost")
             if after.get("reservation") is not None or not any(
                     isinstance(b, dict) and b.get("reservation_id") == before_res.get("reservation_id")
+                    and b.get("idempotency_key") == before_res.get("idempotency_key")
                     and (charged_for is None or b.get("amount") == charged_for) for b in balances):
                 flag("decline_not_settled", {"scooter_after": after, "amount_charged_for": charged_for})
         final, final_detail = _final_payment(decisions)
+        before_res = (r.get("scooter_before") or {}).get("reservation") or {}
+        if final is not None and before_res:
+            for field in ("idempotency_key", "reservation_id"):
+                if field in final_detail and final_detail[field] != before_res.get(field):
+                    flag("payment_key_mismatch", {"field": field, "charged_under": final_detail[field],
+                                                  "reservation": before_res.get(field)})
+                    break
+        if double is not None:
+            flag("double_charge", double)
         # (a record with no decisions at all can't say how it paid, so it isn't judged)
         if path == "/reservation/end" and status == 200 and decisions and final != "ok":
             flag("ended_without_payment", {"final_payment": final, "gateway_outcome": (final_detail or {}).get("gateway_outcome")})
@@ -322,22 +350,53 @@ def anomalies(records, since=None):
     return sorted(found, key=_ts_key)
 
 
-def ledger_orphans(ledger_entries, records, now=None, min_age_s=5):
-    """Ledger entries whose request_id has no request record: the request that called the
-    gateway never finished (e.g. a worker SIGKILLed after the charge was appended). Entries
-    younger than min_age_s are skipped, since their request may still be running."""
-    seen = {r.get("request_id") for r in records}
+def ledger_check(ledger_entries, records, now=None, min_age_s=5):
+    """Cross-check the payments ledger against the request records -> dict of lists:
+
+    - open_orphans: ledger entries whose request_id has no request record (the request that
+      called the gateway never finished, e.g. its worker was SIGKILLed), and no later record
+      touched that idempotency key (no retry has settled it yet). Entries younger than
+      min_age_s are skipped: their request may still be running.
+    - resolved_orphans: the same, but a later record (a retry) used that key.
+    - double_charges: two or more charges for one reservation_id, under any keys: one ride
+      paid twice.
+    - foreign_keys: a charge whose idempotency_key isn't its reservation_id. Every key equals
+      its reservation_id (AGENTS.md "Database schema"), so this is a charge under a key no
+      reservation owns.
+    """
     now = now or datetime.datetime.now(datetime.UTC)
-    orphans = []
+    seen, key_uses = set(), {}
+    for r in records:
+        seen.add(r.get("request_id"))
+        for d in r.get("decisions") or []:
+            key = (d.get("detail") or {}).get("idempotency_key") if isinstance(d, dict) and d.get("step") == "payment" else None
+            if key is not None:
+                key_uses.setdefault(key, []).append(r.get("ts") or "")
+    result = {"open_orphans": [], "resolved_orphans": [], "double_charges": [], "foreign_keys": []}
+    charges = {}
     for entry in ledger_entries:
-        rid = entry.get("request_id")
+        rid, key = entry.get("request_id"), entry.get("idempotency_key")
+        if entry.get("charged") is True:
+            charges.setdefault(entry.get("reservation_id"), []).append(entry)
+            if key != entry.get("reservation_id"):
+                result["foreign_keys"].append(entry)
         if rid is None or rid in seen:
             continue
         ts = parse_ts(entry.get("ts"))
         if ts is not None and (now - ts).total_seconds() < min_age_s:
             continue
-        orphans.append(entry)
-    return orphans
+        later = [t for t in key_uses.get(key, []) if t >= (entry.get("ts") or "")]
+        result["resolved_orphans" if later else "open_orphans"].append(entry)
+    for reservation_id, entries in charges.items():
+        if len(entries) > 1:
+            result["double_charges"].append({"reservation_id": reservation_id, "charges": [
+                {k: e.get(k) for k in ("ts", "idempotency_key", "txn_id", "amount", "request_id")} for e in entries]})
+    return result
+
+
+def ledger_problems(result):
+    """True if ledger_check found something that needs attention (exit 1)."""
+    return bool(result["open_orphans"] or result["double_charges"] or result["foreign_keys"])
 
 
 def read_ledger(path, warn=None):
@@ -405,17 +464,26 @@ def _print_human(command, result, args):
     elif command == "request":
         for record in result:
             print(json.dumps(record, indent=2, ensure_ascii=False))
-    elif command == "payment-orphans":
-        print(f"{len(result)} ledger entr(ies) with no request record")
-        for e in result:
-            print(f"  {e.get('ts')} key={e.get('idempotency_key')} attempt={e.get('attempt')} "
-                  f"outcome={e.get('outcome')} charged={e.get('charged')} request_id={e.get('request_id')} "
-                  f"scooter={e.get('scooter_id')}")
-        if result:
-            print("  The request that made each call never finished (e.g. its worker was killed), so it left no\n"
-                  "  record. Its ride is usually still payment_pending (a retry of /reservation/end, or reconcile,\n"
-                  "  settles it with this charge); if the worker died after saving, it already ended. Check the\n"
-                  "  key with make payments ARGS=\"lookup <key>\" and the DB's reservation for that scooter.")
+    elif command == "ledger-check":
+        def entry_line(e):
+            return (f"    {e.get('ts')} key={e.get('idempotency_key')} attempt={e.get('attempt')} outcome={e.get('outcome')} "
+                    f"charged={e.get('charged')} request_id={e.get('request_id')} scooter={e.get('scooter_id')}")
+        print(f"double charges: {len(result['double_charges'])}")
+        for d in result["double_charges"]:
+            print(f"    reservation {d['reservation_id']} charged {len(d['charges'])} times: "
+                  + ", ".join(f"{c['txn_id']} (key {c['idempotency_key']}, {c['amount']})" for c in d["charges"]))
+        print(f"charges under a key that isn't their reservation's: {len(result['foreign_keys'])}")
+        for e in result["foreign_keys"]:
+            print(entry_line(e))
+        print(f"open orphans (the request died mid-payment and nothing has settled its key since): {len(result['open_orphans'])}")
+        for e in result["open_orphans"]:
+            print(entry_line(e))
+        if result["open_orphans"]:
+            print("    Its ride is usually still payment_pending: retry /reservation/end (or reconcile) to settle it\n"
+                  "    with this charge; check with make payments ARGS=\"lookup <key>\" and the DB.")
+        print(f"resolved orphans (a later request used the key): {len(result['resolved_orphans'])}")
+        for e in result["resolved_orphans"]:
+            print(entry_line(e))
     elif command == "anomalies":
         print(f"{len(result)} anomaly(ies){window}")
         for a in result:
@@ -441,8 +509,9 @@ def build_parser():
     p.add_argument("request_id")
     p = sub.add_parser("anomalies", help="records whose fields contradict each other (exit 1 if any)")
     p.add_argument("--since", help="duration (30s, 15m, 1h, 2d, 1h30m) or ISO-8601 time")
-    p = sub.add_parser("payment-orphans",
-                       help="payments-ledger entries with no request record: a request died mid-payment (exit 1 if any)")
+    p = sub.add_parser("ledger-check",
+                       help="cross-check the payments ledger with the records: requests that died mid-payment, "
+                            "double charges, charges under foreign keys (exit 1 if any)")
     p.add_argument("--ledger", help="ledger path (default: $SCOOTER_PAYMENTS_LEDGER_PATH or data/payments_ledger.jsonl)")
     p.add_argument("--min-age", type=float, default=5.0,
                    help="ignore entries younger than this many seconds (their request may still be running; default 5)")
@@ -472,14 +541,14 @@ def main(argv=None, now=None):
             result = scooter_history(records, args.scooter_id)
         elif args.command == "request":
             result = find_requests(records, args.request_id)
-        elif args.command == "payment-orphans":
+        elif args.command == "ledger-check":
             ledger = args.ledger or os.environ.get("SCOOTER_PAYMENTS_LEDGER_PATH") or os.path.join("data", "payments_ledger.jsonl")
             try:
                 entries = read_ledger(ledger, warn=lambda n, reason: warnings.append((n, f"{reason} (in {ledger})")))
             except OSError as exc:
                 print(f"records_query: cannot read ledger {ledger!r}: {exc.strerror or exc}", file=sys.stderr)
                 return 2
-            result = ledger_orphans(entries, records, now=now, min_age_s=args.min_age)
+            result = ledger_check(entries, records, now=now, min_age_s=args.min_age)
         else:
             result = anomalies(records, args.since_dt)
     except OSError as exc:
@@ -497,7 +566,9 @@ def main(argv=None, now=None):
         wanted = args.scooter_id if args.command == "scooter" else args.request_id
         print(f"records_query: no records for {args.command} {wanted!r} in {path}", file=sys.stderr)
         return 1
-    if args.command in ("anomalies", "payment-orphans") and result:
+    if args.command == "anomalies" and result:
+        return 1
+    if args.command == "ledger-check" and ledger_problems(result):
         return 1
     return 0
 

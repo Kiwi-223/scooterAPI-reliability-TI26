@@ -9,7 +9,9 @@ returns every broken invariant (empty list = all hold):
 - I2 no ended ride without a charge or an outstanding balance: every reservation that ever
   existed (from the records' successful starts plus the DB's initial reservations) and is no
   longer in the DB has exactly one charge or a recorded balance.
-- I3 at most one charge per reservation (per idempotency key).
+- I3 at most one charge per reservation: per idempotency key, and per reservation_id (the
+  ledger records both, so a bug that charges one ride under two keys is caught), and no
+  charge under a key that no reservation ever owned (`keys`).
 - I4 the scooter is never reserved without an active or payment_pending reservation, and
   never has a reservation while free.
 - I5 every charge (the ledger's `amount` for a charged key) and every outstanding balance's
@@ -61,6 +63,15 @@ def violations(db, ledger, keys, amounts=None):
     for key, txns in charges.items():
         if len(txns) > 1:
             found.append(("I3 more than one charge", key, txns))
+        if key not in keys:
+            found.append(("I3 charged under a key no reservation owned", key, txns))
+    by_reservation = defaultdict(list)
+    for entry in ledger:
+        if entry.get("charged") and entry.get("reservation_id") is not None:
+            by_reservation[entry["reservation_id"]].append(entry["txn_id"])
+    for reservation_id, txns in by_reservation.items():
+        if len(txns) > 1:
+            found.append(("I3 one reservation charged more than once (a double charge)", reservation_id, txns))
     live, balances = {}, defaultdict(list)
     for entry in db:
         reservation = _reservation(entry)

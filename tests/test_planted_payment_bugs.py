@@ -75,6 +75,14 @@ BUGS = [
     ("M8", "the decline's balance is recorded as 0",
      "\t\t\t\t'amount': reservation['amount'],\n", "\t\t\t\t'amount': 0,\n",
      DECLINE, "decline_not_settled"),
+    # PR #18's review: the failure class that matters most, a double charge
+    ("M9", "a new idempotency key per attempt: a charged timeout + retry charges twice",
+     "\tpayment_response = payments.charge(reservation['idempotency_key'], scooter.id,",
+     "\tpayment_response = payments.charge(reservation['idempotency_key'] + '-' + str(reservation['payment_attempts']), scooter.id,",
+     [["start", "18"], ["end", "18", 1, 1, "timeout_charged"], ["end", "18", 1, 1, "none"]], "double_charge"),
+    ("M10", "the decline's balance is recorded under the wrong idempotency key",
+     "\t\t\t\t'idempotency_key': reservation['idempotency_key'],\n", "\t\t\t\t'idempotency_key': 'wrong-key',\n",
+     DECLINE, "decline_not_settled"),
 ]
 
 

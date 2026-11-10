@@ -193,6 +193,7 @@ def test_end_success_records_payment_and_move(client, read_records):
     detail = payment[2]["detail"]
     assert re.fullmatch(r"[0-9a-f]{32}", detail["txn_id"])
     assert detail == {"gateway_outcome": "success", "txn_id": detail["txn_id"], "attempt": 1,
+                      "idempotency_key": key, "reservation_id": key,             # what it was charged under
                       "fault": {"source": "env", "mode": "none"},
                       "simulator": {"charged": True, "ledger_txn_id": detail["txn_id"]}}
 

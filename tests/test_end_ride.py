@@ -415,7 +415,7 @@ def _entry(sid="18", reservation=None, reserved=None, balances=None):
 
 
 def _charge(key, txn="t1"):
-    return {"idempotency_key": key, "charged": True, "txn_id": txn}
+    return {"idempotency_key": key, "reservation_id": key, "charged": True, "txn_id": txn}
 
 
 @pytest.mark.parametrize("db,ledger,keys,expected", [
@@ -433,6 +433,14 @@ def _charge(key, txn="t1"):
 ])
 def test_the_invariant_checker_catches_each_violation(db, ledger, keys, expected):
     assert expected in [v[0] for v in violations(db, ledger, keys)]
+
+
+def test_the_invariant_checker_catches_a_double_charge_across_keys():
+    # PR #18's review: each attempt charged under its own key (k-0, k-1) for reservation k.
+    ledger = [dict(_charge("k-0", "t1"), reservation_id="k"), dict(_charge("k-1", "t2"), reservation_id="k")]
+    found = [v[0] for v in violations([_entry()], ledger, {"k"})]
+    assert "I3 one reservation charged more than once (a double charge)" in found
+    assert "I3 charged under a key no reservation owned" in found
 
 
 AMOUNTS = {"k": {1000}}

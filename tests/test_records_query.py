@@ -576,7 +576,7 @@ def test_anomaly_charged_without_persisted_end(decisions, flagged):
     assert ("charged_without_persisted_end" in types) is flagged
 
 
-BALANCE_FOR_RES = {"reservation_id": RES["reservation_id"], "amount": 5}
+BALANCE_FOR_RES = {"reservation_id": RES["reservation_id"], "idempotency_key": RES["idempotency_key"], "amount": 5}
 
 
 @pytest.mark.parametrize("after,flagged", [
@@ -678,48 +678,108 @@ def test_decline_not_settled_checks_the_balance_amount():
     declined = _d("payment", "failed", gateway_outcome="decline")
     before = TAKEN12
     for amount, flagged in ((10, False), (0, True), (11, True)):
-        after = dict(FREE12, outstanding_balances=[{"reservation_id": RES["reservation_id"], "amount": amount}])
+        after = dict(FREE12, outstanding_balances=[{"reservation_id": RES["reservation_id"],
+                                                    "idempotency_key": RES["idempotency_key"], "amount": amount}])
         record = _end_rec("x", [PENDING_D, WRITE_OK, REQUESTED_D, declined, WRITE_OK], status=422,
                           kind="payment_declined", scooter_before=before, scooter_after=after, scooter_in_memory=after)
         assert ("decline_not_settled" in _types([record])) is flagged, amount
 
 
-# ---- payment-orphans: a ledger entry whose request left no record -----------------------------
+# ---- ledger-check: the payments ledger against the records ------------------------------------
 
-def _ledger_entry(request_id, minutes_ago=1, charged=True):
-    return {"ts": ts(minutes_ago), "idempotency_key": "k", "attempt": 1, "outcome": "success",
-            "charged": charged, "request_id": request_id, "scooter_id": "18"}
-
-
-def test_ledger_orphans():
-    records = [rec("r1", 1)]
-    entries = [_ledger_entry("r1"), _ledger_entry("dead"), _ledger_entry(None),
-               _ledger_entry("young", minutes_ago=0)]
-    found = rq.ledger_orphans(entries, records, now=NOW + datetime.timedelta(seconds=1), min_age_s=5)
-    assert [e["request_id"] for e in found] == ["dead"]                # young may still be running
+def _ledger_entry(request_id, minutes_ago=1, charged=True, key="k", reservation_id="k", txn="t1"):
+    return {"ts": ts(minutes_ago), "idempotency_key": key, "reservation_id": reservation_id, "attempt": 1,
+            "outcome": "success", "charged": charged, "txn_id": txn if charged else None, "request_id": request_id,
+            "scooter_id": "18", "amount": 10}
 
 
-def test_cli_payment_orphans(tmp_path, capsys):
+def _uses_key(rid, key, minutes_ago):
+    return rec(rid, minutes_ago, path="/reservation/end", decisions=[_d("payment", "requested", idempotency_key=key)])
+
+
+def test_ledger_check_orphans_open_and_resolved():
+    records = [rec("r1", 1), _uses_key("retry", "k2", minutes_ago=0)]
+    entries = [_ledger_entry("r1"), _ledger_entry("dead", key="k1", reservation_id="k1"),
+               _ledger_entry("dead2", key="k2", reservation_id="k2", minutes_ago=2),
+               _ledger_entry(None, key="k4", reservation_id="k4"),            # a direct charge: no request
+               _ledger_entry("young", minutes_ago=0, key="k3", reservation_id="k3")]
+    found = rq.ledger_check(entries, records, now=NOW + datetime.timedelta(seconds=1), min_age_s=5)
+    assert [e["request_id"] for e in found["open_orphans"]] == ["dead"]       # nothing has used k1 since
+    assert [e["request_id"] for e in found["resolved_orphans"]] == ["dead2"]  # a later retry used k2
+    assert found["double_charges"] == [] and found["foreign_keys"] == []
+
+
+def test_ledger_check_finds_a_double_charge_across_keys():
+    entries = [_ledger_entry("a", key="r-0", reservation_id="r", txn="t1"),
+               _ledger_entry("b", key="r-1", reservation_id="r", txn="t2"),
+               _ledger_entry("c", key="other", reservation_id="other", charged=False)]
+    found = rq.ledger_check(entries, [rec("a", 1), rec("b", 1), rec("c", 1)], now=NOW)
+    assert [d["reservation_id"] for d in found["double_charges"]] == ["r"]
+    assert [c["txn_id"] for c in found["double_charges"][0]["charges"]] == ["t1", "t2"]
+    assert [e["idempotency_key"] for e in found["foreign_keys"]] == ["r-0", "r-1"]
+    assert rq.ledger_problems(found)
+
+
+def test_cli_ledger_check(tmp_path, capsys):
     records_file = tmp_path / "records.jsonl"
     records_file.write_text(json.dumps(rec("r1", 1)) + "\n")
     ledger = tmp_path / "ledger.jsonl"
     ledger.write_text(json.dumps(_ledger_entry("r1")) + "\n")
-    assert rq.main(["--file", str(records_file), "payment-orphans", "--ledger", str(ledger)], now=NOW) == 0
+    args = ["--file", str(records_file), "ledger-check", "--ledger", str(ledger)]
+    assert rq.main(args, now=NOW) == 0
     capsys.readouterr()
     with ledger.open("a") as f:
-        f.write(json.dumps(_ledger_entry("killed-worker")) + "\n")
-    assert rq.main(["--file", str(records_file), "payment-orphans", "--ledger", str(ledger)], now=NOW) == 1
+        f.write(json.dumps(_ledger_entry("killed-worker", key="k9", reservation_id="k9", txn="t9")) + "\n")
+    assert rq.main(args, now=NOW) == 1
     out = capsys.readouterr().out
-    assert "1 ledger entr(ies) with no request record" in out and "request_id=killed-worker" in out
-    assert rq.main(["--file", str(records_file), "--json", "payment-orphans", "--ledger", str(ledger)], now=NOW) == 1
-    assert [e["request_id"] for e in json.loads(capsys.readouterr().out)] == ["killed-worker"]
-    assert rq.main(["--file", str(records_file), "payment-orphans", "--ledger", str(tmp_path / "nope")], now=NOW) == 2
+    assert "open orphans (the request died mid-payment and nothing has settled its key since): 1" in out
+    assert "request_id=killed-worker" in out
+    # a retry that uses the key settles it: no longer counts (exit 0), still listed as resolved
+    with records_file.open("a") as f:
+        f.write(json.dumps(_uses_key("retry", "k9", minutes_ago=0)) + "\n")
+    assert rq.main(["--file", str(records_file), "--json", "ledger-check", "--ledger", str(ledger)], now=NOW) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["open_orphans"] == [] and [e["request_id"] for e in result["resolved_orphans"]] == ["killed-worker"]
+    assert rq.main(["--file", str(records_file), "ledger-check", "--ledger", str(tmp_path / "nope")], now=NOW) == 2
 
 
-def test_payment_orphans_on_real_requests_is_clean(client, monkeypatch, records_path, ledger_path, capsys):
+def test_ledger_check_on_real_requests_is_clean(client, monkeypatch, records_path, ledger_path, capsys):
     client.get("/reservation/start?id=18")
     monkeypatch.setenv("PAYMENT_FAULT", "timeout_charged")
     client.get("/reservation/end?id=18&lat=1&lng=1")
     monkeypatch.setenv("PAYMENT_FAULT", "none")
     client.get("/reservation/end?id=18&lat=1&lng=1")
-    assert rq.main(["--file", str(records_path), "payment-orphans", "--ledger", str(ledger_path), "--min-age", "0"]) == 0
+    assert rq.main(["--file", str(records_path), "ledger-check", "--ledger", str(ledger_path), "--min-age", "0"]) == 0
+
+
+# ---- double charges and keys in the records ---------------------------------------------------
+
+def _charged_result(key, rid, txn):
+    return _d("payment", "ok", gateway_outcome="success", txn_id=txn, idempotency_key=key, reservation_id=rid,
+              simulator={"charged": True, "ledger_txn_id": txn})
+
+
+def test_anomaly_payment_key_mismatch():
+    good = _end_rec("a", [PENDING_D, WRITE_OK, REQUESTED_D, _charged_result(RES["idempotency_key"], RES["reservation_id"], "t1"),
+                          WRITE_OK], scooter_before=TAKEN12)
+    bad = _end_rec("b", [PENDING_D, WRITE_OK, REQUESTED_D, _charged_result("other-key", RES["reservation_id"], "t1"),
+                         WRITE_OK], scooter_before=TAKEN12)
+    assert "payment_key_mismatch" not in _types([good])
+    assert "payment_key_mismatch" in _types([bad])
+
+
+def test_anomaly_double_charge_across_records_and_windows():
+    key, rid = RES["idempotency_key"], RES["reservation_id"]
+    timeout = _d("payment", "failed", gateway_outcome="timeout_charged", txn_id=None, idempotency_key=key + "-0",
+                 reservation_id=rid, simulator={"charged": True, "ledger_txn_id": "t1"})
+    first = _end_rec("a", [PENDING_D, WRITE_OK, REQUESTED_D, timeout, WRITE_OK], status=504, kind="payment_timeout",
+                     scooter_before=TAKEN12, minutes_ago=120)
+    second = _end_rec("b", [RETRY_D, REQUESTED_D, _charged_result(key + "-1", rid, "t2"), WRITE_OK],
+                      scooter_before=TAKEN12, minutes_ago=1)
+    assert "double_charge" in _types([first, second])
+    assert "double_charge" in _types([first, second], since=NOW - datetime.timedelta(minutes=60))  # earlier out of window
+    settled = _end_rec("c", [RETRY_D, REQUESTED_D, _d("payment", "ok", gateway_outcome="already_charged", txn_id="t1",
+                                                       idempotency_key=key, reservation_id=rid,
+                                                       simulator={"charged": False, "ledger_txn_id": "t1"}), WRITE_OK],
+                       scooter_before=TAKEN12)
+    assert "double_charge" not in _types([first, settled])                # settling the same charge is fine
