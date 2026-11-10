@@ -144,9 +144,9 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 
 ## Tally, and how this log was checked
 
-Counted from the "Who was wrong" lines of all 46 entries; an entry naming two or three
+Counted from the "Who was wrong" lines of all 48 entries; an entry naming two or three
 agents counts for each of them.
-- **Writer: 40** (every entry except #1–#5 and #22). 6 of them are shared with the
+- **Writer: 42** (every entry except #1–#5 and #22). 6 of them are shared with the
   reviewer: #9, #28, #34, #38, #43, #44. #34 counts as shared because its line names the
   reviewer's #28 as part of the pattern.
 - **Reviewer: 7** (those 6, plus #22).
@@ -222,6 +222,8 @@ round count (#17), and status lines in #3–#5 that had gone stale.
 | 44 | The reviewer called a guardrail missing without checking the platform's built-in protections | Security boundaries and guardrails |
 | 45 | The attribution roles turned a document ("plan") into a party, hiding who wrote the plan draft | Process slips |
 | 46 | A guard for an empty `WEB_CONCURRENCY` that couldn't help, because it was never tested against an empty value | Claims that outran the evidence |
+| 47 | A "read only this section" note one line above an import that loads the whole file | Claims that outran the evidence |
+| 48 | An agent-facing `jq` one-liner that had never been run as an agent copies it | Claims that outran the evidence |
 
 ## All entries, by theme
 
@@ -695,6 +697,43 @@ Something presented as checked, proven or true everywhere that was only checked 
   for a specific failure needs a test that reproduces **that** failure, and should be
   watched failing without the fix. Reading the traceback for *where* the value is read
   would have shown the guard was in the wrong place.
+
+#### 47. A "read only this section" note one line above an import that loads the whole file
+- **Who was wrong:** writer.
+- **Where:** PLAN PR 20a (PR #27): CLAUDE.md and the cold-start note at the top of AGENTS.md.
+- **What the AI claimed:** CLAUDE.md said "Read only AGENTS.md's 'Debugging a symptom'
+  section first (about 11 KB, not the whole file)". That was presented as the fix for the
+  rehearsal agent's complaint that ~170 KB was too much to read cold.
+- **Reality:** the very next line is `@AGENTS.md`, and Claude Code expands imports into
+  context, so every session already has all ~160 KB loaded. The note could steer attention,
+  but it couldn't make the session load less, and "not the whole file" said it did. The
+  size was off too: the section is about 12.5 KB, and the `sed` one-liner offered to
+  print it also printed the next heading.
+- **How it was caught:** the [PR #27 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/27#issuecomment-6778934773) read the Claude Code memory docs on
+  imports and ran the one-liner.
+- **What changed:** both notes now only say where to start and that the rest is reference.
+  The AGENTS.md note says the file is already loaded in full. The `sed` prints exactly the
+  section, and a test runs it from the raw text and checks the stated size. Splitting
+  AGENTS.md is left to the human. Lesson: check what a mechanism actually does (an import
+  loads everything) before writing guidance about how much gets read.
+
+#### 48. An agent-facing `jq` one-liner that had never been run as an agent copies it
+- **Who was wrong:** writer.
+- **Where:** PLAN PR 20a (PR #27): the playbook's step-5 table row "What's in the DB now?"
+  in AGENTS.md.
+- **What the AI claimed:** `jq '.[] \| select(.id=="18")' data/scenarios/rides/db.json` was
+  a copy-pasteable answer. The row it went into is in a section that says "every command is
+  copy-pasteable".
+- **Reality:** the `\|` is markdown-table escaping. It renders as `|`, but agents read the
+  raw file. Copied as written, jq rejects it with `syntax error, unexpected
+  INVALID_CHARACTER`. The writer had only checked the filter with a plain `|` in a shell,
+  never the text as it sits in the file. Three other table cells had the same escape in
+  command shapes (`git push [-u\|-q…]`, `scooter_state(scooter_id \| "all")`).
+- **How it was caught:** the [PR #27 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/27#issuecomment-6778934773) copied it from the raw AGENTS.md and ran it.
+- **What changed:** the pipe-free `jq 'map(select(.id=="18"))' …` replaces it. The other
+  escaped pipes are reworded. A test fails on any code span in AGENTS.md that contains
+  `\|`. Lesson: test documentation commands from the raw text the reader will copy, which
+  is the same rule as #41, applied to markdown.
 
 ### Tests that passed for the wrong reason
 

@@ -139,8 +139,8 @@ def concurrent(d):
 
 
 def restore(d):
-    """DB rollbacks: a replayed ride isn't charged twice; one ended elsewhere is a conflict
-    (409, back to active, nothing charged); an erased balance is rebuilt."""
+    """DB rollbacks: a replayed ride isn't charged twice, one ended elsewhere is a 409 conflict,
+    an erased balance is rebuilt."""
     d.req("/reservation/start?id=18", 200, "start 18")
     d.snapshot("riding")
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "end 18 (paid)")
@@ -161,8 +161,8 @@ def restore(d):
 
 
 def reconcile_stuck(d):
-    """Stuck rides: a charged timeout settles; N failed attempts end unpaid (no N+1th call); a
-    fresh failure is retried; an old one ends unpaid by age."""
+    """Stuck rides: a charged timeout settles, N failures end unpaid, a fresh failure is
+    retried, an old one ends unpaid by age."""
     d.req("/reservation/start?id=15", 200, "start 15")
     d.req("/reservation/end?id=15&lat=0.01&lng=-129.01", (504, "payment_timeout"), "15 was charged, then timed out",
           fault="timeout_charged")
@@ -493,7 +493,7 @@ def main(argv=None):
     if not args.name:
         print("scenarios (make scenario NAME=<name>, or NAME=all):")
         for name, fn in SCENARIOS.items():
-            print(f"  {name:15} {fn.__doc__.strip()}")
+            print(f"  {name:15} {' '.join(fn.__doc__.split())}")     # one line each, however the docstring wraps
         return 0
     names = list(SCENARIOS) if args.name == "all" else [args.name]
     if any(n not in SCENARIOS for n in names):

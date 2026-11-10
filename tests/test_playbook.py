@@ -83,6 +83,15 @@ def test_every_scenario_is_clean_on_the_real_code_by_every_documented_command(sc
         assert _call("anomalies", {"scenario": s["scenario"]}).structured_content["result"]["unresolved"] == 0
 
 
+def test_the_listing_prints_one_line_per_scenario():
+    # PR #27 review: two-line docstrings wrapped into the next column-less line.
+    import scenarios
+    out = subprocess.run([sys.executable, str(REPO / "scenarios.py")], cwd=REPO, capture_output=True, text=True,
+                         timeout=60, check=True).stdout.splitlines()
+    assert out[0].startswith("scenarios (") and len(out) == 1 + len(scenarios.SCENARIOS)
+    assert [line.split()[0] for line in out[1:]] == list(scenarios.SCENARIOS)
+
+
 def test_a_scenario_never_touches_the_live_files_and_keeps_earlier_runs(scenarios_dir):
     run_scenario("decline")
     run_scenario("decline")                            # the first run is moved aside, not deleted
@@ -298,6 +307,27 @@ def test_stale_bytecode_cant_hide_a_planted_bug(tmp_path, scenarios_dir):
 
 
 # ---- the playbook's failing-test template is real code ---------------------------------------------
+
+def test_no_agent_facing_command_has_an_escaped_pipe():
+    # PR #27 review: `jq '.[] \| select(...)'` in a markdown table renders as a pipe, but an agent
+    # reading the raw file copies the backslash, and jq rejects it. Code spans in AGENTS.md must
+    # be runnable exactly as written in the raw text (AI_NOTES #48).
+    import re
+    spans = re.findall(r"`[^`\n]*\\\|[^`\n]*`", (REPO / "AGENTS.md").read_text())
+    assert spans == []
+
+
+def test_the_cold_start_sed_prints_exactly_the_debugging_section():
+    # Run the one-liner as AGENTS.md's raw text spells it (PR #27 review NIT: it printed one line too many).
+    import re
+    text = (REPO / "AGENTS.md").read_text()
+    [command] = re.findall(r"`(sed -n '/\^## Debugging a symptom/[^`]*AGENTS\.md)`", text)
+    out = subprocess.run(["bash", "-c", command], cwd=REPO, capture_output=True, text=True, check=True).stdout
+    assert out.startswith("## Debugging a symptom (start here)\n") and "\n## Setup" not in out
+    assert out.rstrip().endswith("`make scenario NAME=payment-faults` shows the same flow working as specified.")
+    [stated] = re.findall(r"\(about ([0-9.]+) KB\); the rest of this file is reference", text)
+    assert abs(float(stated) - len(out.encode()) / 1000) <= 1.5, "update the cold-start note's size"
+
 
 def _template():
     text = (REPO / "AGENTS.md").read_text()
