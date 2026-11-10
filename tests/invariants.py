@@ -35,18 +35,29 @@ def _reservation(entry):
 
 def started_keys(records, initial_db):
     """Every reservation's idempotency key that ever existed: the initial DB's, every
-    successful start's, and every reservation any record saw (its `scooter_before` or
-    `scooter_after`). The last covers rides older than the records, e.g. the committed DB's
-    legacy-33, when the current DB stands in for the initial one (the CLI below, the MCP
-    `check_invariants`): otherwise a ride that started before the records and has ended
-    since looks like a charge under a key nobody owned (PR #24 review)."""
+    successful start's, and every reservation a record saw (its `scooter_before` or
+    `scooter_after`) **that is older than the records**, i.e. whose `start_request_id` isn't
+    a recorded successful start (legacy rides have none). The last covers rides like the
+    committed DB's legacy-33 when the current DB stands in for the initial one (the CLI
+    below, the MCP `check_invariants`); otherwise a ride that started before the records
+    and has ended since looks like a charge under a key nobody owned (PR #24 review).
+
+    It must NOT count every key a record saw: the app persists each key before charging
+    under it (phase 1), so a bug that invents a new key or reservation id on a retry would
+    then look "owned", and its double charge would pass I3 (planted bug F2, PR #24
+    re-review). A reservation that claims a recorded start but carries another key is
+    exactly that bug."""
     keys = {r["idempotency_key"] for r in map(_reservation, initial_db) if r}
+    started = set()
     for rec in records:
         if rec.get("path") == "/reservation/start" and rec.get("status") == 200:
             keys.add(rec["scooter_after"]["reservation"]["idempotency_key"])
+            started.add(rec.get("request_id"))
+    for rec in records:
         for snapshot in (rec.get("scooter_before"), rec.get("scooter_after")):
             reservation = snapshot.get("reservation") if isinstance(snapshot, dict) else None
-            if isinstance(reservation, dict) and reservation.get("idempotency_key"):
+            if isinstance(reservation, dict) and reservation.get("idempotency_key") \
+                    and reservation.get("start_request_id") not in started:      # older than the records
                 keys.add(reservation["idempotency_key"])
     return keys
 

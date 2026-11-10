@@ -55,7 +55,8 @@ make scenario                    # lists the scenarios
 make scenario NAME=rides         # start/end rides and check /view_all_available (the ACTIVITY symptom)
 make scenario NAME=all           # every scenario: rides, errors, payment-faults (incl. a pending
                                  # scooter must not be listed or found), retry-settle, decline,
-                                 # concurrent, restore, reconcile (both terminal rules: N attempts, T minutes)
+                                 # concurrent, restore (incl. a restored ride ended elsewhere: 409),
+                                 # reconcile (both terminal rules: N attempts, T minutes)
 ```
 - Each run uses the **working-tree code** (a fresh interpreter with its own bytecode
   cache, so a stale `__pycache__` can't hide a planted bug) against its own DB, records
@@ -71,7 +72,10 @@ make scenario NAME=all           # every scenario: rides, errors, payment-faults
   records (`data/records.jsonl`) if the symptom happened there.
 
 **5. Query the evidence.** MCP tools first (`scenario="<name>"` reads a scenario run;
-omit it for the live files); the CLI is the fallback and needs no approval.
+omit it for the live files); the CLI is the fallback and needs no approval. **For a 500
+or a refused write, start with `recent-failures`, then `request <id>`:** `anomalies` can
+show 0 for a request whose write was refused (its `db_write: refused` decision and
+`exception` field are the evidence).
 
 | Question | MCP tool | CLI |
 |---|---|---|
@@ -104,7 +108,9 @@ omit it for the live files); the CLI is the fallback and needs no approval.
 
 **7. Write a failing test** that reproduces it through the API and checks the persisted
 state. The fixtures are in `tests/conftest.py` (see Test): `client`, `read_db`,
-`read_records`, `read_ledger`; every test gets its own DB, records and ledger. Template
+`read_records`, `read_ledger`, and `db_path` (the test's own DB file: snapshot it with
+`db_path.read_bytes()` and put it back with `db_path.write_bytes(...)` to reproduce a
+restore); every test gets its own DB, records and ledger. Template
 (`tests/test_<symptom>.py`):
 ```python
 def test_ending_a_ride_frees_the_scooter(client, read_db, read_records):
@@ -796,10 +802,13 @@ show it. Every settling decision records the end coordinates it settles at, whic
      ```
      It reads the same `SCOOTER_DB_PATH` / `SCOOTER_PAYMENTS_LEDGER_PATH` /
      `SCOOTER_RECORDS_PATH` as the app (a missing ledger or records file counts as empty).
-     The current DB stands in for the "initial" one, and every reservation a record saw
-     (in `scooter_before`/`scooter_after`) counts as having existed, so a ride older than
-     the records, such as the committed DB's `legacy-33`, isn't mistaken for a charge under
-     a key nobody owned (PR #24 review). A
+     The current DB stands in for the "initial" one. A reservation a record saw (in
+     `scooter_before`/`scooter_after`) also counts as having existed **if it's older than
+     the records** (its `start_request_id` isn't a recorded successful start; legacy rides
+     have none), so the committed DB's `legacy-33` isn't mistaken for a charge under a key
+     nobody owned. Only those: the app persists every key before charging under it, so
+     counting every key a record saw would hide a bug that invents a key on a retry
+     (PR #24 review and re-review). A
      `"I1 a reservation was charged and also owes a balance"` means a paid balance is still
      open: run `make reconcile`.
   6. **"What did the last restore erase?"** (PLAN PR 15c) An

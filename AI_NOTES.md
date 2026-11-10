@@ -814,8 +814,9 @@ strongest entries.
 - **How it was caught:** the PR #24 reviewer ran every documented step-4 command after a
   clean scenario. I had tested the scenario's summary, not the commands I told readers to
   run.
-- **What changed:** `started_keys` also counts every reservation a record saw (right for
-  live data too: a ride older than the records still existed), and a test runs every
+- **What changed:** `started_keys` also counts reservations the records saw, but only
+  those older than the records (see #43: the first version, "every reservation a record
+  saw", was *not* right for live data: it hid a double charge). A test runs every
   documented step-5 command (CLI and MCP) on every clean scenario. Lesson: **test the
   commands the docs tell people to run, exactly as written**, not an internal equivalent.
 
@@ -836,3 +837,27 @@ strongest entries.
   tests. Lesson: **a scenario only covers the expectations it states**: list the rules
   (both terminal rules, every listing) and check each has an expectation, and put the
   cheapest strong signal (the existing tests) first.
+
+### 43. Both agents loosened a checker and each claimed the other checks still covered it
+- **Where:** PLAN PR 17 (PR #24), `tests/invariants.py` `started_keys`.
+- **What the AIs claimed:**
+  - The reviewer's first fix for #41 was "count every reservation seen in the records' snapshots".
+  - The writer adopted it with a trade-off note: per-reservation I3 and `ledger-check`
+    would still catch double charges.
+- **Reality:** the app persists every key before charging under it (phase 1). So a bug that
+  invents a new key **and** reservation id on each failed attempt (F2) left its new key in
+  a snapshot, and the key counted as "owned". Its double charge then passed:
+  - I3 by key, because the key now looked owned;
+  - I3 by reservation, because each charge had a different reservation id;
+  - `ledger-check`, because each key equals its own reservation id.
+
+  Only the per-scooter `scooter_double_charge` anomaly, the suite and the scenarios still
+  caught it. The false positive had become a false negative, and the note claiming the
+  other checks covered it was wrong.
+- **How it was caught:** in the re-review, the reviewer planted two bugs aimed exactly at
+  the loosened case (a persisted foreign key that double-charges).
+- **What changed:** a snapshot's reservation counts only if it is older than the records,
+  meaning its `start_request_id` isn't a recorded start. F2 is now a planted-bug test, and
+  it's caught by the documented invariants command. Lesson: **when you loosen a checker,
+  plant a bug aimed exactly at the loosened case before claiming the other checks cover
+  it**, whoever proposed the loosening.

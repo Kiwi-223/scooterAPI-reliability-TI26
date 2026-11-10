@@ -200,6 +200,38 @@ def test_reviewer_plant_reconcile_attempt_limit_off_by_one(tmp_path, scenarios_d
     assert "expected: reconcile made no 4th gateway call for 9" in problems
 
 
+def test_reviewer_plant_f2_a_new_reservation_and_key_per_attempt(tmp_path, scenarios_dir):
+    """PR #24 re-review, F2: each failed attempt rotates BOTH reservation_id and key, so the
+    retry charges again. The loosened started_keys hid it from I3 and ledger-check; the
+    documented invariants command must name it."""
+    copy = planted_copy(tmp_path, "app.py",
+                        "\tscooter.reservation['payment_attempts'] += 1\n",
+                        "\tscooter.reservation['payment_attempts'] += 1\n"
+                        "\tscooter.reservation['reservation_id'] = scooter.reservation['idempotency_key'] = uuid.uuid4().hex\n")
+    code, summary = run_scenario("retry-settle", copy)
+    assert code == 1
+    assert "the retry wasn't charged again" in [s["why"] for s in summary["unexpected"]]
+    assert "scooter_double_charge" in {a["type"] for a in summary["anomalies"]}
+    d = Path(summary["dir"])
+    env = dict(os.environ, SCOOTER_DB_PATH=str(d / "db.json"), SCOOTER_RECORDS_PATH=str(d / "records.jsonl"),
+               SCOOTER_PAYMENTS_LEDGER_PATH=str(d / "ledger.jsonl"))
+    out = subprocess.run([sys.executable, "tests/invariants.py"], cwd=REPO, env=env, capture_output=True, text=True)
+    assert out.returncode == 1 and "I3 charged under a key no reservation owned" in out.stdout
+    assert any(v[0] == "I3 charged under a key no reservation owned" for v in summary["invariant_violations"])
+
+
+def test_reviewer_plant_conflict_doesnt_reopen_the_ride(tmp_path, scenarios_dir):
+    """PR #24 re-review, blind run 3: abandon_payment no longer resets the ride to active."""
+    copy = planted_copy(tmp_path, "app.py", "\tscooter.reservation['payment_state'] = 'active'\n", "")
+    code, summary = run_scenario("restore", copy)
+    assert code == 1
+    [bad] = [s for s in summary["unexpected"] if s["why"] == "ending the restored ride elsewhere is a conflict, not a second ride"]
+    assert bad["problem"] == "expected 409 payment_conflict, got 500 internal_error"
+    [record] = [r for r in records_of(summary) if r["request_id"] == bad["request_id"]]
+    steps = [(d["step"], d["outcome"]) for d in record["decisions"]]
+    assert ("reservation", "payment_abandoned") in steps and ("db_write", "refused") in steps
+
+
 def test_a_payment_bug_timeout_ends_the_ride_as_paid(tmp_path, scenarios_dir):
     copy = planted_copy(tmp_path, "app.py", "\t\t\t\tif payment_response.ok or outcome == 'decline':",
                         "\t\t\t\tif payment_response.ok or outcome in ('decline', 'timeout_not_charged'):")

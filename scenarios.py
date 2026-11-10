@@ -145,11 +145,17 @@ def concurrent(d):
 
 
 def restore(d):
-    """DB rollbacks: a replayed ride isn't charged twice; an erased balance is rebuilt."""
+    """DB rollbacks: a replayed ride isn't charged twice; one ended elsewhere is a conflict
+    (409, back to active, nothing charged); an erased balance is rebuilt."""
     d.req("/reservation/start?id=18", 200, "start 18")
     d.snapshot("riding")
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "end 18 (paid)")
     d.restore("riding", "roll the DB back: 18 is riding again (the same reservation and key)")
+    d.req("/reservation/end?id=18&lat=23.5&lng=19.5", (409, "payment_conflict"),
+          "ending the restored ride elsewhere is a conflict, not a second ride",
+          check=lambda b: b.get("ride_ended") is False, check_why="the body says the ride didn't end")
+    d.expect_db("18", lambda s: s["is_reserved"] and s["reservation"]["payment_state"] == "active"
+                and "amount" not in s["reservation"], "after a conflict 18's ride is active again, payment fields dropped")
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "ending it the same way returns the original charge")
     d.expect_ledger(lambda entries: sum(e["charged"] for e in entries) == 1, "still one charge: no double charge")
     d.snapshot("before-9")
