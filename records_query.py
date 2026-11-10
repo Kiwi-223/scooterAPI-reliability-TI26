@@ -106,6 +106,21 @@ def _ts_key(record):
     return parse_ts(record.get("ts")) or datetime.datetime.min.replace(tzinfo=datetime.UTC)
 
 
+def acquired_at(record):
+    """When a mutating request got the DB lock (its `db_lock: acquired` decision), or None."""
+    for d in record.get("decisions") or []:
+        if isinstance(d, dict) and d.get("step") == "db_lock" and d.get("outcome") == "acquired":
+            return parse_ts((d.get("detail") or {}).get("acquired_at"))
+    return None
+
+
+def _effect_key(record):
+    """When a request took effect: its lock acquisition if it had one (PLAN PR 11c), else its ts.
+    Requests that change a scooter run one at a time under the DB lock, in acquisition order,
+    which can differ from the order they started in (ts)."""
+    return acquired_at(record) or _ts_key(record)
+
+
 # ---- queries (pure: iterable of records in, plain data out) ----------------------------
 
 def recent_failures(records, since=None, limit=20):
@@ -126,8 +141,9 @@ def failure_counts(records, since=None):
 
 
 def scooter_history(records, scooter_id):
-    """Every record about one scooter, oldest first by ts (file order is completion order)."""
-    return sorted((r for r in records if r.get("scooter_id") == scooter_id), key=_ts_key)
+    """Every record about one scooter, in the order they took effect: by lock acquisition
+    (`acquired_at`) where the record has one, else by ts. File order is completion order."""
+    return sorted((r for r in records if r.get("scooter_id") == scooter_id), key=_effect_key)
 
 
 def find_requests(records, request_id):

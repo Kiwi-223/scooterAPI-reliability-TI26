@@ -140,10 +140,13 @@ def test_concurrent_cycles_across_processes(db_path, records_path, read_db, read
     started = [r["scooter_after"]["reservation"]["reservation_id"] for r in records
                if r["path"] == "/reservation/start" and r["status"] == 200]
     assert len(set(started)) == len(started) == sum(r["path"] == "/reservation/start" and r["status"] == 200 for r in records)
-    # Every successful request's persisted after-state chains: replay them in lock order.
-    by_lock = sorted((r for r in records if r["scooter_id"] == "18" and r["db_write"]["ok"]),
-                     key=lambda r: r["ts"])
-    assert [r["scooter_after"]["is_reserved"] for r in by_lock][-1] == db["18"]["is_reserved"]
+    # The last write in LOCK order is what's on disk. (PLAN PR 11c: this used to sort by ts,
+    # the request's start time, which isn't lock order: waiters poll, so a request that
+    # started later can get the lock first. It flaked on CI.)
+    by_lock = sorted((r for r in records if r["scooter_id"] == "18" and r["db_write"]["ok"]), key=rq.acquired_at)
+    assert by_lock[-1]["scooter_after"] == db["18"]
+    times = [rq.acquired_at(r) for r in records if rq.acquired_at(r) is not None]
+    assert len(set(times)) == len(times)                     # one holder at a time: no ties
     assert all(json.loads(o) for o in outputs)
 
 
@@ -263,11 +266,83 @@ def test_lock_is_released_when_the_request_crashes(client, monkeypatch, db_path)
         fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+# ---- lock order vs start order (PLAN PR 11c) ---------------------------------------------------
+
+_SLOW_TO_LOCK = """
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+import app
+sync_dir = sys.argv[2]
+real = app.acquire_db_lock
+
+def late(db_path, timeout):
+    # Started first (its record's ts is set), but reaches for the lock only after "go":
+    # the deterministic version of "a waiter that polls a moment later than the other".
+    open(os.path.join(sync_dir, "a-started"), "w").close()
+    while not os.path.exists(os.path.join(sync_dir, "go")):
+        time.sleep(0.001)
+    return real(db_path, timeout)
+
+app.acquire_db_lock = late
+client = app.app.test_client()
+print(client.get("/reservation/end?id=18&lat=1&lng=1",
+                 headers={"X-Payment-Fault": "error", "X-Request-ID": "slow-a"}).status_code)
+"""
+
+_PLAIN = """
+import sys
+sys.path.insert(0, sys.argv[1])
+import app
+print(app.app.test_client().get("/reservation/end?id=18&lat=1&lng=1",
+                                headers={"X-Payment-Fault": "error", "X-Request-ID": "fast-b"}).status_code)
+"""
+
+
+def test_lock_order_not_start_order_decides_what_is_on_disk(tmp_path, db_path, records_path, read_db, read_records):
+    # Two writers on one scooter: A starts first but gets the lock second. Both write (each
+    # end leaves the ride payment_pending; the second is a retry that counts an attempt), so
+    # the final DB is the LAST LOCK HOLDER's after-state, not the last starter's.
+    client = app_module.app.test_client()
+    assert client.get("/reservation/start?id=18").status_code == 200
+    env = dict(os.environ, ENABLE_FAULT_INJECTION="1", PAYMENT_TIMEOUT_DELAY_MS="0", PYTHONDONTWRITEBYTECODE="1")
+    sync_dir = tmp_path / "sync"
+    sync_dir.mkdir()
+    a = subprocess.Popen([sys.executable, "-c", _SLOW_TO_LOCK, str(REPO), str(sync_dir)], env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + 60
+    while not (sync_dir / "a-started").exists():
+        assert time.monotonic() < deadline and a.poll() is None, a.communicate()
+        time.sleep(0.005)
+    b = subprocess.run([sys.executable, "-c", _PLAIN, str(REPO)], env=env, capture_output=True, text=True, timeout=60)
+    assert b.returncode == 0 and b.stdout.strip() == "502", b.stderr
+    (sync_dir / "go").touch()
+    out, err = a.communicate(timeout=60)
+    assert a.returncode == 0 and out.strip() == "502", err
+
+    ends = [r for r in read_records() if r["path"] == "/reservation/end"]
+    by_start = sorted(ends, key=lambda r: r["ts"])
+    by_lock = sorted(ends, key=rq.acquired_at)
+    assert [r["request_id"] for r in by_start] == ["slow-a", "fast-b"]    # A started first...
+    assert [r["request_id"] for r in by_lock] == ["fast-b", "slow-a"]     # ...but B got the lock first
+    final = read_db()["18"]
+    assert final["reservation"]["payment_attempts"] == 2
+    assert by_lock[-1]["scooter_after"] == final                           # lock order: right
+    assert by_start[-1]["scooter_after"] != final                          # start order: wrong (the old bug)
+    # and `make records ARGS="scooter 18"` lists them in the order they took effect
+    history = [r for r in rq.scooter_history(read_records(), "18") if r["path"] == "/reservation/end"]
+    assert [r["request_id"] for r in history] == ["fast-b", "slow-a"]
+
+
 def test_lock_wait_is_recorded(client, read_records):
     client.get("/reservation/start?id=18")
     step = next(d for d in read_records()[0]["decisions"] if d["step"] == "db_lock")
     assert step["outcome"] == "acquired" and step["detail"]["wait_ms"] >= 0
     assert step["detail"]["lock_path"].endswith("scooter_db.json.lock")
+    # acquired_at (PLAN PR 11c): UTC with microseconds, at or after the request started
+    import re as _re
+    assert _re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", step["detail"]["acquired_at"])
+    record = read_records()[0]
+    assert rq.acquired_at(record) >= rq.parse_ts(record["ts"])
 
 
 @pytest.mark.parametrize("value,expected", [("", 5.0), ("0.5", 0.5), ("x", 5.0), ("-3", 0.0)])

@@ -783,3 +783,21 @@ def test_anomaly_double_charge_across_records_and_windows():
                                                        simulator={"charged": False, "ledger_txn_id": "t1"}), WRITE_OK],
                        scooter_before=TAKEN12)
     assert "double_charge" not in _types([first, settled])                # settling the same charge is fine
+
+
+# ---- scooter history follows lock order (PLAN PR 11c) -----------------------------------------
+
+def _locked(rid, minutes_ago, acquired_minutes_ago):
+    t = (NOW - datetime.timedelta(minutes=acquired_minutes_ago)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    return rec(rid, minutes_ago, path="/reservation/end", scooter="18",
+               decisions=[{"step": "db_lock", "outcome": "acquired", "detail": {"acquired_at": t}}])
+
+
+def test_scooter_history_is_in_lock_order_where_known():
+    started_first_locked_second = _locked("a", 10, 5)
+    started_second_locked_first = _locked("b", 9, 8)
+    no_lock = rec("c", 7, path="/reservation/end", scooter="18", kind="invalid_number", status=422)  # never locked: ts
+    history = rq.scooter_history([started_first_locked_second, started_second_locked_first, no_lock], "18")
+    # b locked 8 min ago, c (no lock) started 7 min ago, a locked 5 min ago
+    assert [r["request_id"] for r in history] == ["b", "c", "a"]
+    assert rq.acquired_at(no_lock) is None and rq.acquired_at(started_first_locked_second) is not None

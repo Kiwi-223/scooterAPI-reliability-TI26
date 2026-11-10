@@ -605,3 +605,25 @@ strongest entries.
   - AGENTS.md names "double charge" as the failure class.
   - Lesson: start from the failure class that matters most (here, charging a ride twice).
     Plant every way you can think of to cause it, not only the bugs someone else listed.
+
+### 31. A test sorted by request start time and called it "lock order"
+- **Where:** `tests/test_db_transactions.py::test_concurrent_cycles_across_processes`
+  (PLAN PR 11), the assertion "replay them in lock order".
+- **What the AI claimed:** sorting scooter 18's successful writes by `ts` replays them in lock
+  order, so the last one's `scooter_after` must equal the final DB.
+- **Reality:** `ts` is when a request *started*. Waiters poll the lock every 5 ms, so after a
+  release whichever waiter polls first wins, and a request that started later often gets
+  the lock first. The reviewer measured this: with the lock held, a start followed 20 ms
+  later by an end gave a start order different from the lock order in 17 of 30 trials. The
+  assertion flaked on CI in PR #18.
+- **How it was caught:** a CI failure on an unrelated PR. The writer diagnosed it from the
+  code without fixing it on the side, and the reviewer confirmed it experimentally.
+- **What changed (PLAN PR 11c):**
+  - The `db_lock` decision records `acquired_at`.
+  - The test and `make records ARGS="scooter <id>"` order by it.
+  - `test_lock_order_not_start_order_decides_what_is_on_disk` reproduces the difference
+    deterministically: a request that started first gets the lock second, and only lock
+    order explains the final DB.
+  - The fixed test passed 50 of 50 local runs.
+  - Lesson: a comment that names a property ("lock order") isn't evidence that the code
+    computes it. Order by the event you mean, and record it if it isn't recorded.
