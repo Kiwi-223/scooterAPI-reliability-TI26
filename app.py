@@ -12,6 +12,12 @@ from failures import FailureKind, StorageBusy, StorageError
 
 app=Flask(__name__)
 records.init_app(app)	# request ids + one JSON line per request (records.py, AGENTS.md)
+# A doubled slash inside a path (/reservation//start) is a JSON route_not_found (404), as it
+# was with the 2019 Werkzeug 0.14. Werkzeug >= 1.0 merges slashes with an HTML 308 redirect
+# instead, which bypasses the JSON error handlers and turns one state-changing GET into two
+# requests (PR #9 review; PLAN PR 19). A leading // (//search) is collapsed by gunicorn and
+# the dev server before routing, so it still works.
+app.url_map.merge_slashes = False
 
 # Configuration from environment variables (unset or empty -> README default)
 DEFAULT_DB_PATH = 'scooter_db.json'
@@ -93,6 +99,27 @@ def view_all_available():
 	records.note('filter', 'ok', available=len(available_scooters), **listing_detail(available_scooters, db))
 	available_scooters_dictlist = [scooter.to_public_dict() for scooter in available_scooters]
 	return json.dumps(available_scooters_dictlist), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# return a json-ified list of all the scooters with status 200
+
+
+# Health check (PLAN PR 19): is the DB readable and valid? Lock-free and read-only, like
+# the listings: it never waits on a writer and never writes the DB. An unreadable or corrupt
+# DB raises StorageError, i.e. the usual storage_error (500) envelope, whose msg names the
+# cause but never the path. It's recorded like any request (one line in the records), so
+# frequent probes grow the records file (README, Deploying).
+# A reservation in a payment state this code doesn't know (start/end on that scooter are
+# refused) is counted as `unsupported` and makes `status` "degraded", still 200: the server
+# is up and every other scooter works, and restarting it wouldn't help; a human must look.
+@app.route('/health', methods=['GET'])
+def health():
+	db = init_db(get_db_path())
+	pending = sum(1 for scooter in db if (scooter.reservation or {}).get('payment_state') == 'payment_pending')
+	unsupported = sum(1 for scooter in db if not is_supported_reservation(scooter.reservation))
+	body = {'status': 'degraded' if unsupported else 'ok',
+	        'db': {'readable': True, 'scooters': len(db),
+	               'reserved': sum(1 for scooter in db if scooter.is_reserved),
+	               'payment_pending': pending, 'unsupported': unsupported}}
+	records.note('health', body['status'], **body['db'])
+	return json.dumps(body), HTTPStatus.OK.value, {'Content-Type':'application/json'}
 
 
 # Search for scooters

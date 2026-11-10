@@ -206,6 +206,11 @@ make help         # lists every target
   `.venv/.installed`). It installs on top of the existing venv. To get a venv that exactly
   matches the lock, run `make clean && make setup`. `make clean` removes `.venv`. Agents
   can't run a raw `rm -rf`: it's a deny rule (see Agent boundaries).
+  - **Why not `pip-sync`** (PLAN PR 19 decided): it would remove packages dropped from the
+    lock, but it uninstalls from the shared `.venv` that other agents' test runs may be
+    using at that moment, and it needs pip-tools installed first (a two-step bootstrap). CI
+    and a deploy always start from an empty environment, so only a long-lived local venv can
+    drift, and `make clean && make setup` fixes that.
 - `.venv/` is git-ignored.
 
 ## Run
@@ -248,17 +253,23 @@ SCOOTER_DB_PATH="$SCRATCH_DB" SCOOTER_RECORDS_PATH="$(mktemp -d)/records.jsonl" 
 
 `HOST` is a common name. zsh and bash don't export it by default, but some shells (e.g.
 tcsh) and CI images do. If `make run` binds somewhere unexpected, check `env | grep HOST`.
-- Production-style server: the Procfile runs plain `gunicorn app:app`. gunicorn binds
-  `127.0.0.1:8000` by default, but if `PORT` is set in the environment it binds
-  `0.0.0.0:$PORT`, which means every network interface. For local use, be explicit:
-  `.venv/bin/gunicorn --no-control-socket --bind 127.0.0.1:8000 app:app`.
+- Production-style server: the Procfile (PLAN PR 19) runs
+  `WEB_CONCURRENCY=${WEB_CONCURRENCY:-2} gunicorn --bind 0.0.0.0:$PORT --timeout 20 --graceful-timeout 25 --no-control-socket app:app`.
+  `0.0.0.0` means every network interface, so for local use bind to localhost instead:
+  `WEB_CONCURRENCY=2 .venv/bin/gunicorn --bind 127.0.0.1:8000 --timeout 20 --graceful-timeout 25 --no-control-socket app:app`.
+  (A bare `gunicorn app:app` binds `127.0.0.1:8000`, or `0.0.0.0:$PORT` if `PORT` is set.)
   Without `--no-control-socket`, gunicorn 26 creates a control socket at
   `~/.gunicorn/gunicorn.ctl`, outside the repo, and the Claude Code sandbox blocks that
-  write (see Agent boundaries).
-  - Keep gunicorn's `--timeout` (default 30 s) longer than `SCOOTER_DB_LOCK_TIMEOUT` plus
-    the slowest payment call. Otherwise a worker killed mid-request returns gunicorn's HTML
-    500 instead of our JSON (see Concurrency).
-  - Deploy readiness is PLAN PR 19.
+  write (see Agent boundaries). gunicorn reads `WEB_CONCURRENCY` itself when it loads its
+  config, so an **empty** value makes gunicorn 26 fail at startup (`int('')`) whatever
+  `--workers` says. That's why the Procfile sets it as an env prefix rather than passing
+  `--workers ${WEB_CONCURRENCY:-2}` (AI_NOTES #46).
+  - Keep gunicorn's `--timeout` (the Procfile's 20 s) longer than `SCOOTER_DB_LOCK_TIMEOUT`
+    plus the slowest payment call. Otherwise a worker killed mid-request returns gunicorn's
+    HTML 500 instead of our JSON (see Concurrency). `tests/test_deploy.py` checks the
+    Procfile's numbers.
+  - Deploying (what's ready, what blocks it, the required env): README.md, "Deploying".
+    **Nothing is deployed.**
 - Server logs: the Flask dev server prints request lines (`"GET /search?... 200"`) to
   **stderr**; only its banner goes to stdout. gunicorn logs **no** requests unless you run
   it with `--access-logfile -`, which sends them to stdout. Neither log is persisted.
@@ -307,6 +318,7 @@ same command (see CI below).
     `test_reservation_state.py`, `test_payments.py`, `test_end_ride.py`, `test_planted_payment_bugs.py`,
     `test_reconcile.py`, `test_restore_replay.py`, `test_rollback.py`, `test_mcp_server.py`,
     `test_playbook.py` (scenarios, planted-bug evidence, `make reset-local`),
+    `test_deploy.py` (`/health`, doubled slashes, the Procfile and `app.json`),
     `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
@@ -656,7 +668,7 @@ reservation moves through these states, and every arrow is one atomic DB write:
   key's charge and finalise in parallel; the ledger would still prevent a double charge,
   but both finalisers would race to write. The cost: a slow gateway delays every writer.
   Here it's bounded by `PAYMENT_TIMEOUT_DELAY_MS` (20 ms); a real gateway with multi-second
-  timeouts would need the split (PLAN PR 19, deploy readiness).
+  timeouts would need the split (README.md, "Deploying", says how).
 - **Where things are stored:** the `txn_id` is in the ledger and in the end request's
   record (no ride history in the DB). An outstanding balance has to outlive the cleared
   reservation and be written atomically with the ride's end, so it lives in the DB, on the
@@ -1012,7 +1024,7 @@ make payments ARGS="verify"                                # is the ledger reada
 
 | Path | What it is |
 |---|---|
-| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (the payment state machine: `begin_payment`, `pay` (calls `payments.charge`), `finish_ride`, `record_outstanding_balance`, `note_payment_attempt`, `abandon_payment`, `PAYMENT_FAILURES` (outcome → kind); see Payment state machine; `calculate_cost`, `db_transaction` (lock + read for mutating requests), `init_db`, `find_db_shape_problem` / `find_reservation_problem` (DB validation), `load_reservation` / `legacy_reservation` / `new_reservation` (see Database schema), `write_db` (atomic replace, refuses invalid state), `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
+| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`, `/health`; `merge_slashes` is off, so `/reservation//start` is a JSON 404), the error handlers and `error_response`, and helpers (the payment state machine: `begin_payment`, `pay` (calls `payments.charge`), `finish_ride`, `record_outstanding_balance`, `note_payment_attempt`, `abandon_payment`, `PAYMENT_FAILURES` (outcome → kind); see Payment state machine; `calculate_cost`, `db_transaction` (lock + read for mutating requests), `init_db`, `find_db_shape_problem` / `find_reservation_problem` (DB validation), `load_reservation` / `legacy_reservation` / `new_reservation` (see Database schema), `write_db` (atomic replace, refuses invalid state), `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
 | `reconcile.py` | `make reconcile`: settles stuck (`payment_pending`) rides and restore-induced charged-but-active ones, and rebuilds balances a DB rollback erased. Pure `decide()` / `plan()` plus `run()` and a CLI; see Reconcile. |
 | `payments.py` | The simulated payment gateway: `charge`, the ledger, the seeded `draw`, the `X-Payment-Fault` gating, and a CLI (`make payments ARGS="lookup|draw|verify …"`, `python -m payments`). See Payments & fault injection. |
 | `failures.py` | The failure-kind registry (`FailureKind`), `StorageError` and `StorageBusy` (see Failure kinds). |
@@ -1038,7 +1050,7 @@ make payments ARGS="verify"                                # is the ledger reada
 | `requirements.in` / `requirements.txt` | Direct runtime deps / hash-locked full runtime set. |
 | `requirements-dev.in` / `requirements-dev.txt` | Direct dev deps / hash-locked dev set, constrained to the runtime lock. |
 | `.python-version` | `3.15`. |
-| `Procfile`, `app.json` | Heroku-style deploy config. The app is **not deployed** (PLAN PR 19 covers readiness). |
+| `Procfile`, `app.json` | Heroku deploy config (PLAN PR 19): gunicorn's bind, workers and timeouts; one web dyno, safe env defaults. The app is **not deployed**, and the JSON files on an ephemeral filesystem block a real deploy (H5); see README.md, "Deploying". |
 
 ## Known behaviour worth knowing before debugging
 
@@ -1166,7 +1178,8 @@ the evidence to use when debugging. Read the records before reading code.
   produced.
 - **Querying:** use the records CLI (below). jq is the fallback.
 - **Not done yet:** there's no log rotation (future work). The file grows until you move
-  it aside.
+  it aside. `/health` is recorded too (deliberately: exactly one record per request), so a
+  frequent health probe adds to it (README.md, "Deploying").
 
 ### Schema (`schema: 1`)
 
@@ -1211,7 +1224,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: "reserved" \| "payment_pending"}` for the reserved scooters, at most 50, always including any that was listed; PR #24 review), and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: "reserved" \| "payment_pending"}` for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, or `degraded` when a reservation is in an unknown payment state, with `readable`, `scooters`, `reserved`, `payment_pending` and `unsupported`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -1516,7 +1529,7 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `payment_declined` | 422 | The gateway declined the payment. **The ride ended** (H3): the scooter is free at the end location, nothing was charged, and the cost is recorded in the scooter's `outstanding_balances`. Body adds `ride_ended: true` and `outstanding_balance` (H7). |
 | `payment_timeout` | 504 | The gateway timed out (`timeout_not_charged` or `timeout_charged`; the client can't tell which, the record's `simulator.charged` can). The ride is **`payment_pending`**; a retry settles it and is charged at most once. Body adds `ride_ended: false`. |
 | `payment_conflict` | 409 | The reservation's idempotency key already has a charge for a different ride (scooter, reservation, end location or amount differ): a restored DB ended elsewhere, even at the same distance. Nothing is charged; the ride is `active` again (not ended, not pending). Body adds `ride_ended: false`. The record's `existing_charge` shows the earlier charge. |
-| `route_not_found` | 404 | No endpoint at that path. |
+| `route_not_found` | 404 | No endpoint at that path, including a doubled slash inside a known one (`/reservation//start`): `merge_slashes` is off, so Werkzeug answers 404, not an HTML 308 redirect (PLAN PR 19). |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
 | `reconcile_unsettled` | 409 | **Not an API response:** recorded on a `make reconcile` `/reconcile` record when reconcile leaves a ride unchanged for a human (a charge that doesn't fit, an unreadable ledger, a conflict). The msg says which scooter and why, so `make records ARGS="recent-failures"` / `failure-counts` show it. |
 | `storage_busy` | 503 | A mutating request (`/reservation/*`) couldn't get the DB lock within `SCOOTER_DB_LOCK_TIMEOUT` (default 5 s), because another request held it. **Nothing was read or written**, so it's safe to retry; the response has `Retry-After: 1`. The record has a `db_lock: timeout` decision with `wait_ms`. A separate kind from `storage_error` because it's transient and retryable, and agents counting failures should see "contention" apart from "broken DB". |

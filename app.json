@@ -1,7 +1,38 @@
 {
+	"name": "Scooter Reservation API",
+	"description": "Flask API to find, reserve and end rides on scooters, with a JSON-file database and a simulated payment gateway. Not production-ready: see README, Deploying.",
+	"keywords": ["python", "flask", "gunicorn"],
 	"buildpacks": [
 		{
 			"url": "heroku/python"
 		}
-	]
+	],
+	"formation": {
+		"web": {
+			"quantity": 1,
+			"size": "basic"
+		}
+	},
+	"env": {
+		"WEB_CONCURRENCY": {
+			"description": "gunicorn worker processes in the one web dyno. Writers are serialised by the DB file lock, so more workers mostly help reads. Empty or unset means 2 (the Procfile sets it before gunicorn reads it).",
+			"value": "2"
+		},
+		"PAYMENT_FAULT": {
+			"description": "Simulated gateway fault mode. Must be none in production. Leave ENABLE_FAULT_INJECTION unset too (it lets any client force payment faults with a header).",
+			"value": "none"
+		},
+		"SCOOTER_DB_LOCK_TIMEOUT": {
+			"description": "Seconds a reservation request waits for the DB lock before answering storage_busy (503). Keep it well below the Procfile's gunicorn --timeout (20).",
+			"value": "5"
+		},
+		"RECONCILE_MAX_ATTEMPTS": {
+			"description": "H3's N: gateway attempts without a charge before make reconcile ends a ride with an outstanding balance.",
+			"value": "3"
+		},
+		"RECONCILE_MAX_AGE_MINUTES": {
+			"description": "H3's T: minutes since payment started before make reconcile ends an uncharged ride with an outstanding balance.",
+			"value": "15"
+		}
+	}
 }
