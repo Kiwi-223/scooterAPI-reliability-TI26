@@ -109,7 +109,7 @@ make test                          # the single command: runs setup if needed, t
 make test ARGS="-k search -x"      # pass any pytest options through ARGS
 ```
 
-The result should be all passed plus 7 `xfailed` (see "Known behaviour" below). CI runs the
+The result should be all passed plus 5 `xfailed` (see "Known behaviour" below). CI runs the
 same command (see CI below).
 
 - **Layout:** tests live in `tests/`, and the pytest config is `pytest.ini`.
@@ -117,7 +117,9 @@ same command (see CI below).
   - `tests/seed_db.json` is the test-owned seed data: 5 scooters, and `33` starts reserved.
   - `tests/messages.py` holds the exact `msg` strings the API returns today.
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
-    `test_known_bugs.py`.
+    `test_failure_kinds.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
+    `test_settings_policy.py` for the agent policy.
+  - `messages.err(msg, kind)` builds the expected error body.
 - **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
   each test's `tmp_path` and points `SCOOTER_DB_PATH` at that copy with
   `monkeypatch.setenv`. Every test therefore starts from the same data, whatever state the
@@ -127,11 +129,13 @@ same command (see CI below).
   a test.
 - **Fixtures for new tests:**
   - `client`: a Flask test client. It sets `TESTING=True` for that test only, through
-    `monkeypatch.setitem(app.app.config, "TESTING", True)`, so unhandled exceptions
-    propagate into the test as tracebacks instead of becoming HTML 500s. To see the real
-    500 response, override it inside the test with
-    `monkeypatch.setitem(app.app.config, "TESTING", False)`.
-  - **Flask 3 gotcha, relevant to PLAN PR 7:** in testing mode, Flask re-raises an
+    `monkeypatch.setitem(app.app.config, "TESTING", True)`; a test can override it with
+    `monkeypatch.setitem(app.app.config, "TESTING", False)`. Since PLAN PR 7, an unhandled
+    exception does **not** propagate into the test, even with `TESTING=True`: the
+    `Exception` catch-all turns it into a JSON `internal_error` 500. The traceback is in
+    the log (`unhandled exception`), which pytest prints with a failing test; assert on it
+    through `caplog`.
+  - **Flask 3 gotcha (why PR 7's catch-all is registered for `Exception`):** in testing mode, Flask re-raises an
     unhandled exception **before** any handler registered for `500` /
     `InternalServerError` runs. A handler registered for `Exception` does still run.
     Verified on Flask 3.1.3:
@@ -213,7 +217,8 @@ every pull request and on every push to `master`.
 
 | Path | What it is |
 |---|---|
-| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`) and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `write_db`, `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). |
+| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `write_db`, `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). |
+| `failures.py` | The failure-kind registry (`FailureKind`) and `StorageError` (see Failure kinds). |
 | `scooter_db.json` | Live JSON database, mutated by the app (see above). |
 | `README.md` | API contract: endpoints, params, responses. |
 | `ACTIVITY.md` | The activity brief and Required outcomes 0–7. |
@@ -236,21 +241,57 @@ every pull request and on every push to `master`.
 These exist today and are scheduled in PLAN.md. Don't "fix" them outside their PR. The
 ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
 
-- Errors are JSON `{"msg": ...}` with status 422, but Flask's own 404/405/500 pages are
-  HTML *(xfail: 404, 405)*. Stable failure kinds are **coming in PLAN PR 7**.
 - `radius` isn't validated: a negative value or `nan` is accepted, and `inf` returns every
   scooter (PLAN PR 8) *(xfail)*.
-- If the payment gateway ever returned a failure, `/reservation/end` would crash with a
-  `KeyError` and return an HTML 500 (PLAN PR 13) *(xfail)*. `txn_id` is an int, although the
-  README says it's a string *(xfail)*.
+- A payment failure returns `payment_failed` (502) and leaves the ride open, with the
+  scooter still reserved, so a rider who never retries keeps it reserved. PLAN PRs 13/14
+  define decline, timeout and reconcile behaviour (H3, H7). `txn_id` is an int, although
+  the README says it's a string *(xfail, PLAN PR 13)*.
 - The DB read/write isn't locked, and the write isn't atomic, so concurrent requests can
   lose updates (PLAN PR 11).
-- A missing or corrupt DB file (including a wrong `SCOOTER_DB_PATH`) gives an HTML 500.
-  A `storage_error` failure kind is **coming in PLAN PR 7**.
+- With an unwritable DB, `/reservation/end` charges the gateway first and only then fails
+  to save (`storage_error`). The rider pays for a ride that didn't end *(xfail, PLAN PR 14)*.
 
 ## Failure kinds
 
-**Coming in PLAN PR 7.** A fixed registry of stable ids, documented here when it lands.
+Every error response is JSON with a human message and a **stable failure kind**:
+
+```json
+{"msg": "Error 422 - No scooter with id 42 was found.", "error": {"kind": "scooter_not_found"}}
+```
+
+- **Contract:** `msg` is kept byte-for-byte as before (README compatibility); `error.kind`
+  is what code and agents should match on. The ids are a contract: **once an id ships, it
+  is never renamed or reused**. A new failure mode gets a new id.
+- **Where they live:** the registry is `failures.py` (`FailureKind`, a `StrEnum` whose
+  values are the ids, each with a default HTTP status and a description). App code returns
+  errors only through `error_response(kind, msg)` in `app.py`.
+
+| `error.kind` | HTTP | Meaning |
+|---|---|---|
+| `missing_param` | 422 | A required query parameter is missing. |
+| `invalid_number` | 422 | `lat`, `lng` or `radius` isn't a number (the msg still says "Lat/Lng values must be numbers", even for radius). |
+| `invalid_coordinate` | 422 | Latitude outside [-90, 90] or longitude outside [-180, 180]. |
+| `scooter_not_found` | 422 | No scooter has the given id (ids are matched exactly; `18 ` isn't `18`). |
+| `scooter_already_reserved` | 422 | Start requested for a scooter that's already reserved. |
+| `no_active_reservation` | 422 | End requested for a scooter that isn't reserved. |
+| `payment_failed` | 502 | The payment gateway reported a failure. The ride is **not** ended and the scooter stays reserved. A gateway-supplied `msg` is passed through, and so is its `code` if it's 400–599 (anything else becomes 502). PLAN PRs 13/14 add finer payment kinds. |
+| `route_not_found` | 404 | No endpoint at that path. |
+| `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
+| `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable, or has the wrong shape: the top level must be a list of objects, each with a string `id`, finite-number `lat`/`lng` and a boolean `is_reserved` (extra fields are allowed). The msg names the cause without a path, e.g. `(FileNotFoundError)` or `(entry 3: lat is not a finite number)`. The **server log** line `storage error: … (db=<path>)` carries the path and the original exception's traceback. |
+| `internal_error` | 500 | Anything else, i.e. a bug, including `abort(500)`. The msg is generic; the **traceback is in the server log** (`unhandled exception`). Any other HTTP error raised by the framework (unreachable today) also gets this kind but keeps its own status. |
+
+- **How it's wired (Flask 3):** a handler for `StorageError`, one for `HTTPException`
+  (404, 405 and `abort(...)`, including `InternalServerError`, which is itself an
+  `HTTPException`), and a catch-all for `Exception`. Because the catch-all is registered
+  for `Exception` rather than `500`, it also runs with `TESTING=True`.
+- **Counting failures:** group by `error.kind`, never by parsing `msg`. Request records
+  (PLAN PR 9) will carry the same kind, and the records CLI (PLAN PR 10) will answer
+  "how many of each kind since T".
+- **Tests:** `tests/test_failure_kinds.py` pins the shipped ids and statuses and produces
+  **every** kind through a real request. Adding a kind to `failures.py` without adding it
+  to `SHIPPED` and `TRIGGERS` there fails the suite. Update this table and README.md in the
+  same PR.
 
 ## Agent tools (MCP)
 

@@ -59,7 +59,7 @@ Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blo
 ### Stage 2: Failures have names (Outcome 2)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 7 | `feat`: stable failure kinds + JSON error envelope | A fixed registry of kinds with stable string ids (`missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `scooter_already_reserved`, `no_active_reservation`, `route_not_found`, `method_not_allowed`, `storage_error`, `internal_error`, …). **Every** error, including Flask's own 404/405/500 pages, returns JSON with `msg` (kept for README compatibility) and `"error": {"kind": ...}`. A test enumerates the registry and exercises every kind. Kinds are documented in AGENTS.md. | ⬜ |
+| 7 | `feat`: stable failure kinds + JSON error envelope | A fixed registry of kinds with stable string ids (`missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `scooter_already_reserved`, `no_active_reservation`, `route_not_found`, `method_not_allowed`, `storage_error`, `internal_error`, …). **Every** error, including Flask's own 404/405/500 pages, returns JSON with `msg` (kept for README compatibility) and `"error": {"kind": ...}`. A test enumerates the registry and exercises every kind. Kinds are documented in AGENTS.md. | ✅ |
 | 8 | `fix`: validate `radius` | Reject negative, non-finite (`inf`, `nan`) or missing radius with a named kind (`invalid_radius`). | ⬜ |
 
 ### Stage 3: Every request leaves a record (Outcome 1)

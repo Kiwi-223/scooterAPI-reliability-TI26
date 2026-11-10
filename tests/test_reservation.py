@@ -1,7 +1,7 @@
 """GET /reservation/start?id= and GET /reservation/end?id=&lat=&lng=."""
 import pytest
 
-from messages import (LAT_RANGE, LNG_RANGE, MISSING_PARAMS, NOT_A_NUMBER, already_reserved,
+from messages import (err, LAT_RANGE, LNG_RANGE, MISSING_PARAMS, NOT_A_NUMBER, already_reserved,
                       ended_ok, no_reservation, not_found, reserved_ok)
 
 
@@ -26,29 +26,29 @@ def test_reserved_scooter_disappears_from_available_and_search(get_json):
 
 def test_start_twice_is_rejected(get_json, read_db):
     get_json("/reservation/start?id=18", 200)
-    assert get_json("/reservation/start?id=18", 422) == {"msg": already_reserved("18")}
+    assert get_json("/reservation/start?id=18", 422) == err(already_reserved("18"), "scooter_already_reserved")
     assert read_db()["18"]["is_reserved"] is True
 
 
 def test_start_on_seed_reserved_scooter_is_rejected(get_json):
-    assert get_json("/reservation/start?id=33", 422) == {"msg": already_reserved("33")}
+    assert get_json("/reservation/start?id=33", 422) == err(already_reserved("33"), "scooter_already_reserved")
 
 
 @pytest.mark.parametrize("sid", ["nope", ""])
 def test_start_unknown_id(get_json, read_db, sid):
     before = read_db()
-    assert get_json(f"/reservation/start?id={sid}", 422) == {"msg": not_found(sid)}
+    assert get_json(f"/reservation/start?id={sid}", 422) == err(not_found(sid), "scooter_not_found")
     assert read_db() == before
 
 
 def test_start_id_is_matched_exactly(get_json, read_db):
     # "18 " (stray whitespace) is not "18": ids are not trimmed or normalised.
-    assert get_json("/reservation/start?id=18%20", 422) == {"msg": not_found("18 ")}
+    assert get_json("/reservation/start?id=18%20", 422) == err(not_found("18 "), "scooter_not_found")
     assert read_db()["18"]["is_reserved"] is False
 
 
 def test_start_missing_id(get_json):
-    assert get_json("/reservation/start", 422) == {"msg": MISSING_PARAMS}
+    assert get_json("/reservation/start", 422) == err(MISSING_PARAMS, "missing_param")
 
 
 # ---- end ---------------------------------------------------------------------------
@@ -77,35 +77,35 @@ def test_end_seed_reserved_scooter(get_json):
 
 def test_end_when_not_reserved_is_rejected(get_json, read_db):
     before = read_db()
-    assert get_json("/reservation/end?id=18&lat=1&lng=1", 422) == {"msg": no_reservation("18")}
+    assert get_json("/reservation/end?id=18&lat=1&lng=1", 422) == err(no_reservation("18"), "no_active_reservation")
     assert read_db() == before
 
 
 def test_end_twice_is_rejected(get_json, read_db):
     get_json("/reservation/start?id=18", 200)
     get_json("/reservation/end?id=18&lat=23.01&lng=19.01", 200)
-    assert get_json("/reservation/end?id=18&lat=5&lng=5", 422) == {"msg": no_reservation("18")}
+    assert get_json("/reservation/end?id=18&lat=5&lng=5", 422) == err(no_reservation("18"), "no_active_reservation")
     assert read_db()["18"]["lat"] == 23.01  # second call did not move it
 
 
 def test_end_id_is_matched_exactly(get_json, read_db):
-    assert get_json("/reservation/end?id=33%20&lat=0&lng=0", 422) == {"msg": not_found("33 ")}
+    assert get_json("/reservation/end?id=33%20&lat=0&lng=0", 422) == err(not_found("33 "), "scooter_not_found")
     assert read_db()["33"]["is_reserved"] is True
 
 
 def test_end_unknown_id(get_json):
-    assert get_json("/reservation/end?id=nope&lat=0&lng=0", 422) == {"msg": not_found("nope")}
+    assert get_json("/reservation/end?id=nope&lat=0&lng=0", 422) == err(not_found("nope"), "scooter_not_found")
 
 
 @pytest.mark.parametrize("query", ["lat=0&lng=0", "id=33&lng=0", "id=33&lat=0", ""])
 def test_end_missing_param(get_json, read_db, query):
-    assert get_json(f"/reservation/end?{query}", 422) == {"msg": MISSING_PARAMS}
+    assert get_json(f"/reservation/end?{query}", 422) == err(MISSING_PARAMS, "missing_param")
     assert read_db()["33"]["is_reserved"] is True
 
 
 @pytest.mark.parametrize("query", ["id=33&lat=x&lng=0", "id=33&lat=0&lng=x"])
 def test_end_non_numeric_coordinate(get_json, read_db, query):
-    assert get_json(f"/reservation/end?{query}", 422) == {"msg": NOT_A_NUMBER}
+    assert get_json(f"/reservation/end?{query}", 422) == err(NOT_A_NUMBER, "invalid_number")
     assert read_db()["33"]["is_reserved"] is True
 
 
@@ -117,11 +117,11 @@ def test_end_accepts_coordinate_bounds(get_json, read_db, lat, lng):
 
 @pytest.mark.parametrize("lat", ["-91", "90.5"])
 def test_end_latitude_out_of_range(get_json, read_db, lat):
-    assert get_json(f"/reservation/end?id=33&lat={lat}&lng=0", 422) == {"msg": LAT_RANGE}
+    assert get_json(f"/reservation/end?id=33&lat={lat}&lng=0", 422) == err(LAT_RANGE, "invalid_coordinate")
     assert read_db()["33"]["is_reserved"] is True
 
 
 @pytest.mark.parametrize("lng", ["-181", "180.5"])
 def test_end_longitude_out_of_range(get_json, read_db, lng):
-    assert get_json(f"/reservation/end?id=33&lat=0&lng={lng}", 422) == {"msg": LNG_RANGE}
+    assert get_json(f"/reservation/end?id=33&lat=0&lng={lng}", 422) == err(LNG_RANGE, "invalid_coordinate")
     assert read_db()["33"]["is_reserved"] is True
