@@ -509,6 +509,7 @@ RESERVATION_FIELDS = { 'reservation_id', 'started_at', 'start_request_id', 'paym
 # twice), and write_db refuses to change it. See AGENTS.md "Database schema".
 PAYMENT_STATES = { 'active', 'payment_pending' }
 BALANCE_FIELDS = { 'reservation_id', 'idempotency_key', 'amount', 'end_lat', 'end_lng', 'ended_at', 'reason' }
+BALANCE_SETTLED_FIELDS = { 'settled_by_txn_id', 'settled_at', 'settled_reason' }	# optional, all or none
 LAT_RANGE, LNG_RANGE = (-90, 90), (-180, 180)
 
 def _is_number(value):
@@ -581,7 +582,19 @@ def find_balances_problem(balances):
 		problem = _find_location_amount_problem(balance, f'outstanding_balances[{n}]')
 		if problem:
 			return problem
+		# a balance voided because the ride turned out to be paid (reconcile's clear_paid_balance,
+		# PLAN PR 15b) keeps its entry for the audit trail, with all three settled_* fields
+		settled = BALANCE_SETTLED_FIELDS & set(balance)
+		if settled and settled != BALANCE_SETTLED_FIELDS:
+			return f'outstanding_balances[{n}] is missing {sorted(BALANCE_SETTLED_FIELDS - settled)}'
+		for field in settled:
+			if not _is_nonempty_str(balance[field]):
+				return f'outstanding_balances[{n}].{field} is not a non-empty string'
 	return None
+
+def is_open_balance(balance):
+	# owed: not voided by a later-found charge for the same reservation
+	return 'settled_by_txn_id' not in balance
 
 def find_db_shape_problem(db_list):
 	# Returns a short, client-safe description of the first shape problem, or None.

@@ -32,10 +32,16 @@ for step in json.loads(sys.argv[2]):
         _, sid, lat, lng, fault = step
         resp = client.get(f"/reservation/end?id={sid}&lat={lat}&lng={lng}", headers={"X-Payment-Fault": fault})
         statuses.append(resp.status_code)
-    elif step[0] == "snapshot":
-        shutil.copyfile(db, db + ".snap")
+    elif step[0] == "snapshot":                  # ["snapshot"] or ["snapshot", name]
+        shutil.copyfile(db, db + ".snap" + "".join(step[1:]))
     elif step[0] == "restore":
-        shutil.copyfile(db + ".snap", db)
+        shutil.copyfile(db + ".snap" + "".join(step[1:]), db)
+    elif step[0] == "gateway_before_15b":        # a decline isn't replayed (PLAN PR 15b's bug)
+        import payments
+        payments.REPLAY_DECLINES = False
+    elif step[0] == "gateway_15b":
+        import payments
+        payments.REPLAY_DECLINES = True
     elif step[0] == "reconcile":                 # ["reconcile", fault, max_attempts]
         import reconcile
         os.environ["PAYMENT_FAULT"] = step[1]
@@ -105,9 +111,10 @@ def _run(tmp_path, app_source, steps, db_path, records_path, planted_file="app.p
 
 
 def _cli_anomalies(records_path, capsys):
+    """(exit code, unresolved finding types); `--db` defaults to $SCOOTER_DB_PATH, the scenario's DB."""
     code = rq.main(["--file", str(records_path), "--json", "anomalies"])
     found = json.loads(capsys.readouterr().out)
-    return code, sorted({a["type"] for a in found})
+    return code, sorted({a["type"] for a in found if not a.get("resolved")})
 
 
 @pytest.mark.parametrize("bug,what,old,new,steps,rule", BUGS, ids=[b[0] for b in BUGS])
@@ -127,6 +134,12 @@ def test_the_same_scenarios_are_clean_on_the_real_app(tmp_path, db_path, records
 
 # ---- planted in reconcile.py (PR #20 review): bugs only the suite saw ---------------------------
 
+# a declined ride, restored and ended again the same way; then a later snapshot brings its balance back
+REPLAY = [["start", "18"], ["snapshot", "a"], ["end", "18", 1, 1, "decline"], ["snapshot", "b"], ["restore", "a"]]
+# ... built with the gateway before PR 15b (charged on the replay), then reconciled
+CHARGED_AND_OWED = REPLAY + [["gateway_before_15b"], ["end", "18", 1, 1, "none"], ["gateway_15b"], ["restore", "b"],
+                             ["reconcile", "none", 3]]
+
 RECONCILE_BUGS = [
     ("R1", "settle_charged pays under a new key: the ride ends charged AND owing a balance",
      "        payment = app_module.pay(scooter)\n",
@@ -134,13 +147,48 @@ RECONCILE_BUGS = [
      "        payment = app_module.pay(scooter)\n",
      [["start", "18"], ["end", "18", 1, 1, "timeout_charged"],
       ["reconcile", "error", 3], ["reconcile", "error", 3], ["reconcile", "error", 3]],
-     "charged_and_owed"),
+     # since PLAN PR 15b the same run's clear_paid_balance voids that balance (charged_and_owed
+     # is then historical, resolved); the key the planted code charged under still names it
+     "payment_key_mismatch"),
     ("R2", "a restored ride is settled at the scooter's current position, not the ledger's",
      '"end_lat": decision["end_lat"],\n                                "end_lng": decision["end_lng"],',
      '"end_lat": scooter.lat,\n                                "end_lng": scooter.lng,',
      [["start", "18"], ["snapshot"], ["end", "18", 3, 3, "none"], ["restore"], ["reconcile", "none", 3]],
      "end_location_not_persisted"),
+    # PLAN PR 15b
+    ("R3", "clear_paid_balance leaves the paid balance open",
+     "                if app_module.is_open_balance(balance) and balance[\"reservation_id\"] in by_reservation:\n",
+     "                if False:\n",
+     CHARGED_AND_OWED, "reconcile_not_settled"),
+    ("R4", "settle_declined_from_ledger ends the restored declined ride without a balance",
+     "\"decline\"\n                app_module.record_outstanding_balance(scooter)\n", "\"decline\"\n",
+     [["start", "18"], ["snapshot"], ["end", "18", 1, 1, "decline"], ["restore"], ["end", "18", 2, 2, "none"],
+      ["reconcile", "none", 3]], "reconcile_not_settled"),
+    ("R5", "reconcile never finds a paid balance: the rider still owes in the DB",
+     "        if charge is not None:\n            found.append((balance, charge))\n", "",
+     CHARGED_AND_OWED, "charged_and_owed"),
 ]
+
+
+# ---- planted in payments.py (PLAN PR 15b) ---------------------------------------------------
+
+REPLAYED_AND_RESTORED = REPLAY + [["end", "18", 1, 1, "none"], ["restore", "b"]]
+
+
+def test_anomalies_name_a_gateway_that_charges_a_replayed_decline(tmp_path, db_path, records_path, capsys):
+    source = (REPO / "payments.py").read_text()
+    old = "REPLAY_DECLINES = True\n"
+    assert source.count(old) == 1
+    _run(tmp_path, source.replace(old, "REPLAY_DECLINES = False\n"), REPLAYED_AND_RESTORED, db_path, records_path,
+         planted_file="payments.py")
+    assert _cli_anomalies(records_path, capsys) == (1, ["charged_and_owed"])
+
+
+def test_the_real_gateway_declines_the_replay_again(tmp_path, db_path, records_path, capsys):
+    statuses = _run(tmp_path, (REPO / "payments.py").read_text(), REPLAYED_AND_RESTORED, db_path, records_path,
+                    planted_file="payments.py")
+    assert statuses == [200, 422, 422]          # start, decline, the replay declined again (no charge)
+    assert _cli_anomalies(records_path, capsys) == (0, [])
 
 
 @pytest.mark.parametrize("bug,what,old,new,steps,rule", RECONCILE_BUGS, ids=[b[0] for b in RECONCILE_BUGS])

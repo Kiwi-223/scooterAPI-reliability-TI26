@@ -55,6 +55,10 @@ TIMEOUTS = {"timeout_not_charged", "timeout_charged"}
 FAULT_MODES = ("none", SUCCESS) + FAULTS + ("random",)
 
 DEFAULT_SEED = "0"
+# A key that was declined stays declined for the same ride (PLAN PR 15b). Only tests turn this
+# off, to reproduce ledgers written before 15b (a restore could replay a declined ride into a
+# charge).
+REPLAY_DECLINES = True
 DEFAULT_FAULT_RATE = 0.5
 DEFAULT_TIMEOUT_DELAY_MS = 20
 
@@ -262,6 +266,7 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, *, end_lat, end_
                                                          "problem": problem},
                                 detail={"idempotency_key": idempotency_key, "reservation_id": reservation_id})
         earlier = next((e for e in mine if e.get("charged") is True), None)
+        declined = next((e for e in mine if e.get("outcome") == "decline"), None)
         if earlier is not None:
             existing = {"txn_id": earlier.get("txn_id"), "attempt": earlier.get("attempt"),
                         "scooter_id": earlier.get("scooter_id"), "reservation_id": earlier.get("reservation_id"),
@@ -271,6 +276,15 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, *, end_lat, end_
             outcome = "already_charged" if same_ride else "conflict"
             fault = {"source": "ledger"}
             detail = {"existing_charge": existing}
+        elif declined is not None and REPLAY_DECLINES:
+            # A decline is definitive (H3): the key was declined, so a replay of the same ride
+            # (only possible after a DB restore) is declined again, never charged. Charging it
+            # would leave a ride both charged and owing (PLAN PR 15b). Another ride under the key
+            # is a conflict, as with charges.
+            same_ride = _matches(declined, scooter_id, reservation_id, end_lat, end_lng, amount)
+            outcome = "decline" if same_ride else "conflict"
+            fault = {"source": "ledger", "replayed": "decline"}
+            detail = {"existing_decline": {k: declined.get(k) for k in ("attempt", "request_id", "end_lat", "end_lng", "amount")}}
         elif override is not None:
             outcome, fault = _choose(override, "header", idempotency_key, attempt)
         else:
@@ -295,6 +309,14 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, *, end_lat, end_
     # what this call was actually charged under, so a record can be checked against its reservation
     detail = {"idempotency_key": idempotency_key, "reservation_id": reservation_id, **detail}
     return ChargeResult(outcome, attempt, known_txn, fault, charged, ledger_txn_id, detail)
+
+
+def all_entries(path=None):
+    """Every ledger entry (raises ValueError if the ledger is unreadable)."""
+    entries, problem = _read_entries(path or ledger_path())
+    if problem:
+        raise ValueError(f"ledger unreadable: {problem}")
+    return entries
 
 
 def lookup(idempotency_key, path=None):
