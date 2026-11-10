@@ -1,7 +1,8 @@
 """GET /search?lat=&lng=&radius= (radius in metres)."""
 import pytest
 
-from messages import err, LAT_RANGE, LNG_RANGE, MISSING_PARAMS, NOT_A_NUMBER
+from messages import (err, INVALID_RADIUS, LAT_RANGE, LNG_RANGE, MISSING_PARAMS, NOT_A_NUMBER,
+                      RADIUS_NOT_A_NUMBER)
 
 
 def ids(results):
@@ -52,7 +53,6 @@ def test_search_missing_param(get_json, query):
 @pytest.mark.parametrize("query", [
     "lat=abc&lng=0&radius=1",
     "lat=0&lng=abc&radius=1",
-    "lat=0&lng=0&radius=abc",  # today's msg says Lat/Lng even for radius
 ])
 def test_search_non_numeric_param(get_json, query):
     assert get_json(f"/search?{query}", 422) == err(NOT_A_NUMBER, "invalid_number")
@@ -66,3 +66,37 @@ def test_search_latitude_out_of_range(get_json, lat):
 @pytest.mark.parametrize("lng", ["180.5", "-181"])
 def test_search_longitude_out_of_range(get_json, lng):
     assert get_json(f"/search?lat=0&lng={lng}&radius=1", 422) == err(LNG_RANGE, "invalid_coordinate")
+
+
+@pytest.mark.parametrize("radius", ["abc", "", "%20", "1km", "0x10"])
+def test_search_non_numeric_radius(get_json, radius):
+    # Before PLAN PR 8 this said "Lat/Lng values must be numbers"; the kind is unchanged.
+    assert get_json(f"/search?lat=0&lng=0&radius={radius}", 422) == err(RADIUS_NOT_A_NUMBER, "invalid_number")
+
+
+@pytest.mark.parametrize("radius", ["-5", "-0.001", "-1e-300", "inf", "-inf", "Infinity", "nan", "NaN", "1e309", "-1e309"])
+def test_search_rejects_negative_or_non_finite_radius(get_json, radius):
+    assert get_json(f"/search?lat=0&lng=0&radius={radius}", 422) == err(INVALID_RADIUS, "invalid_radius")
+
+
+@pytest.mark.parametrize("radius,expected", [
+    ("0", ["14"]), ("-0", ["14"]), ("-0.0", ["14"]), ("0.0", ["14"]),
+    ("1e-300", ["14"]),
+    ("1e300", ["15", "18", "9", "14"]),        # no upper bound: a huge radius covers every scooter
+])
+def test_search_accepts_zero_and_any_finite_non_negative_radius(get_json, radius, expected):
+    assert ids(get_json(f"/search?lat=0&lng=0&radius={radius}", 200)) == expected
+
+
+@pytest.mark.parametrize("query,expected", [
+    # Validation order is unchanged: lat/lng parse, radius parse, coordinate range, radius range.
+    ("lat=abc&lng=0&radius=abc", err(NOT_A_NUMBER, "invalid_number")),
+    ("lat=abc&lng=0", err(NOT_A_NUMBER, "invalid_number")),            # bad lat beats missing radius
+    ("lat=0&lng=0&radius=abc", err(RADIUS_NOT_A_NUMBER, "invalid_number")),
+    ("lat=91&lng=0&radius=abc", err(RADIUS_NOT_A_NUMBER, "invalid_number")),
+    ("lat=91&lng=0&radius=-1", err(LAT_RANGE, "invalid_coordinate")),
+    ("lat=0&lng=0&radius=-1&radius=5", err(INVALID_RADIUS, "invalid_radius")),  # first value wins
+])
+def test_search_error_precedence(get_json, query, expected):
+    assert get_json(f"/search?{query}", 422) == expected
+

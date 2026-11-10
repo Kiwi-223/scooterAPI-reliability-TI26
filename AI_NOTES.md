@@ -361,3 +361,18 @@ strongest entries.
   covers 3 kinds of corruption × 4 endpoints. Lesson: when documenting "X happens", test
   it on every entry point, not the first one you try.
 
+### 19. "Extra fields are tolerated" held for reads but not for writes
+- **Where:** `init_db` shape validation, and the PR #9 review fix that claimed it (PLAN PR 7).
+- **What the AI claimed:** extra per-scooter fields in `scooter_db.json` are "tolerated",
+  for forward compatibility with PLAN PR 12's reservation fields.
+- **Reality:** they were tolerated only on **read**. `write_db` serialises through
+  `Scooter.to_dict()`, which knows only `id/lat/lng/is_reserved`, so the first reservation
+  silently dropped every extra field from the file. The tests only loaded a DB with an
+  extra field and checked for a 200; they never wrote one back.
+- **How it was caught:** the reviewer ran a round-trip probe on PR #9: add a `note` field,
+  reserve the scooter, and the note is gone.
+- **What changed:** this is deferred to PLAN PR 12, which rewrites the DB code. Row 12's
+  scope now says to preserve or reject extra fields. Lesson: when a claim is about data,
+  test the write path as well as the read path. A round trip (read, mutate, write, read)
+  is the minimal honest check.
+
