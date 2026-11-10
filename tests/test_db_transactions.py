@@ -271,19 +271,26 @@ def test_lock_is_released_when_the_request_crashes(client, monkeypatch, db_path)
 _SLOW_TO_LOCK = """
 import os, sys, time
 sys.path.insert(0, sys.argv[1])
+import fcntl
 import app
 sync_dir = sys.argv[2]
-real = app.acquire_db_lock
 
-def late(db_path, timeout):
-    # Started first (its record's ts is set), but reaches for the lock only after "go":
-    # the deterministic version of "a waiter that polls a moment later than the other".
-    open(os.path.join(sync_dir, "a-started"), "w").close()
-    while not os.path.exists(os.path.join(sync_dir, "go")):
-        time.sleep(0.001)
-    return real(db_path, timeout)
 
-app.acquire_db_lock = late
+class LosesEveryPollUntilGo:
+    # The real race, made deterministic: A is inside acquire_db_lock's polling loop, and
+    # every non-blocking attempt reports "busy" (as if another waiter always won the
+    # retry) until the test creates "go". So A genuinely waits in the real code, and
+    # wherever acquired_at is taken, the test sees whether it's after that wait.
+    LOCK_EX, LOCK_NB, LOCK_UN, LOCK_SH = fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_UN, fcntl.LOCK_SH
+
+    def flock(self, fd, operation):
+        if operation & fcntl.LOCK_NB and not os.path.exists(os.path.join(sync_dir, "go")):
+            open(os.path.join(sync_dir, "a-waiting"), "w").close()
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return fcntl.flock(fd, operation)
+
+
+app.fcntl = LosesEveryPollUntilGo()      # only app's DB lock; records/payments keep the real one
 client = app.app.test_client()
 print(client.get("/reservation/end?id=18&lat=1&lng=1",
                  headers={"X-Payment-Fault": "error", "X-Request-ID": "slow-a"}).status_code)
@@ -310,7 +317,7 @@ def test_lock_order_not_start_order_decides_what_is_on_disk(tmp_path, db_path, r
     a = subprocess.Popen([sys.executable, "-c", _SLOW_TO_LOCK, str(REPO), str(sync_dir)], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     deadline = time.monotonic() + 60
-    while not (sync_dir / "a-started").exists():
+    while not (sync_dir / "a-waiting").exists():          # A is polling inside acquire_db_lock
         assert time.monotonic() < deadline and a.poll() is None, a.communicate()
         time.sleep(0.005)
     b = subprocess.run([sys.executable, "-c", _PLAIN, str(REPO)], env=env, capture_output=True, text=True, timeout=60)
@@ -324,6 +331,13 @@ def test_lock_order_not_start_order_decides_what_is_on_disk(tmp_path, db_path, r
     by_lock = sorted(ends, key=rq.acquired_at)
     assert [r["request_id"] for r in by_start] == ["slow-a", "fast-b"]    # A started first...
     assert [r["request_id"] for r in by_lock] == ["fast-b", "slow-a"]     # ...but B got the lock first
+    # acquired_at is taken AFTER the wait, not when the request started waiting: A waited
+    # through all of B (a whole process run), and its acquired_at reflects that.
+    a, b = by_start
+    a_lock = next(d["detail"] for d in a["decisions"] if d["step"] == "db_lock")
+    assert a_lock["wait_ms"] >= 50
+    assert rq.acquired_at(a) > rq.acquired_at(b)
+    assert (rq.acquired_at(a) - rq.parse_ts(a["ts"])).total_seconds() * 1000 >= a_lock["wait_ms"] - 1
     final = read_db()["18"]
     assert final["reservation"]["payment_attempts"] == 2
     assert by_lock[-1]["scooter_after"] == final                           # lock order: right

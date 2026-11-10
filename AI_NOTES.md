@@ -627,3 +627,22 @@ strongest entries.
   - The fixed test passed 50 of 50 local runs.
   - Lesson: a comment that names a property ("lock order") isn't evidence that the code
     computes it. Order by the event you mean, and record it if it isn't recorded.
+
+### 32. The deterministic repro delayed the request outside the code whose timing it tested
+- **Where:** PR #19 (PLAN PR 11c), `test_lock_order_not_start_order_decides_what_is_on_disk`.
+- **What the AI claimed:** the new test pinned the fix. Lock order is recorded by
+  `acquired_at`, and ordering by it explains the final DB.
+- **Reality:** the test made request A late by wrapping `acquire_db_lock` and waiting
+  *before* calling it, so A never waited inside the real polling loop. The test therefore
+  couldn't tell where `acquired_at` was taken. The reviewer moved the timestamp to the start
+  of `acquire_db_lock`, before the wait, and all 155 relevant tests still passed. That
+  mutation brings the original flake back.
+- **How it was caught:** the reviewer's mutation of the timestamp's position.
+- **What changed:**
+  - A's process now makes every non-blocking `flock` attempt in `app` report "busy" until
+    the test says go, so A really polls inside `acquire_db_lock` (`wait_ms` ≥ 50).
+  - The test asserts that A's `acquired_at` is after B's, and after A's wait.
+  - The timestamp-before-the-wait mutation is now caught. The test passed 30 of 30 looped
+    runs.
+  - Lesson: a deterministic repro must put the delay where the real race happens, inside
+    the code under test, or it proves only the part downstream of the delay.
