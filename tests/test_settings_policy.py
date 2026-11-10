@@ -173,6 +173,38 @@ def test_unlisted_commands_fall_back_to_the_mode(command):
     assert decide(command) == "default"
 
 
+# Short-flag clusters (git accepts `-fqu` for `-f -q -u`). PLAN PR 6b denies every cluster
+# in which `f` (force) or `d` (delete) appears within the first three letters, combined with
+# the harmless flags u/q/v/n, in front of or after the allowed `origin stage-*` shape.
+_SAFE, _BAD = "uqvn", "fd"
+_CLUSTERS = sorted(
+    {b for b in _BAD}
+    | {x + b for x in _SAFE + _BAD for b in _BAD}
+    | {b + x for x in _SAFE + _BAD for b in _BAD}
+    | {x + y + z for x in _SAFE + _BAD for y in _SAFE + _BAD for z in _SAFE + _BAD
+       if _BAD[0] in x + y + z or _BAD[1] in x + y + z}
+)
+
+
+@pytest.mark.parametrize("cluster", _CLUSTERS)
+def test_force_or_delete_short_flag_clusters_are_denied(cluster):
+    assert decide(f"git push origin stage-7/x -{cluster}") == "deny"
+    assert decide(f"git push -u origin stage-7/x -{cluster}") == "deny"
+    assert decide(f"git push -{cluster} origin stage-7/x") == "deny"
+
+
+def test_known_limitation_force_in_fourth_place_of_a_cluster_is_not_caught():
+    # Documented gap (AGENTS.md): f/d first appearing at position 4+ of a cluster, e.g.
+    # `-uqvf`, still matches the allowed push shape. Branch protection (H2) + review is
+    # the real control. If a rule change closes this, flip this test.
+    assert decide("git push origin stage-7/x -uqvf") == "allow"
+    assert decide("git push origin stage-7/x -uqv") == "allow"   # harmless cluster stays allowed
+    assert decide("git push origin stage-7/x -4uf") == "allow"   # -4/-6 mixed in: also a gap
+    # ...but longer clusters with f/d in the first three letters are caught (prefix rules):
+    assert decide("git push origin stage-7/x -fquv") == "deny"
+    assert decide("git push origin stage-7/x -uqdv") == "deny"
+
+
 def test_known_limitation_branch_names_containing_master_are_denied():
     # Documented trade-off of the `git push*master*` deny (AGENTS.md).
     assert decide("git push -u origin stage-9/remaster-db") == "deny"
