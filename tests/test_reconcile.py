@@ -484,3 +484,23 @@ def test_scooter_double_charge_is_flagged_across_reservations():
     start2 = rec("s2", 3, "/reservation/start", before=free, after=taken)
     charge_c = rec("c", 4, "/reservation/end", charged=True, before=taken, after=free)
     assert "scooter_double_charge" not in [a["type"] for a in rq.anomalies([start, charge_b, start2, charge_c])]
+
+
+def test_scooter_double_charge_after_a_rollback_counts_the_restored_ride_on_its_own():
+    # PLAN PR 15c: ride A started, then a DB rollback put back a snapshot in which ride B
+    # (started earlier) was still riding; B's charge is B's only charge, not A's second
+    def rec(rid, minute, path, before, after, charged=False):
+        return {"ts": f"2026-11-10T12:{minute:02d}:00.000Z", "request_id": rid, "path": path, "status": 200,
+                "scooter_id": "18", "db_write": {}, "scooter_before": before, "scooter_after": after,
+                "decisions": [{"step": "payment", "outcome": "ok", "detail": {"simulator": {"charged": True,
+                                                                                "ledger_txn_id": rid}}}] if charged else []}
+    free = {"is_reserved": False, "reservation": None}
+    b, a = ({"is_reserved": True, "reservation": {"reservation_id": x, "start_request_id": f"s{x}"}} for x in "ba")
+    timeout = dict(rec("ta", 3, "/reservation/end", a, a, charged=True), status=504)    # A charged, still pending
+    records = [rec("sb", 0, "/reservation/start", free, b), rec("eb", 1, "/reservation/end", b, free),  # (B ended: no charge)
+               rec("sa", 2, "/reservation/start", free, a), timeout,
+               rec("cb", 4, "/reservation/end", b, free, charged=True)]                # after the rollback
+    assert "scooter_double_charge" not in [f["type"] for f in rq.anomalies(records)]
+    swapped = dict(b, reservation={"reservation_id": "swapped-in", "start_request_id": None})   # a bug, no start
+    records[-1] = rec("cx", 4, "/reservation/end", swapped, free, charged=True)
+    assert "scooter_double_charge" in [f["type"] for f in rq.anomalies(records)]

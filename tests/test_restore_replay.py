@@ -165,10 +165,14 @@ def test_without_a_db_a_settled_record_decides(client, end, state, monkeypatch, 
     assert finding["detail"]["still_in_db"] is None and finding["resolved"]
 
 
-def test_an_unreadable_db_leaves_the_finding_unresolved(client, end, state, monkeypatch, tmp_path, capsys):
+def test_an_unreadable_db_leaves_the_finding_unresolved(client, end, state, monkeypatch, tmp_path, capsys, db_path):
     _declined_then_replayed_into_a_charge(client, end, state, monkeypatch)
     assert rq.main(["anomalies", "--db", str(tmp_path / "missing.json")]) == 1
-    assert "DB not read" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "DB not read" in out and '"db": "unknown"' in out       # PLAN PR 15c NIT: which DB it consulted
+    rq.main(["--json", "anomalies"])
+    [finding] = _charged_and_owed(json.loads(capsys.readouterr().out))
+    assert finding["detail"]["db"] == str(db_path)
 
 
 def test_a_restore_after_the_clear_reopens_the_balance_and_reconcile_clears_it_again(client, end, state, monkeypatch):

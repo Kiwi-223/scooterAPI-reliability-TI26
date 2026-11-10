@@ -584,6 +584,9 @@ def find_balances_problem(balances):
 			return problem
 		# a balance voided because the ride turned out to be paid (reconcile's clear_paid_balance,
 		# PLAN PR 15b) keeps its entry for the audit trail, with all three settled_* fields
+		# a balance rebuilt from the ledger after a DB rollback (PLAN PR 15c) says what it was
+		if 'original_reason' in balance and not _is_nonempty_str(balance['original_reason']):
+			return f'outstanding_balances[{n}].original_reason is not a non-empty string'
 		settled = BALANCE_SETTLED_FIELDS & set(balance)
 		if settled and settled != BALANCE_SETTLED_FIELDS:
 			return f'outstanding_balances[{n}] is missing {sorted(BALANCE_SETTLED_FIELDS - settled)}'

@@ -100,7 +100,7 @@ BUGS = [
 def _run(tmp_path, app_source, steps, db_path, records_path, planted_file="app.py"):
     planted = tmp_path / "app_copy"
     planted.mkdir(exist_ok=True)
-    for name in ("app.py", "records.py", "failures.py", "payments.py", "reconcile.py"):
+    for name in ("app.py", "records.py", "failures.py", "payments.py", "reconcile.py", "records_query.py"):
         (planted / name).write_text((REPO / name).read_text())
     (planted / planted_file).write_text(app_source)
     env = dict(os.environ, ENABLE_FAULT_INJECTION="1", PAYMENT_TIMEOUT_DELAY_MS="0", PYTHONDONTWRITEBYTECODE="1")
@@ -140,6 +140,13 @@ REPLAY = [["start", "18"], ["snapshot", "a"], ["end", "18", 1, 1, "decline"], ["
 CHARGED_AND_OWED = REPLAY + [["gateway_before_15b"], ["end", "18", 1, 1, "none"], ["gateway_15b"], ["restore", "b"],
                              ["reconcile", "none", 3]]
 
+# a declined ride replayed into a charge (pre-15b gateway), then the DB rolled back to before it started
+CHARGED_THEN_ROLLED_BACK = [["snapshot", "0"], ["start", "18"], ["snapshot", "a"], ["end", "18", 1, 1, "decline"],
+                            ["restore", "a"], ["gateway_before_15b"], ["end", "18", 1, 1, "none"], ["gateway_15b"],
+                            ["restore", "0"], ["reconcile", "none", 3]]
+DECLINED_THEN_ROLLED_BACK = [["snapshot", "0"], ["start", "18"], ["end", "18", 1, 1, "decline"], ["restore", "0"],
+                             ["reconcile", "none", 3]]
+
 RECONCILE_BUGS = [
     ("R1", "settle_charged pays under a new key: the ride ends charged AND owing a balance",
      "        payment = app_module.pay(scooter)\n",
@@ -164,10 +171,33 @@ RECONCILE_BUGS = [
      "\"decline\"\n                app_module.record_outstanding_balance(scooter)\n", "\"decline\"\n",
      [["start", "18"], ["snapshot"], ["end", "18", 1, 1, "decline"], ["restore"], ["end", "18", 2, 2, "none"],
       ["reconcile", "none", 3]], "reconcile_not_settled"),
+    # PLAN PR 15c
+    ("R7", "rebuild_lost_balance writes no balance",
+     "                scooter.outstanding_balances = (scooter.outstanding_balances or []) + [balance]\n", "",
+     DECLINED_THEN_ROLLED_BACK, "reconcile_not_settled"),
     ("R5", "reconcile never finds a paid balance: the rider still owes in the DB",
      "        if charge is not None:\n            found.append((balance, charge))\n", "",
      CHARGED_AND_OWED, "charged_and_owed"),
 ]
+
+
+# ---- planted in records_query.lost_balances (PLAN PR 15c): the guards reconcile relies on ------
+
+def test_anomalies_name_a_rebuild_that_ignores_a_later_charge(tmp_path, db_path, records_path, capsys):
+    source = (REPO / "records_query.py").read_text()
+    old = "        if rid in known or rid in charged or keys & known or keys & charged:\n"
+    assert source.count(old) == 1
+    _run(tmp_path, source.replace(old, "        if rid in known or keys & known:\n"), CHARGED_THEN_ROLLED_BACK,
+         db_path, records_path, planted_file="records_query.py")
+    # the next pass's clear_paid_balance voids it (charged_and_owed is then historical), but the
+    # rebuild itself was wrong, and the record says so
+    assert _cli_anomalies(records_path, capsys) == (1, ["reconcile_not_settled"])
+
+
+@pytest.mark.parametrize("steps", [CHARGED_THEN_ROLLED_BACK, DECLINED_THEN_ROLLED_BACK], ids=["charged", "declined"])
+def test_the_rollback_scenarios_are_clean_on_the_real_code(tmp_path, db_path, records_path, capsys, steps):
+    _run(tmp_path, (REPO / "records_query.py").read_text(), steps, db_path, records_path, planted_file="records_query.py")
+    assert _cli_anomalies(records_path, capsys) == (0, [])
 
 
 # ---- planted in payments.py (PLAN PR 15b) ---------------------------------------------------

@@ -11,6 +11,11 @@ time) says what to do; the first matching row wins:
   (a DB restore replayed a declined ride into a charge, PLAN PR 15b)  -> clear_paid_balance:
   mark every such balance settled (settled_by_txn_id/settled_at/settled_reason; kept, not
   deleted, for the audit trail). A charge always wins: the rider paid, so they owe nothing.
+- any scooter, when the ledger proves a debt the DB forgot (a rollback erased it, PLAN PR
+  15c: a decline, or only uncharged attempts, for a reservation with no charge and no trace
+  in the DB)                                                       -> rebuild_lost_balance:
+  re-create each such balance from the ledger (reason rebuilt_from_ledger; see
+  records_query.lost_balances for the guards)
 - payment_pending and the ledger has a charge for the stored ride  -> settle_charged:
   end the ride with that charge (the gateway answers already_charged; nothing new is charged)
 - payment_pending, the ledger has a charge for a *different* ride  -> report (never guessed)
@@ -43,7 +48,7 @@ so a scooter whose paid balance was cleared gets its ride settled in the same ru
 that was retried or reported is not touched again in that run (one gateway attempt per run).
 
 Exit codes: 0 = nothing left (no payment_pending ride, no open balance the ledger shows paid,
-nothing reported); 1 = something remains (a ride still pending after this run's attempt, a
+no lost balance left unrebuilt, nothing reported); 1 = something remains (a ride still pending after this run's attempt, a
 reported problem, or an unreadable ledger); 2 = usage.
 """
 import argparse
@@ -59,14 +64,15 @@ from geopy.distance import distance as geodesic
 import app as app_module
 import payments
 import records
+import records_query
 from failures import FailureKind, StorageBusy, StorageError
 
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_MAX_AGE_MINUTES = 15.0
 PATH = "/reconcile"
-ACTIONS = ("none", "clear_paid_balance", "retry", "settle_charged", "settle_declined", "end_unpaid",
+ACTIONS = ("none", "clear_paid_balance", "rebuild_lost_balance", "retry", "settle_charged", "settle_declined", "end_unpaid",
            "settle_from_ledger", "settle_declined_from_ledger", "report")
-MAX_PASSES = 3      # clear_paid_balance, then the ride's own action, then one spare
+MAX_PASSES = 4      # clear_paid_balance, rebuild_lost_balance, the ride's own action, one spare
 FINAL_ACTIONS = ("retry", "report")     # never repeated within a run
 SETTLED_REASON = "paid: the ledger has a charge for this reservation"
 
@@ -126,12 +132,25 @@ def _ride_fits(entry, reservation, ledger_entry, what):
     return None, {"end_lat": ledger_entry["end_lat"], "end_lng": ledger_entry["end_lng"], "distance_m": distance, "amount": cost}
 
 
-def decide(entry, ledger, now, max_attempts=DEFAULT_MAX_ATTEMPTS, max_age=datetime.timedelta(minutes=DEFAULT_MAX_AGE_MINUTES)):
+def _usable_balance(lost):
+    try:
+        ok = (isinstance(lost["amount"], (int, float)) and not isinstance(lost["amount"], bool) and lost["amount"] >= 0
+              and -90 <= float(lost["end_lat"]) <= 90 and -180 <= float(lost["end_lng"]) <= 180
+              and isinstance(lost["idempotency_key"], str) and lost["idempotency_key"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return bool(ok)
+
+
+def decide(entry, ledger, now, max_attempts=DEFAULT_MAX_ATTEMPTS, max_age=datetime.timedelta(minutes=DEFAULT_MAX_AGE_MINUTES),
+           db=None):
     """What reconcile should do about one scooter -> {"action", "reason", ...}.
 
     entry: the scooter as persisted (`Scooter.to_dict()`, so a legacy reservation is already
     synthesised); ledger: the ledger's entries (all of them, or at least those for this
-    scooter's reservation key and balances); now: an aware datetime. Pure: no I/O, no clock.
+    scooter's reservation key and balances); now: an aware datetime; db: the whole persisted
+    DB (scooter dicts), so a lost balance is only rebuilt if NO scooter has a trace of its
+    reservation (default: just this entry). Pure: no I/O, no clock.
     """
     paid = paid_balances(entry, ledger)
     if paid:
@@ -139,6 +158,14 @@ def decide(entry, ledger, now, max_attempts=DEFAULT_MAX_ATTEMPTS, max_age=dateti
                 "txn_id": paid[0][1].get("txn_id"),
                 "balances": [{"reservation_id": b["reservation_id"], "amount": b.get("amount"), "txn_id": c.get("txn_id"),
                               "charged_amount": c.get("amount")} for b, c in paid]}
+    lost = [b for b in records_query.lost_balances(db if db is not None else [entry], ledger)
+            if b["scooter_id"] == entry["id"]]
+    if lost:
+        if not all(map(_usable_balance, lost)):
+            return {"action": "report", "reason": "the ledger proves a lost balance, but its amount or location isn't usable"}
+        return {"action": "rebuild_lost_balance",
+                "reason": "the ledger proves a debt the DB has no trace of (a rollback erased it)",
+                "balances": lost}
     reservation = entry.get("reservation")
     if reservation is None:
         return {"action": "none", "reason": "free"}
@@ -204,14 +231,15 @@ def plan(db, now, max_attempts, max_age):
     """[(scooter_id, decision)] for every scooter that needs something (read-only)."""
     result = []
     entries, problem = ledger_entries()
-    for scooter in db:
-        entry = scooter.to_dict()
-        if entry.get("reservation") is None and not any(map(app_module.is_open_balance, entry.get("outstanding_balances") or [])):
-            continue
+    everything = [s.to_dict() for s in db]
+    for entry in everything:
         decision = ({"action": "report", "reason": problem} if problem
-                    else decide(entry, entries, now, max_attempts, max_age))
+                    else decide(entry, entries, now, max_attempts, max_age, db=everything))
+        if problem and entry.get("reservation") is None and not any(
+                map(app_module.is_open_balance, entry.get("outstanding_balances") or [])):
+            continue
         if decision["action"] != "none":
-            result.append((scooter.id, decision))
+            result.append((entry["id"], decision))
     return result
 
 
@@ -244,7 +272,7 @@ def _reconcile_one():
         entries, problem = ledger_entries()
         decision = ({"action": "report", "reason": problem} if problem
                     else decide(scooter.to_dict(), entries, cfg["RECONCILE_NOW"](), cfg["RECONCILE_MAX_ATTEMPTS"],
-                                cfg["RECONCILE_MAX_AGE"]))
+                                cfg["RECONCILE_MAX_AGE"], db=[s.to_dict() for s in txn.db]))
         action = decision["action"]
         records.note("reconcile", action, **{k: v for k, v in decision.items() if k != "action"})
         body = {"scooter_id": scooter_id, **decision}
@@ -256,6 +284,20 @@ def _reconcile_one():
             records.scooter(in_memory=scooter.to_dict())
             records.unchanged()
             return _report(scooter_id, decision["reason"])
+        if action == "rebuild_lost_balance":
+            for lost in decision["balances"]:
+                balance = {"reservation_id": lost["reservation_id"], "idempotency_key": lost["idempotency_key"],
+                           "amount": lost["amount"], "end_lat": float(lost["end_lat"]), "end_lng": float(lost["end_lng"]),
+                           "ended_at": lost["ended_at"] if isinstance(lost["ended_at"], str) and lost["ended_at"]
+                           else app_module.utc_now_iso(),
+                           "reason": records_query.REBUILT_REASON, "original_reason": lost["original_reason"]}
+                scooter.outstanding_balances = (scooter.outstanding_balances or []) + [balance]
+                records.note("balance", "rebuilt", reservation_id=lost["reservation_id"], amount=lost["amount"],
+                             original_reason=lost["original_reason"], ledger_outcome=lost["ledger_outcome"],
+                             ledger_attempt=lost["ledger_attempt"])
+            app_module.write_db(txn.db, txn.path)
+            records.scooter(in_memory=scooter.to_dict())
+            return _respond(200, dict(body, result="balance_rebuilt"))
         if action == "clear_paid_balance":
             settled_at = app_module.utc_now_iso()
             by_reservation = {b["reservation_id"]: b["txn_id"] for b in decision["balances"]}
@@ -380,10 +422,12 @@ def run(now=None, max_attempts=None, max_age=None, dry_run=False, only=None):
     entries, problem = ledger_entries()
     paid_open = (None if problem else
                  sorted({s.id for s in after if paid_balances(s.to_dict(), entries)}))
+    lost_open = (None if problem else
+                 sorted(b["reservation_id"] for b in records_query.lost_balances([s.to_dict() for s in after], entries)))
     reported = [r for r in results if r.get("action") == "report" or r.get("status", 200) >= 500]
     return {"run_id": run_id, "dry_run": dry_run, "max_attempts": max_attempts,
             "max_age_minutes": max_age.total_seconds() / 60, "results": results,
-            "still_pending": pending, "paid_balances_open": paid_open,
+            "still_pending": pending, "paid_balances_open": paid_open, "lost_balances_open": lost_open,
             "reported": sorted({r["scooter_id"] for r in reported})}
 
 
@@ -392,8 +436,8 @@ def remaining(summary):
     if summary["dry_run"]:
         return bool(summary["results"])
     # paid_balances_open is None when the ledger couldn't be read afterwards: not known clean
-    return bool(summary["still_pending"] or summary["reported"] or summary.get("paid_balances_open", []) is None
-                or summary.get("paid_balances_open"))
+    return bool(summary["still_pending"] or summary["reported"]
+                or any(summary.get(k, []) is None or summary.get(k) for k in ("paid_balances_open", "lost_balances_open")))
 
 
 def main(argv=None, now=None):
@@ -434,6 +478,7 @@ def main(argv=None, now=None):
             paid_open = summary["paid_balances_open"]
             print(f"still payment_pending: {summary['still_pending'] or 'none'}; "
                   f"open balances the ledger shows paid: {'unknown (ledger unreadable)' if paid_open is None else paid_open or 'none'}; "
+                  f"lost balances not rebuilt: {'unknown' if summary['lost_balances_open'] is None else summary['lost_balances_open'] or 'none'}; "
                   f"reported: {summary['reported'] or 'none'}")
     return 1 if remaining(summary) else 0
 
