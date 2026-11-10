@@ -340,13 +340,11 @@ def test_other_scooters_keep_working_and_the_unknown_reservation_is_kept(client,
 
 
 @pytest.mark.parametrize("url", ["/reservation/start?id=33", "/reservation/end?id=33&lat=1&lng=1"])
-def test_start_and_end_on_the_unknown_payment_state_scooter_are_refused(client, monkeypatch, pending_db, read_records, url):
-    calls = []
-    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: calls.append(cost) or {"status": True, "txn_id": 1})
+def test_start_and_end_on_the_unknown_payment_state_scooter_are_refused(client, pending_db, read_records, read_ledger, url):
     before = pending_db.read_bytes()
     body = assert_envelope(client.get(url), FailureKind.STORAGE_ERROR)
     assert body["msg"] == UNSUPPORTED_MSG
-    assert calls == [] and pending_db.read_bytes() == before            # never charged, nothing written
+    assert read_ledger() == [] and pending_db.read_bytes() == before    # gateway never called, nothing written
     r = read_records()[-1]
     assert {"step": "reservation", "outcome": "unsupported",
             "detail": {"reservation_id": "a" * 32, "payment_state": "payment_pending"}} in r["decisions"]
@@ -382,27 +380,39 @@ def test_the_write_guard_never_creates_an_unknown_payment_state(client, monkeypa
     assert db_path.read_bytes() == before
 
 
-# ---- restoring a DB snapshot replays its reservations (input for PLAN PR 13) -----------------
+# ---- restoring a DB snapshot replays its reservations (PLAN PR 13's ride-matching rule) ------
 
 @pytest.mark.parametrize("sid", ["18", "33"])                       # a uuid reservation, and a legacy one
-def test_a_restored_reservation_is_charged_again_not_ridden_free(client, monkeypatch, db_path, read_records, sid):
+def test_a_restored_reservation_is_not_charged_twice_or_ridden_free(client, db_path, read_db, read_ledger, sid):
     # Restoring a snapshot (git restore, a backup) brings back every reservation in it, with
-    # the same reservation_id and idempotency_key. Today there's no ledger, so ending it again
-    # charges again. PLAN PR 13's ledger must keep that from becoming a free ride: a ledger
-    # hit only counts as "already charged" if it matches the ride; see PLAN row 13.
-    calls = []
-    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: calls.append(cost) or {"status": True, "txn_id": len(calls)})
+    # the same reservation_id and idempotency_key: it's the SAME ride, which was already paid.
+    # The ledger answers a matching end (same scooter, reservation and amount) with the
+    # original charge: the ride ends, nothing is charged twice, and the rider did pay (once).
+    # A non-matching end (another amount) is a conflict: nothing charged, ride left open,
+    # never ended for free. AGENTS.md "Payments & fault injection" explains the choice.
     if sid == "18":
         client.get("/reservation/start?id=18")
     snapshot = db_path.read_bytes()
-    assert client.get(f"/reservation/end?id={sid}&lat=1&lng=1").status_code == 200
-    db_path.write_bytes(snapshot)                                     # the restore
-    assert client.get(f"/reservation/end?id={sid}&lat=1&lng=1").status_code == 200
-    cleared = [d["detail"]["reservation_id"] for r in read_records() for d in r["decisions"]
-               if d["step"] == "reservation" and d["outcome"] == "cleared"]
-    assert len(cleared) == 2 and cleared[0] == cleared[1]             # the same key, twice
-    assert len(calls) == 2 and calls[0] == calls[1] > 0               # and the rider was charged both times
+    key = next(s for s in app_module.init_db(str(db_path)) if s.id == sid).reservation["idempotency_key"]
+    assert key == ("legacy-33" if sid == "33" else read_db()["18"]["reservation"]["reservation_id"])
 
+    first = client.get(f"/reservation/end?id={sid}&lat=1&lng=1")
+    assert first.status_code == 200
+    txn_id = first.get_json()["txn_id"]
+
+    db_path.write_bytes(snapshot)                                     # the restore
+    again = client.get(f"/reservation/end?id={sid}&lat=1&lng=1")
+    assert again.status_code == 200 and again.get_json()["txn_id"] == txn_id   # the original charge
+    assert read_db()[sid]["reservation"] is None                      # the ride is ended
+
+    db_path.write_bytes(snapshot)                                     # restore, then end elsewhere
+    assert_envelope(client.get(f"/reservation/end?id={sid}&lat=2&lng=2"), FailureKind.PAYMENT_CONFLICT)
+    assert db_path.read_bytes() == snapshot                           # not ended, nothing written
+
+    ledger = read_ledger()
+    assert [e["outcome"] for e in ledger] == ["success", "already_charged", "conflict"]
+    assert [e["txn_id"] for e in ledger if e["charged"]] == [txn_id]  # exactly one charge, ever
+    assert {e["idempotency_key"] for e in ledger} == {key}
 
 
 # ---- the write guard: a write never drops or invents a scooter ---------------------------------

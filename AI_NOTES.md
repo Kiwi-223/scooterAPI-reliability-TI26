@@ -495,3 +495,21 @@ strongest entries.
   - Lesson: a one-off failure followed by clean reruns is evidence about the environment,
     not proof of a flaky test. Check what else touched the shared files before calling it
     flaky, and never throw away the only failing output.
+
+### 26. A new persisted file was added before its test isolation, and the first run wrote to the real one
+- **Where:** PLAN PR 13 (`payments.py`), during development. It was caught before any
+  commit.
+- **What the AI did:** wrote the gateway with a default ledger path of
+  `data/payments_ledger.jsonl` and ran the whole suite, confident that "the tests are
+  isolated". The suite's isolation fixtures only knew about the DB and the records file.
+- **Reality:** that run appended 118 test charges to the **real**
+  `data/payments_ledger.jsonl`. Tests also shared one ledger, so later tests saw earlier
+  tests' charges (a burst of `already_charged`/`conflict` failures that looked like logic
+  bugs).
+- **How it was caught:** 57 failures with odd payment outcomes led to listing `data/`, where
+  a ledger the feature had only just created already had 118 lines.
+- **What changed:** the stray file was moved out of `data/`. `tests/conftest.py` got an
+  autouse `ledger_path` fixture (a temp ledger per test, all `PAYMENT_*` env cleared) and a
+  `_guard_real_ledger` guard. AGENTS.md lists them. Lesson: whenever a change adds a new
+  file the app writes, add the per-test redirect and the guard **before** the first test
+  run, the way `records_path` and `_guard_real_records` were.

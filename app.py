@@ -6,6 +6,7 @@ import json, math, os, werkzeug
 from http import HTTPStatus
 from werkzeug.exceptions import HTTPException
 
+import payments
 import records
 from failures import FailureKind, StorageBusy, StorageError
 
@@ -226,7 +227,7 @@ def end_reservation():
 			
 				# initiate payment
 				payment_response = pay(scooter, end_lat, end_lng)
-				if payment_response['status']:
+				if payment_response.ok:
 					# the payment was completed successfully
 				
 					# close the reservation, then update scooter's reserved status and location
@@ -239,20 +240,16 @@ def end_reservation():
 					records.scooter(in_memory=scooter.to_dict())
 					# construct successful response
 					success =	{	'msg': f'Payment for scooter {scooter_id_to_end} was made successfully and the reservation was ended.',
-									'txn_id': payment_response['txn_id']
+									'txn_id': payment_response.txn_id
 								}
 					return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
 				else:
-					# the payment failed: the reservation is NOT ended (unchanged behaviour; PLAN PRs 13/14
-					# define decline/timeout handling). Use the gateway's msg/code when it gives them.
+					# the payment didn't pay for the ride: the reservation is NOT ended (unchanged
+					# behaviour; PLAN PR 14 defines what decline/timeout/error do to the ride)
 					records.scooter(in_memory=scooter.to_dict())	# expected: still reserved, not moved
 					records.unchanged()
-					code = payment_response.get('code')
-					if not (isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599):
-						code = None  # a failed payment never carries a non-error status: fall back to 502
-					return error_response(FailureKind.PAYMENT_FAILED,
-						payment_response.get('msg', 'Error 502 - Payment failed; the reservation was not ended.'),
-						code)
+					kind, msg = PAYMENT_FAILURES[payment_response.outcome]
+					return error_response(kind, msg)
 			else:
 				# the scooter is not currently reserved
 				records.note('end', 'refused', reason='scooter is not reserved')
@@ -279,19 +276,29 @@ def pay(scooter, end_lat, end_lng):
 	distance_ridden = round(distance_ridden)
 	# calculate cost (currently a dummy function that returns the distance as the cost)
 	cost = calculate_cost(distance_ridden)	# returns cost = distance for now
-	records.note('payment', 'requested', distance_m=distance_ridden, cost=cost)
-	# redirect to payment gateway and return response (currently a dummy function that returns a hypothetical transaction id)
-	payment_response = payment_gateway(cost)	# returns hypothetical success and txn id for now
-	records.note('payment', 'ok' if payment_response.get('status') else 'failed',
-		txn_id=payment_response.get('txn_id'), gateway_msg=payment_response.get('msg'), gateway_code=payment_response.get('code'))
+	reservation = scooter.reservation
+	records.note('payment', 'requested', distance_m=distance_ridden, cost=cost,
+		idempotency_key=reservation['idempotency_key'])
+	# The simulated gateway (payments.py): at most one charge per idempotency key, and
+	# reproducible faults (AGENTS.md "Payments & fault injection").
+	override, override_note = payments.header_override(request.headers.get(payments.FAULT_HEADER))
+	if override_note:
+		records.note('payment_fault_override', override_note[0], **override_note[1])
+	payment_response = payments.charge(reservation['idempotency_key'], scooter.id, reservation['reservation_id'],
+		cost, request_id=records.current_request_id(), override=override)
+	records.note('payment', 'ok' if payment_response.ok else 'failed', **payment_response.record_detail())
 	return payment_response
-	
-def payment_gateway(cost):
-	# TODO: Implement real payment processing in future
-	txn_id = 379892831
-	return 	{	'status': True,
-				'txn_id': txn_id
-			}
+
+# How each payment outcome that doesn't pay for the ride is answered (H7). In every case the
+# ride is NOT ended and the scooter stays reserved (PLAN PR 14 changes that for decline,
+# timeouts and errors).
+PAYMENT_FAILURES = {
+	'decline': (FailureKind.PAYMENT_DECLINED, 'Error 422 - The payment was declined; the reservation was not ended.'),
+	'timeout_not_charged': (FailureKind.PAYMENT_TIMEOUT, 'Error 504 - The payment gateway timed out; the reservation was not ended. A retry is charged at most once.'),
+	'timeout_charged': (FailureKind.PAYMENT_TIMEOUT, 'Error 504 - The payment gateway timed out; the reservation was not ended. A retry is charged at most once.'),
+	'error': (FailureKind.PAYMENT_FAILED, 'Error 502 - Payment failed; the reservation was not ended.'),
+	'conflict': (FailureKind.PAYMENT_CONFLICT, 'Error 409 - This reservation already has a charge for a different ride; nothing was charged and the reservation was not ended.'),
+}
 
 def calculate_cost(distance):
 	# TODO: Implement meaningful cost calculation in future

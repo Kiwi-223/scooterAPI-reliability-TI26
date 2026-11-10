@@ -8,8 +8,9 @@ this file in the same PR.
 
 A small scooter-rental HTTP API written in 2019: Python + Flask, with a JSON file as the
 database. Clients can list available scooters, search by location and radius, start a
-reservation, and end it. Ending a reservation "pays" through a dummy gateway that always
-succeeds. [README.md](README.md) is the API contract (endpoints, params, status codes).
+reservation, and end it. Ending a reservation pays through a **simulated** payment
+gateway (`payments.py`) with a persisted ledger and reproducible faults (see "Payments &
+fault injection"). [README.md](README.md) is the API contract (endpoints, params, status codes).
 Keep it backwards compatible.
 
 The repo is being modernised and made debuggable by an agent with no context, following
@@ -60,6 +61,12 @@ before.
 |---|---|---|---|
 | `SCOOTER_RECORDS_PATH` | `data/records.jsonl` | `records.py`, once per request | Where request records are appended (see Request records). Relative to the cwd. The directory is created on demand. Read on every request, like `SCOOTER_DB_PATH`. |
 | `SCOOTER_DB_LOCK_TIMEOUT` | `5` | `app.py`, per mutating request | Seconds to wait for the DB lock before answering `storage_busy` (503). Unparseable values fall back to 5; negative values mean 0 (don't wait). |
+| `SCOOTER_PAYMENTS_LEDGER_PATH` | `data/payments_ledger.jsonl` | `payments.py`, per payment | The simulated gateway's ledger (see Payments & fault injection). Relative to the cwd; the directory is created on demand. |
+| `PAYMENT_FAULT` | `none` | `payments.py`, per payment | `none` (or `success`), a fault to force on **every** attempt (`decline`, `timeout_not_charged`, `timeout_charged`, `error`), or `random` (a seeded draw). Any other value makes every end fail with `internal_error` (`PaymentConfigError` in the log), never a silent default. |
+| `PAYMENT_SEED` | `0` | `payments.py`, `random` mode | Any string. Same seed + idempotency key + attempt → same outcome. |
+| `PAYMENT_FAULT_RATE` | `0.5` | `payments.py`, `random` mode | Probability of a fault per attempt, in [0, 1]; anything else is a `PaymentConfigError`. |
+| `PAYMENT_TIMEOUT_DELAY_MS` | `20` | `payments.py` | How long a simulated timeout waits. Keep it small: the DB lock is held during the call. |
+| `ENABLE_FAULT_INJECTION` | unset | `payments.py`, per payment | Only the exact value `1` makes the server honour the `X-Payment-Fault` request header. **Never set it on a deployed server.** |
 | `SCOOTER_DB_PATH` | `scooter_db.json` | `app.py` on every DB read/write, under both the dev server and gunicorn | Read on **every request**, so changing `os.environ` in a test takes effect without re-importing `app`. A relative path is resolved against the cwd. The file must already exist; the app doesn't create it. |
 | `HOST` | `localhost` | `python app.py` / `make run` only | gunicorn ignores it; use `--bind`. |
 | `PORT` | `8080` | `python app.py` / `make run` | Must be an integer. **gunicorn reads `PORT` too**: with no `--bind` it then listens on `0.0.0.0:$PORT` (see below). |
@@ -115,7 +122,7 @@ make test                          # the single command: runs setup if needed, t
 make test ARGS="-k search -x"      # pass any pytest options through ARGS
 ```
 
-The result should be all passed plus 2 `xfailed` (see "Known behaviour" below). CI runs the
+The result should be all passed plus 1 `xfailed` (see "Known behaviour" below). CI runs the
 same command (see CI below).
 
 - **Layout:** tests live in `tests/`, and the pytest config is `pytest.ini`.
@@ -127,7 +134,7 @@ same command (see CI below).
   - `tests/messages.py` holds the exact `msg` strings the API returns today.
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
     `test_failure_kinds.py`, `test_records.py`, `test_records_query.py`, `test_db_transactions.py`,
-    `test_reservation_state.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
+    `test_reservation_state.py`, `test_payments.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
 - **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
@@ -138,7 +145,8 @@ same command (see CI below).
   `scooter_db.json` changed while it ran. Never point `SCOOTER_DB_PATH` at the real file in
   a test.
   - **The guards also see changes made by anything else.** If another process writes the
-    live `scooter_db.json` or `data/records.jsonl` while `make test` runs, whichever test
+    live `scooter_db.json`, `data/records.jsonl` or `data/payments_ledger.jsonl` while
+    `make test` runs, whichever test
     happens to be running fails with one error, `… changed during this test`. Typical
     sources: a dev server running from the same checkout (`make run` plus `curl`, which
     rewrites the DB and appends records), a `git restore scooter_db.json`, or another
@@ -173,6 +181,12 @@ same command (see CI below).
   - `records_path` (autouse) points `SCOOTER_RECORDS_PATH` at `<tmp_path>/records.jsonl`.
     `read_records()` returns the test's records as a list of dicts, and the autouse
     `_guard_real_records` fails a test that touches the live `data/records.jsonl`.
+  - `ledger_path` (autouse) points `SCOOTER_PAYMENTS_LEDGER_PATH` at
+    `<tmp_path>/payments_ledger.jsonl` and **clears every `PAYMENT_*` and
+    `ENABLE_FAULT_INJECTION` variable**, so each test starts with an empty ledger and no
+    faults whatever your shell exports. Set faults with `monkeypatch.setenv("PAYMENT_FAULT", …)`.
+    `read_ledger()` returns the entries, and the autouse `_guard_real_ledger` fails a test
+    that touches the live `data/payments_ledger.jsonl`.
 - **Strictness:** `pytest.ini` sets `strict = true` and `filterwarnings = error`. Unknown
   markers and config keys are errors, an xfail that unexpectedly passes **fails** the run,
   and any warning fails the test, including a leaked file handle's `ResourceWarning`.
@@ -240,8 +254,11 @@ every pull request and on every push to `master`.
   the failure kind and the code version. They're git-ignored and survive restarts. See
   "Request records". The server log (stderr for the dev server) has tracebacks and storage
   details on top of that.
-- **Payment gateway ledger:** coming in PLAN PR 13. Today `payment_gateway()` in `app.py`
-  always succeeds and always returns the same `txn_id`.
+- **Payment gateway ledger:** `data/payments_ledger.jsonl` (or
+  `SCOOTER_PAYMENTS_LEDGER_PATH`), one JSON line per gateway call: key, attempt, outcome,
+  whether money was taken, the `txn_id`, and why that outcome happened. It's git-ignored,
+  shared by all workers and survives restarts. **`git restore scooter_db.json` doesn't
+  reset it**; see "Payments & fault injection" for a full reset.
 
 ## Database schema
 
@@ -331,12 +348,12 @@ every pull request and on every push to `master`.
   entries. Every reservation in it comes back with the same `reservation_id` and
   `idempotency_key`, legacy (`legacy-33` returns on every `git restore`) or uuid. Ending
   it again uses that key a second time.
-  - **Today** there's no ledger, so the rider is simply charged again
-    (`test_a_restored_reservation_is_charged_again_not_ridden_free`).
-  - **PLAN PR 13 must not turn this into a free ride.** With a ledger keyed by idempotency
-    key, a second end would find "already charged". So a ledger hit counts as "already
-    charged" only if it matches the ride (scooter id, reservation id and amount); anything
-    else is a conflict, never a free ride. That's in PLAN row 13's scope.
+  - **Since PLAN PR 13 the ledger decides** (see "Payments & fault injection"): ending it
+    the same way again (same scooter, reservation and amount) returns the **original**
+    charge's `txn_id` and ends the ride, with no second charge. Ending it differently (e.g.
+    another end location, so another amount) is `payment_conflict` (409): nothing is
+    charged and the ride stays open. Never a free ride, never a double charge
+    (`test_a_restored_reservation_is_not_charged_twice_or_ridden_free`).
 - **Request records** show the same full form (`reservation` and unknown fields) in
   `scooter_before`, `scooter_after` and `scooter_in_memory`. A legacy reserved scooter's
   `scooter_before` shows its synthesised reservation, i.e. the scooter as the app loaded
@@ -346,22 +363,129 @@ every pull request and on every push to `master`.
   `legacy_reservation`, `new_reservation`, `is_supported_reservation`,
   `refuse_unsupported_reservation`, and the guard in `write_db`.
 
+## Payments & fault injection
+
+`/reservation/end` pays through `payments.charge()` (`payments.py`), a **simulated**
+gateway. Nothing real is charged. It exists so payment failures can be produced and
+replayed on demand (ACTIVITY Outcome 3).
+
+**Outcomes** (each is a record's `payment` decision `gateway_outcome`, and a ledger entry's
+`outcome`):
+
+| Outcome | Money taken? | API answer | Ride |
+|---|---|---|---|
+| `success` | yes | 200 + `txn_id` (32 hex chars, a string) | ended |
+| `already_charged` | no (found the key's earlier charge, same scooter/reservation/amount) | 200 + **that** charge's `txn_id` | ended |
+| `decline` | no | 422 `payment_declined` | open |
+| `timeout_not_charged` | no | 504 `payment_timeout` | open |
+| `timeout_charged` | **yes** (the caller isn't told) | 504 `payment_timeout` | open |
+| `error` | no | 502 `payment_failed` | open |
+| `conflict` | no (the key has a charge for a *different* ride) | 409 `payment_conflict` | open |
+
+"Open" is PLAN PR 13's behaviour, the same as before. PR 14 adds `payment_pending` and H3.
+
+**The ledger** (`data/payments_ledger.jsonl`, or `SCOOTER_PAYMENTS_LEDGER_PATH`) is the
+gateway's memory: one JSON line per call, appended under an exclusive `flock` on the
+ledger file. It's a different lock from the DB's, so a later `reconcile` (PR 15) can use it
+without the DB lock.
+- **At most one charge per idempotency key.** Check-then-append happens under the lock, so
+  workers and processes racing on one key produce exactly one charge (tested with 8
+  processes).
+- **Ride matching.** A key that already has a charge returns `already_charged` only if the
+  scooter id, reservation id and amount all match that charge; otherwise `conflict`.
+  `already_charged`/`conflict` win over any forced fault: the gateway knows it was paid.
+- **Attempt numbers** are counted from the ledger (1 + earlier entries for the key), so
+  they're the same whichever worker serves the retry.
+- **Fails closed.** If any line can't be parsed, the gateway can't know whether a key was
+  charged, so it answers `error` (502) without charging or appending. Fix or move the
+  ledger to recover.
+- Each entry: `ts`, `idempotency_key`, `attempt`, `outcome`, `charged`, `txn_id` (when
+  charged), `scooter_id`, `reservation_id`, `amount`, `request_id` (the end request's
+  `X-Request-ID`), `fault`, `existing_charge` (for `already_charged`/`conflict`), `pid`.
+
+**Why a restored DB doesn't charge twice (and doesn't ride free).** A restored snapshot
+replays reservations with their idempotency keys (see Database schema). A restored
+reservation is the **same ride**: keys are per reservation, and nobody else can be riding
+under it. So ending it the same way returns the original charge: the rider paid once, for
+that ride. Ending it a different way is a conflict to surface, not to guess at. This is
+PLAN row 13's rule, applied literally.
+
+**Choosing faults**, in order of precedence:
+1. The ledger (`already_charged` / `conflict`), as above.
+2. The `X-Payment-Fault` request header, **only if `ENABLE_FAULT_INJECTION=1`** in the
+   server's environment. Values: `none`/`success`, a fault name, or `random`.
+   - Without the flag, the header is ignored. The record says so:
+     `payment_fault_override: ignored`. An unknown value is `rejected`, and the env
+     applies.
+3. `PAYMENT_FAULT`: `none` (the default), a fault forced on every attempt, or `random`.
+   `random` draws from `sha256(PAYMENT_SEED, idempotency key, attempt)`. A fault happens
+   with probability `PAYMENT_FAULT_RATE`, and the fault itself is uniform over the four.
+   Same inputs, same outcome, whichever worker or order; a retry (the next attempt) is a
+   fresh, independent draw.
+
+Every payment decision records `fault`: `{"source": "env", "mode": "decline"}`,
+`{"source": "header", "mode": …}`, `{"source": "ledger"}`, or for a draw
+`{"source": "env:random", "seed", "idempotency_key", "attempt", "rate", "draw"}`. That's
+everything needed to replay it.
+
+**Recipes.** Run a scratch server first, so the real DB, records and ledger aren't
+touched. Run the curls and queries from another terminal, with the same `S` and exports.
+
+```sh
+S=$(mktemp -d) && cp scooter_db.json "$S/db.json"
+export SCOOTER_DB_PATH="$S/db.json" SCOOTER_RECORDS_PATH="$S/records.jsonl" \
+       SCOOTER_PAYMENTS_LEDGER_PATH="$S/ledger.jsonl" PORT=8099
+ENABLE_FAULT_INJECTION=1 make run                  # header overrides allowed (scratch only!)
+
+# Trigger each failure on demand (scooter 33 starts reserved; or start one first):
+curl -s -H 'X-Payment-Fault: decline'             'localhost:8099/reservation/end?id=33&lat=24.5&lng=-28'  # 422
+curl -s -H 'X-Payment-Fault: timeout_not_charged' 'localhost:8099/reservation/end?id=33&lat=24.5&lng=-28'  # 504
+curl -s -H 'X-Payment-Fault: error'               'localhost:8099/reservation/end?id=33&lat=24.5&lng=-28'  # 502
+curl -s -H 'X-Payment-Fault: timeout_charged'     'localhost:8099/reservation/end?id=33&lat=24.5&lng=-28'  # 504, charged
+curl -s                                           'localhost:8099/reservation/end?id=33&lat=25&lng=-28'    # 409 conflict
+curl -s                                           'localhost:8099/reservation/end?id=33&lat=24.5&lng=-28'  # 200, same txn
+
+# Or without the header: force one fault for every attempt, or a seeded mix
+PAYMENT_FAULT=timeout_charged make run
+PAYMENT_FAULT=random PAYMENT_SEED=42 PAYMENT_FAULT_RATE=0.7 make run
+
+# What happened, and why:
+make records ARGS="--file $S/records.jsonl scooter 33"     # each request's payment=<outcome>
+make payments ARGS="lookup legacy-33"                      # the ledger entries for a key (uses the export)
+make payments ARGS="draw --seed 42 --key legacy-33 --attempt 1 --rate 0.7"   # replay one draw
+```
+
+- **Replaying a seeded failure exactly:** take `seed`, `idempotency_key`, `attempt` and
+  `rate` from the record's `fault`. `make payments ARGS="draw …"` recomputes the outcome.
+  To re-run the whole sequence, restore the same DB, give the server an **empty** ledger
+  (attempt numbering restarts at 1) and the same `PAYMENT_*` env, then repeat the
+  requests. Scooter 33's legacy key `legacy-33` is the same in every copy of the
+  committed DB, so its sequence is fully reproducible
+  (`test_a_seeded_run_replays_exactly`). A fresh start gets a new uuid key, so its draws
+  differ.
+- **Full reset of local state:** `git restore scooter_db.json`, and move
+  `data/payments_ledger.jsonl` aside. Otherwise restored reservations find their old
+  charges (that's intended; see above).
+- **Code:** `payments.py` (`charge`, `draw`, `header_override`, `lookup`, `main`), and
+  `pay` / `PAYMENT_FAILURES` in `app.py`. Tests: `tests/test_payments.py`.
+
 ## Repo map
 
 | Path | What it is |
 |---|---|
-| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `db_transaction` (lock + read for mutating requests), `init_db`, `find_db_shape_problem` / `find_reservation_problem` (DB validation), `load_reservation` / `legacy_reservation` / `new_reservation` (see Database schema), `write_db` (atomic replace, refuses invalid state), `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
+| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay` (calls `payments.charge`), `PAYMENT_FAILURES` (outcome → kind), `calculate_cost`, `db_transaction` (lock + read for mutating requests), `init_db`, `find_db_shape_problem` / `find_reservation_problem` (DB validation), `load_reservation` / `legacy_reservation` / `new_reservation` (see Database schema), `write_db` (atomic replace, refuses invalid state), `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
+| `payments.py` | The simulated payment gateway: `charge`, the ledger, the seeded `draw`, the `X-Payment-Fault` gating, and a CLI (`make payments ARGS=…`, `python -m payments`). See Payments & fault injection. |
 | `failures.py` | The failure-kind registry (`FailureKind`), `StorageError` and `StorageBusy` (see Failure kinds). |
 | `records.py` | Request records: request ids, one JSON line per request (see Request records). |
 | `records_query.py` | Records query functions and CLI (`make records ARGS=…`, `python -m records_query`). |
-| `data/` | Default home of `records.jsonl`. Git-ignored except `.gitkeep`. |
+| `data/` | Default home of `records.jsonl` and `payments_ledger.jsonl`. Git-ignored except `.gitkeep`. |
 | `scooter_db.json` | Live JSON database, mutated by the app (see above). |
 | `README.md` | API contract: endpoints, params, responses. |
 | `ACTIVITY.md` | The activity brief and Required outcomes 0–7. |
 | `PLAN.md` | The authoritative staged plan: PR table, human decisions, change log. |
 | `AGENTS.md` | This file. `CLAUDE.md` just imports it. |
 | `AI_NOTES.md` | Log of where the AI was confidently wrong and how it was caught (Outcome 7). |
-| `Makefile` | `setup`, `run`, `test`, `check-settings`, `records`, `lock`, `agent`, `clean` and `help`. More targets (`reconcile`, `scenario`) arrive with later PLAN PRs. |
+| `Makefile` | `setup`, `run`, `test`, `check-settings`, `records`, `payments`, `lock`, `agent`, `clean` and `help`. More targets (`reconcile`, `scenario`) arrive with later PLAN PRs. |
 | `.claude/settings.json` | Claude Code sandbox and permission rules for this repo (see Agent boundaries). |
 | `scripts/agent.sh` | Headless `claude -p` wrapper with spend, turn and wall-clock caps (`make agent`). |
 | `scripts/check_settings.py`, `schemas/` | `make check-settings`: validates `.claude/settings.json` against the vendored Claude Code settings schema. |
@@ -377,19 +501,25 @@ every pull request and on every push to `master`.
 These exist today and are scheduled in PLAN.md. Don't "fix" them outside their PR. The
 ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
 
-- A payment failure returns `payment_failed` (502) and leaves the ride open, with the
-  scooter still reserved, so a rider who never retries keeps it reserved. PLAN PRs 13/14
-  define decline, timeout and reconcile behaviour (H3, H7). `txn_id` is an int, although
-  the README says it's a string *(xfail, PLAN PR 13)*.
+- **Every payment failure leaves the ride open** (`payment_declined`, `payment_timeout`,
+  `payment_failed`, `payment_conflict`): the scooter stays reserved and unmoved, so a rider
+  who never retries keeps it reserved. That includes a **decline**, although H3/H7 say a
+  decline ends the ride with an outstanding balance. That, `payment_pending` and retries
+  are PLAN PR 14; reconcile is PR 15.
+- After `timeout_charged` the rider **has been charged** but the ride is still open. A
+  retry with the same end location settles it with that charge (`already_charged`, 200).
+  A retry from a different location asks for a different amount, so it's
+  `payment_conflict` until PR 14 stores the amount at the first attempt.
 - `lat`/`lng`/`radius` are parsed with Python's lenient `float()`, so `+5`, `1_000`,
   surrounding whitespace and Unicode digits (e.g. `٥`) are all accepted as numbers.
 - With an unwritable DB, `/reservation/end` charges the gateway first and only then fails
   to save (`storage_error`). The rider pays for a ride that didn't end *(xfail, PLAN PR 14)*.
 - A scooter reserved before PLAN PR 12 has no record of when or by which request its ride
   started: it loads with a synthesised `legacy-<id>` reservation (see Database schema).
-- Restoring a DB snapshot replays its reservations with the same ids and keys; ending one
-  again charges again (no ledger yet). PLAN PR 13 must keep that from becoming a free ride
-  (see Database schema).
+- Restoring a DB snapshot replays its reservations with the same ids and keys. Ending one
+  again the same way returns the original charge; ending it differently is
+  `payment_conflict` (see Database schema). The ledger survives `git restore`, so for a
+  clean demo reset also move the ledger aside (see Payments & fault injection).
 - The start response's `reservation_id` isn't used by any endpoint yet. `/reservation/end`
   still takes only `id`, `lat` and `lng`. Later PLAN PRs build on it.
 
@@ -495,8 +625,10 @@ the evidence to use when debugging. Read the records before reading code.
    {"step": "db_read", "outcome": "ok", "detail": {"db_path": "scooter_db.json", "scooters": 5}},
    {"step": "lookup", "outcome": "found", "detail": {"id": "18"}},
    {"step": "end", "outcome": "allowed", "detail": {"reason": "scooter is reserved"}},
-   {"step": "payment", "outcome": "requested", "detail": {"distance_m": 1509, "cost": 1509}},
-   {"step": "payment", "outcome": "ok", "detail": {"txn_id": 379892831, "gateway_msg": null, "gateway_code": null}},
+   {"step": "payment", "outcome": "requested", "detail": {"distance_m": 1509, "cost": 1509, "idempotency_key": "f36f087baa0842929afe8d9eaf0e8598"}},
+   {"step": "payment", "outcome": "ok", "detail": {"gateway_outcome": "success", "txn_id": "0d4c9e1f2a3b4c5d6e7f8091a2b3c4d5", "attempt": 1,
+                                                  "fault": {"source": "env", "mode": "none"},
+                                                  "simulator": {"charged": true, "ledger_txn_id": "0d4c9e1f2a3b4c5d6e7f8091a2b3c4d5"}}},
    {"step": "reservation", "outcome": "cleared", "detail": {"reservation_id": "f36f087baa0842929afe8d9eaf0e8598", "legacy": false}},
    {"step": "db_write", "outcome": "ok", "detail": {"db_path": "scooter_db.json"}}],
  "params_truncated": false,
@@ -520,7 +652,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `reservation` (`created`/`cleared` with the `reservation_id`, or `unsupported` with the unknown `payment_state`; see Database schema), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `payment` (`requested` with distance, cost and idempotency key, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, or `unsupported` with the unknown `payment_state`; see Database schema), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -660,7 +792,10 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `scooter_not_found` | 422 | No scooter has the given id (ids are matched exactly; `18 ` isn't `18`). |
 | `scooter_already_reserved` | 422 | Start requested for a scooter that's already reserved. |
 | `no_active_reservation` | 422 | End requested for a scooter that isn't reserved. |
-| `payment_failed` | 502 | The payment gateway reported a failure. The ride is **not** ended and the scooter stays reserved. A gateway-supplied `msg` is passed through, and so is its `code` if it's 400–599 (anything else becomes 502). PLAN PRs 13/14 add finer payment kinds. |
+| `payment_failed` | 502 | The payment gateway reported an **error** (outcome `error`), or its ledger is unreadable (it fails closed: no charge). The ride is **not** ended and the scooter stays reserved. Since PLAN PR 13 the msg is always `Error 502 - Payment failed; the reservation was not ended.` and the status always 502: the old pass-through of a gateway's own `msg`/`code` went away with the dummy gateway. |
+| `payment_declined` | 422 | The gateway declined the payment. The ride is **not** ended (PLAN PR 14 applies H3: end the ride with an outstanding balance). |
+| `payment_timeout` | 504 | The gateway timed out (`timeout_not_charged` or `timeout_charged`; the client can't tell which, the record's `simulator.charged` can). The ride is **not** ended. A retry is charged at most once. |
+| `payment_conflict` | 409 | The reservation's idempotency key already has a charge, but for a different ride (scooter, reservation or amount differ), e.g. a retry from another end location, or a restored DB ended elsewhere. Nothing is charged and the ride is **not** ended: never a free ride. The record's `existing_charge` shows the earlier charge. |
 | `route_not_found` | 404 | No endpoint at that path. |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
 | `storage_busy` | 503 | A mutating request (`/reservation/*`) couldn't get the DB lock within `SCOOTER_DB_LOCK_TIMEOUT` (default 5 s), because another request held it. **Nothing was read or written**, so it's safe to retry; the response has `Retry-After: 1`. The record has a `db_lock: timeout` decision with `wait_ms`. A separate kind from `storage_error` because it's transient and retryable, and agents counting failures should see "contention" apart from "broken DB". |

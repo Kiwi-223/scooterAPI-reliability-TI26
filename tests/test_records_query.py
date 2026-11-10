@@ -409,11 +409,22 @@ def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, record
     ]
     for url in calls:
         client.get(url)
-    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: {"status": False})
-    client.get("/reservation/end?id=18&lat=1&lng=1")      # failed payment: ride left open
+    # every payment outcome (PLAN PR 13); all but the last leave the ride open
+    payment_calls = [
+        ("error", "/reservation/end?id=18&lat=1&lng=1"),                 # 502 payment_failed
+        ("decline", "/reservation/end?id=18&lat=1&lng=1"),               # 422 payment_declined
+        ("timeout_not_charged", "/reservation/end?id=18&lat=1&lng=1"),   # 504 payment_timeout
+        ("timeout_charged", "/reservation/end?id=18&lat=1&lng=1"),       # 504, but charged
+        ("none", "/reservation/end?id=18&lat=2&lng=2"),                  # 409 conflict: other amount
+        ("none", "/reservation/end?id=18&lat=1&lng=1"),                  # 200 already_charged: ends it
+    ]
+    for fault, url in payment_calls:
+        monkeypatch.setenv("PAYMENT_FAULT", fault)
+        client.get(url)
     records = list(rq.read_records(records_path))
-    assert len(records) == len(calls) + 1
-    assert [r["status"] for r in records] == [200, 200, 200, 422, 422, 200, 200, 422, 422, 200, 200, 200, 200, 404, 502]
+    assert len(records) == len(calls) + len(payment_calls)
+    assert [r["status"] for r in records] == [200, 200, 200, 422, 422, 200, 200, 422, 422, 200, 200, 200, 200, 404,
+                                              502, 422, 504, 504, 409, 200]
     assert rq.anomalies(records) == []
 
 
@@ -514,3 +525,18 @@ def test_anomaly_start_reservation_not_persisted(reservation):
 ])
 def test_reservation_rules_have_no_false_positives(record):
     assert rq.anomalies([record]) == []
+
+
+def test_scooter_history_shows_each_payment_outcome(client, monkeypatch, records_path, capsys):
+    client.get("/reservation/start?id=18")
+    monkeypatch.setenv("PAYMENT_FAULT", "decline")
+    client.get("/reservation/end?id=18&lat=1&lng=1")
+    monkeypatch.setenv("PAYMENT_FAULT", "none")
+    client.get("/reservation/end?id=18&lat=1&lng=1")
+    code, out, _ = run(["--file", str(records_path), "scooter", "18"], capsys)
+    assert code == 0
+    lines = [line for line in out.splitlines() if "before=" in line]
+    assert ["payment=" in line for line in lines] == [False, True, True]
+    assert lines[1].endswith("payment=decline") and lines[2].endswith("payment=success")
+    old = {"decisions": [{"step": "payment", "outcome": "ok", "detail": {"txn_id": 1}}]}   # pre-PR 13 record
+    assert rq._payment(old) == "ok" and rq._payment({"decisions": []}) is None
