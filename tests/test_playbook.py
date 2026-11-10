@@ -83,6 +83,20 @@ def test_every_scenario_is_clean_on_the_real_code_by_every_documented_command(sc
         assert _call("anomalies", {"scenario": s["scenario"]}).structured_content["result"]["unresolved"] == 0
 
 
+def test_scenario_db_checks_compare_exactly():
+    # PR #27 review NIT 3: three converted checks were looser than the predicates they replaced.
+    import scenarios as sc
+    base = {"id": "18", "lat": 1.0, "lng": 2.0}
+    assert sc.mismatch(sc.DB_FIELDS, dict(base, is_reserved=0, reservation=None), {"reserved": False}) \
+        == "expected reserved=false, got reserved=0"
+    assert sc.mismatch(sc.DB_FIELDS, dict(base, is_reserved=True, reservation={}), {"state": None}) \
+        == 'expected state=null, got state="<missing>"'
+    pending_null = dict(base, is_reserved=True, reservation={"payment_state": "active", "amount": None})
+    assert sc.mismatch(sc.DB_FIELDS, pending_null, {"amount": "<absent>"}) == 'expected amount="<absent>", got amount=null'
+    active = dict(base, is_reserved=True, reservation={"payment_state": "active"})
+    assert sc.mismatch(sc.DB_FIELDS, active, {"reserved": True, "state": "active", "amount": "<absent>"}) is None
+
+
 def test_the_listing_prints_one_line_per_scenario():
     # PR #27 review: two-line docstrings wrapped into the next column-less line.
     import scenarios

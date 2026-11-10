@@ -94,6 +94,13 @@ BUGS = [
     ("M10", "the decline's balance is recorded under the wrong idempotency key",
      "\t\t\t\t'idempotency_key': reservation['idempotency_key'],\n", "\t\t\t\t'idempotency_key': 'wrong-key',\n",
      DECLINE, "decline_not_settled"),
+    # PR #27's review (MINOR 3): begin_payment stores the end location swapped. The pending
+    # decision used to log the arguments, so the record contradicted itself and anomalies said 0.
+    # Asymmetric coordinates: a swap of (1, 1) would be invisible.
+    ("M11", "begin_payment stores the end location swapped",
+     "\t\t\t\t\t\t\t\t\t'end_lat': end_lat,\n\t\t\t\t\t\t\t\t\t'end_lng': end_lng,\n",
+     "\t\t\t\t\t\t\t\t\t'end_lat': end_lng,\n\t\t\t\t\t\t\t\t\t'end_lng': end_lat,\n",
+     [["start", "18"], ["end", "18", 23.01, 19.01, "none"]], "pending_location_not_requested"),
 ]
 
 
@@ -124,6 +131,22 @@ def test_anomalies_name_each_planted_payment_bug(tmp_path, db_path, records_path
     _run(tmp_path, source.replace(old, new), steps, db_path, records_path)
     code, types = _cli_anomalies(records_path, capsys)
     assert code == 1 and rule in types, (bug, what, types)
+
+
+def test_the_pending_decision_records_what_was_stored_not_the_arguments(tmp_path, db_path, records_path, capsys):
+    # PLAN PR 20b: with M11 planted, the record's `payment: pending` must show the swapped
+    # values that were stored (and persisted), so it agrees with `payment: requested` and the
+    # DB, and disagrees with the request's params, which anomalies then names.
+    [_, _, old, new, steps, _] = next(b for b in BUGS if b[0] == "M11")
+    _run(tmp_path, (REPO / "app.py").read_text().replace(old, new), steps, db_path, records_path)
+    [end] = [r for r in rq.read_records(records_path) if r["path"] == "/reservation/end"]
+    detail = {(d["step"], d["outcome"]): d["detail"] for d in end["decisions"]}
+    assert (detail[("params", "ok")]["lat"], detail[("params", "ok")]["lng"]) == (23.01, 19.01)
+    assert (detail[("payment", "pending")]["end_lat"], detail[("payment", "pending")]["end_lng"]) == (19.01, 23.01)
+    assert (detail[("payment", "requested")]["end_lat"], detail[("payment", "requested")]["end_lng"]) == (19.01, 23.01)
+    [found] = [a for a in rq.anomalies(rq.read_records(records_path)) if a["type"] == "pending_location_not_requested"]
+    assert found["detail"]["requested"] == {"lat": 23.01, "lng": 19.01}
+    assert found["detail"]["stored"] == {"lat": 19.01, "lng": 23.01} and found["detail"]["source"] == "payment_pending"
 
 
 @pytest.mark.parametrize("steps", sorted({json.dumps(b[4]) for b in BUGS}))

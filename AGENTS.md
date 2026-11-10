@@ -122,6 +122,9 @@ show 0 for a request whose write was refused (its `db_write: refused` decision a
   swapped `lat`/`lng`: read the code that sets the scooter's position, `finish_ride`);
   `persistence` means the right location was in memory but not written. Its `summary`
   gives the expected and actual coordinates.
+- anomaly `pending_location_not_requested` → the end location stored when payment started
+  (`begin_payment`, phase 1) isn't the one the request asked for: the bug is in what was
+  stored, before any charge. Its `summary` gives both.
 - `db_write: refused` with a problem, or an `exception` field → the code built an invalid
   state, or crashed; the message names the field.
 - `params: ok` on input that should have been rejected → validation.
@@ -1251,7 +1254,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: reason}`, the reason `"reserved"` or `"payment_pending"`, for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, or `degraded` when a reservation is in an unknown payment state, with `readable`, `scooters`, `reserved`, `payment_pending` and `unsupported`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location, distance and amount **as stored** on the reservation by phase 1, read back after storing, not the arguments (PLAN PR 20b), `requested` with distance, cost, idempotency key and end location, also read from the reservation, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: reason}`, the reason `"reserved"` or `"payment_pending"`, for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, or `degraded` when a reservation is in an unknown payment state, with `readable`, `scooters`, `reserved`, `payment_pending` and `unsupported`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -1303,7 +1306,7 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   files. A leading byte-order mark is ignored (`utf-8-sig`). A line that isn't a complete JSON object (e.g. a partially written last line or a
   stray `42`) is skipped with `warning: <file>:<line>: skipped line, …` on stderr; the
   query still answers.
-- **`anomalies`** flags nineteen contradictions. Most are within a single record;
+- **`anomalies`** flags twenty contradictions. Most are within a single record;
   `pending_location_changed`, `double_charge`, `scooter_double_charge` and
   `charged_and_owed` also compare records with each other:
   - **`write_not_persisted`:** `db_write.ok` is true but `scooter_after` ≠
@@ -1352,6 +1355,14 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     decision) asked the gateway to charge before any `db_write: ok` after that decision.
     Phase 1 must be on disk before the charge. This shows in **every** such record, even
     when nothing crashed.
+  - **`pending_location_not_requested`:** a first-attempt end (it has a `payment: pending`
+    decision) stored an end location other than the one the request asked for (its
+    `params: ok` `lat`/`lng`, compared as floats). Checked against both `payment: pending`
+    and `payment: requested`, which both read the values back from the reservation (PLAN
+    PR 20b), so a bug in `begin_payment` that stores the wrong location (e.g. swapped) is
+    named at the request that stored it, before the ride even ends. Retries are exempt:
+    they ignore their own coordinates by design. The detail has `requested`, `stored`,
+    `source` and a one-line `summary`.
   - **`pending_location_changed`:** a retry (`end: retry`) re-priced the ride (it has its own
     `payment: pending`), or charged a different end location or amount than the one stored
     for it: the retry decision's own stored values, or any earlier record's
@@ -1420,6 +1431,7 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   | a decline's balance recorded as 0 | `decline_not_settled` |
   | **a new idempotency key per attempt** (a charged timeout plus a retry charges the ride twice: a **double charge**) | `double_charge`, `payment_key_mismatch` |
   | a decline's balance recorded under the wrong key | `decline_not_settled` |
+  | `begin_payment` stores the end location swapped (PR #27 review) | `pending_location_not_requested` |
   | (in `reconcile.py`) settling a charged ride under a new key: it ends charged **and** owing | `payment_key_mismatch` (since PLAN PR 15b the same run's `clear_paid_balance` voids the balance, so `charged_and_owed` is listed as resolved) |
   | (in `reconcile.py`) settling a restored ride at the scooter's current position, not the ledger's | `end_location_not_persisted` |
   | (in `reconcile.py`) `clear_paid_balance` leaves the paid balance open | `reconcile_not_settled` |
