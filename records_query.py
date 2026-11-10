@@ -5,14 +5,16 @@
     python -m records_query scooter <id>
     python -m records_query request <request_id>
     python -m records_query anomalies [--since 1h] [--db PATH]
+    python -m records_query rollback-check [--since 1h] [--db PATH] [--ledger PATH]
     make records ARGS="failure-counts --since 1h"
 
 Global options (before the command): --file PATH (default: $SCOOTER_RECORDS_PATH, else
 data/records.jsonl) and --json (machine-readable output on stdout).
 
 Exit codes: 0 = success; 1 = nothing found for `scooter`/`request`, or `anomalies` found at
-least one unresolved finding (a `resolved` one is history the current DB no longer holds); 2 =
-bad arguments or the records file is missing/unreadable.
+least one unresolved finding (a `resolved` one is history the current DB no longer holds), or
+`ledger-check` / `rollback-check` found a problem; 2 = bad arguments or the records file (or,
+for those two, the ledger or DB) is missing/unreadable.
 
 The query functions are pure: they take an iterable of record dicts (see `read_records`)
 and return plain data, so the MCP server (PLAN PR 16) reuses them as-is. Reading streams
@@ -226,12 +228,138 @@ def open_balance_reservations(db):
             for b in s.get("outstanding_balances") or [] if isinstance(b, dict) and "settled_by_txn_id" not in b}
 
 
+# ---- what a DB rollback erased (PLAN PR 15c) --------------------------------------------------
+
+UNCHARGED_ATTEMPTS = ("error", "timeout_not_charged")    # the ledger knows nothing was charged
+REBUILT_REASON = "rebuilt_from_ledger"
+
+
+def _db_reservation(entry):
+    if "reservation" in entry:
+        return entry["reservation"]
+    # legacy shape: the app synthesises legacy-<id> for a reserved scooter
+    return {"reservation_id": f"legacy-{entry.get('id')}", "idempotency_key": f"legacy-{entry.get('id')}"} \
+        if entry.get("is_reserved") else None
+
+
+def db_traces(db):
+    """Every reservation_id and idempotency key the DB knows: live reservations and every
+    outstanding balance, open or settled."""
+    known = set()
+    for entry in db:
+        if not isinstance(entry, dict):
+            continue
+        reservation = _db_reservation(entry)
+        if isinstance(reservation, dict):
+            known.update({reservation.get("reservation_id"), reservation.get("idempotency_key")})
+        for b in entry.get("outstanding_balances") or []:
+            if isinstance(b, dict):
+                known.update({b.get("reservation_id"), b.get("idempotency_key")})
+    known.discard(None)
+    return known
+
+
+def lost_balances(db, ledger):
+    """Debts the ledger proves and the DB forgot (a rollback erased them) -> a list of dicts:
+    reservation_id, idempotency_key, scooter_id, amount, end_lat, end_lng, ended_at (the
+    ledger entry's ts), original_reason, and the ledger evidence (outcome, attempt).
+
+    A reservation qualifies when the ledger shows it ended unpaid -- a decline
+    (original_reason payment_declined), or only uncharged attempts (error /
+    timeout_not_charged: payment_unresolved; H3's terminal rule, since nobody can retry a ride
+    the DB no longer has) -- and:
+    - no charge exists for it in the ledger, by reservation_id or by key (a charge wins);
+    - the DB has no trace of it: no live (active / payment_pending) reservation and no
+      balance, open or settled, by reservation_id or key.
+    The evidence is the first decline (a replayed decline is the same ride), else the latest
+    uncharged attempt (the ride's latest stored end). Pure."""
+    known = db_traces(db)
+    charged = set()
+    for e in ledger:
+        if e.get("charged") is True:
+            charged.update({e.get("reservation_id"), e.get("idempotency_key")})
+    by_reservation = {}
+    for e in ledger:
+        if e.get("reservation_id") is not None:
+            by_reservation.setdefault(e["reservation_id"], []).append(e)
+    lost = []
+    for rid, entries in by_reservation.items():
+        keys = {e.get("idempotency_key") for e in entries}
+        if rid in known or rid in charged or keys & known or keys & charged:
+            continue
+        declines = [e for e in entries if e.get("outcome") == "decline"]
+        attempts = [e for e in entries if e.get("outcome") in UNCHARGED_ATTEMPTS]
+        evidence = declines[0] if declines else (attempts[-1] if attempts else None)
+        if evidence is None:
+            continue
+        lost.append({"reservation_id": rid, "idempotency_key": evidence.get("idempotency_key"),
+                     "scooter_id": evidence.get("scooter_id"), "amount": evidence.get("amount"),
+                     "end_lat": evidence.get("end_lat"), "end_lng": evidence.get("end_lng"),
+                     "ended_at": evidence.get("ts"),
+                     "original_reason": "payment_declined" if declines else "payment_unresolved",
+                     "ledger_outcome": evidence.get("outcome"), "ledger_attempt": evidence.get("attempt")})
+    return lost
+
+
+def rollback_check(records, db, ledger, since=None):
+    """What a DB rollback (a restore of an older snapshot) erased -> dict of lists:
+
+    - lost_balances: debts the ledger proves (see lost_balances); `make reconcile` rebuilds
+      them (rebuild_lost_balance). Recoverable.
+    - erased_rides: a reservation the records show started (within `since`) of which the DB
+      has no trace and the ledger has no entry at all: the ride was in progress when the
+      rollback erased it, so it was never paid or charged: **a free ride**. Unrecoverable:
+      nothing knows where it ended or what it cost.
+    - erased_balances: like erased_rides, but the records show the ride ended with a balance
+      (e.g. reconcile's end_unpaid by age, with no gateway attempt): the debt is in the
+      records only, with no ledger evidence to rebuild it from. Unrecoverable automatically.
+    - rebuilt_balances: balances reconcile already rebuilt (reason rebuilt_from_ledger), for
+      the audit trail.
+    Pure; `db` is the persisted DB (a list of scooter dicts), `ledger` the ledger's entries."""
+    records = list(records)          # read twice (a CLI passes a one-shot stream)
+    known = db_traces(db)
+    in_ledger = {e.get("reservation_id") for e in ledger} | {e.get("idempotency_key") for e in ledger}
+    recorded_balance = {}
+    for r in records:
+        for d in r.get("decisions") or []:
+            if isinstance(d, dict) and d.get("step") == "balance" and d.get("outcome") in ("recorded", "rebuilt"):
+                recorded_balance.setdefault((d.get("detail") or {}).get("reservation_id"), (r, d.get("detail") or {}))
+    erased_rides, erased_balances, seen = [], [], set()
+    for r in records:
+        if r.get("path") != "/reservation/start" or r.get("status") != 200 or not in_window(r, since):
+            continue
+        after = r.get("scooter_after")
+        reservation = after.get("reservation") if isinstance(after, dict) else None
+        if not isinstance(reservation, dict):
+            continue
+        rid, key = reservation.get("reservation_id"), reservation.get("idempotency_key")
+        if rid in seen or rid in known or key in known or rid in in_ledger or key in in_ledger:
+            continue
+        seen.add(rid)
+        item = {"reservation_id": rid, "idempotency_key": key, "scooter_id": r.get("scooter_id"),
+                "started_at": reservation.get("started_at"), "start_request_id": r.get("request_id")}
+        if rid in recorded_balance:
+            rec, detail = recorded_balance[rid]
+            erased_balances.append(dict(item, amount=detail.get("amount"), reason=detail.get("reason"),
+                                        recorded_by=rec.get("request_id")))
+        else:
+            erased_rides.append(item)
+    rebuilt = [dict(b, scooter_id=s.get("id")) for s in db if isinstance(s, dict)
+               for b in s.get("outstanding_balances") or [] if isinstance(b, dict) and b.get("reason") == REBUILT_REASON]
+    return {"lost_balances": lost_balances(db, ledger), "erased_rides": erased_rides,
+            "erased_balances": erased_balances, "rebuilt_balances": rebuilt}
+
+
+def rollback_problems(result):
+    return bool(result["lost_balances"] or result["erased_rides"] or result["erased_balances"])
+
+
 def unresolved(findings):
     """The findings that still need attention (not marked `resolved`)."""
     return [f for f in findings if not f.get("resolved")]
 
 
-def anomalies(records, since=None, db=None):
+def anomalies(records, since=None, db=None, db_path=None):
     """Records whose own fields contradict each other. Each finding is a dict with
     `type`, `request_id`, `ts`, `path`, `scooter_id`, `status` and `detail`, and `resolved`
     (true only for a charged_and_owed whose balance is no longer owed, see below).
@@ -273,22 +401,27 @@ def anomalies(records, since=None, db=None):
       record already shows charged, i.e. one ride paid twice. Checked across records.
     - scooter_double_charge: two charges on one scooter between a successful start and the
       scooter becoming free, under any reservation or key (PLAN PR 15). Checked across
-      records, in the order they took effect.
+      records, in the order they took effect. A charge for an older ride that a DB rollback
+      brought back (its start is in the records, before the scooter's latest start) starts
+      a new count (PLAN PR 15c).
     - charged_and_owed: a reservation that a record shows charged also has an outstanding
       balance recorded (by this or another record), whatever keys they were made under:
       the rider paid AND owes for one ride (PR #20 review). Checked across records. The
       records are history: a DB restore can wipe the balance, and reconcile's
       clear_paid_balance marks it settled (PLAN PR 15b). So the detail says
       `still_in_db` (the current DB, `db`, still holds an open balance for the reservation;
-      None if no DB was given) and `settled_by` (the request_id of a `balance: settled`
+      None if no DB was given), `db` (the path consulted, `db_path`, or "unknown" when no DB
+      could be read) and `settled_by` (the request_id of a `balance: settled`
       record for it, or None), and the finding is `resolved` when the DB doesn't hold it
       (still_in_db false), or, with no DB, when a settled record exists. A resolved finding
       is a labelled historical flag; it doesn't make the CLI exit 1.
     - reconcile_not_settled: a /reconcile record (PLAN PR 15) says it ended the ride (status
-      200, an action other than none or clear_paid_balance) but scooter_after is still
+      200, an action other than none, clear_paid_balance or rebuild_lost_balance) but scooter_after is still
       reserved; or it ended it unpaid (payment_unresolved) or declined (settle_declined*,
       payment_declined) without an outstanding balance of that reason for the reservation;
-      or clear_paid_balance left one of its balances open.
+      or clear_paid_balance left one of its balances open; or rebuild_lost_balance (PLAN PR
+      15c) didn't leave a rebuilt_from_ledger balance for each reservation it named, or
+      rebuilt one for a reservation that a record shows charged.
 
     decline_not_settled also requires the balance's amount to equal the amount charged for
     (the `payment: requested` cost) and its idempotency_key to be the reservation's.
@@ -340,7 +473,7 @@ def anomalies(records, since=None, db=None):
                                        freed, r, in_window(r, since)))
         charged_and_owed = None
         owed = [(d.get("detail") or {}).get("reservation_id") for d in decisions
-                if d.get("step") == "balance" and d.get("outcome") == "recorded"]
+                if d.get("step") == "balance" and d.get("outcome") in ("recorded", "rebuilt")]
         for d in decisions:
             if d.get("step") == "balance" and d.get("outcome") == "settled":
                 settled_by[(d.get("detail") or {}).get("reservation_id")] = r.get("request_id")
@@ -432,7 +565,19 @@ def anomalies(records, since=None, db=None):
                 if isinstance(after, dict) else []
             owed_reason = {"end_unpaid": "payment_unresolved", "settle_declined": "payment_declined",
                            "settle_declined_from_ledger": "payment_declined"}.get(action)
-            if action == "clear_paid_balance":
+            if action == "rebuild_lost_balance":
+                if status == 200 and isinstance(after, dict):
+                    rebuilt = {(b or {}).get("reservation_id") for b in (acted[0].get("detail") or {}).get("balances") or []}
+                    have = {b.get("reservation_id") for b in after_balances if b.get("reason") == REBUILT_REASON}
+                    if rebuilt - have:
+                        flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after,
+                                                       "problem": "a lost balance wasn't rebuilt"})
+                    paid = sorted(rid for rid in rebuilt if rid in charged_by_reservation)
+                    if paid:      # the guard: a charge always wins, so a charged ride owes nothing
+                        flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after,
+                                                       "problem": "rebuilt a balance for a reservation a record shows charged",
+                                                       "reservation_ids": paid})
+            elif action == "clear_paid_balance":
                 if status == 200 and isinstance(after, dict):
                     cleared = {(b or {}).get("reservation_id") for b in (acted[0].get("detail") or {}).get("balances") or []}
                     still = [b for b in after_balances if b.get("reservation_id") in cleared and "settled_by_txn_id" not in b]
@@ -460,12 +605,31 @@ def anomalies(records, since=None, db=None):
             rid = f["detail"]["reservation_id"]
             f["detail"]["still_in_db"] = None if open_in_db is None else rid in open_in_db
             f["detail"]["settled_by"] = settled_by.get(rid)
+            f["detail"]["db"] = "unknown" if db is None else (db_path or "(given)")
             f["resolved"] = (f["detail"]["still_in_db"] is False) if open_in_db is not None else rid in settled_by
     charges_since_start = {}
+    started_rids, latest_rid = set(), {}
+
+    def rid_of(snapshot):
+        reservation = snapshot.get("reservation") if isinstance(snapshot, dict) else None
+        return reservation.get("reservation_id") if isinstance(reservation, dict) else None
+
     for _, scooter, started, charged, freed, r, in_win in sorted(scooter_events, key=lambda e: e[0]):
         if started:
             charges_since_start[scooter] = 0
+            rid = rid_of(r.get("scooter_after"))
+            if rid is not None:
+                started_rids.add(rid)
+                latest_rid[scooter] = rid
         if charged:
+            # A DB rollback (PLAN PR 15c) can bring back an OLDER ride whose start the records
+            # saw before this scooter's latest start: its charge belongs to that ride, not to
+            # the latest one. (A reservation swapped in by a bug has no start record, so it
+            # still counts.)
+            before_rid = rid_of(r.get("scooter_before"))
+            if before_rid in started_rids and before_rid != latest_rid.get(scooter):
+                charges_since_start[scooter] = 0
+                latest_rid[scooter] = before_rid
             charges_since_start[scooter] = charges_since_start.get(scooter, 0) + 1
             if charges_since_start[scooter] > 1 and in_win:
                 found.append(_finding(r, "scooter_double_charge", {"charges_since_start": charges_since_start[scooter]}))
@@ -623,6 +787,25 @@ def _print_human(command, result, args):
                   f"      {json.dumps(a['detail'])}")
         if result and getattr(args, "db_problem", None):
             print(f"  (DB not read, so charged_and_owed can't say whether it is still owed: {args.db_problem})")
+    elif command == "rollback-check":
+        print(f"what a DB rollback erased (DB {args.db_used}, ledger {args.ledger_used}){window}:")
+        print(f"lost balances the ledger proves (make reconcile rebuilds them): {len(result['lost_balances'])}")
+        for b in result["lost_balances"]:
+            print(f"  scooter {b['scooter_id']} reservation {b['reservation_id']}: {b['amount']} "
+                  f"({b['original_reason']}, ledger {b['ledger_outcome']} attempt {b['ledger_attempt']} at {b['ended_at']})")
+        print(f"erased rides (in progress when erased; never paid or charged: FREE RIDES, unrecoverable): "
+              f"{len(result['erased_rides'])}")
+        for e in result["erased_rides"]:
+            print(f"  scooter {e['scooter_id']} reservation {e['reservation_id']} started {e['started_at']} "
+                  f"[start record {e['start_request_id']}]")
+        print(f"erased balances with no ledger evidence (records only; unrecoverable automatically): "
+              f"{len(result['erased_balances'])}")
+        for e in result["erased_balances"]:
+            print(f"  scooter {e['scooter_id']} reservation {e['reservation_id']}: {e['amount']} ({e['reason']}) "
+                  f"[recorded by {e['recorded_by']}]")
+        print(f"balances already rebuilt by reconcile: {len(result['rebuilt_balances'])}")
+        for b in result["rebuilt_balances"]:
+            print(f"  scooter {b['scooter_id']} reservation {b['reservation_id']}: {b['amount']} ({b.get('original_reason')})")
 
 
 def read_db(path):
@@ -658,6 +841,12 @@ def build_parser():
     p.add_argument("--since", help="duration (30s, 15m, 1h, 2d, 1h30m) or ISO-8601 time")
     p.add_argument("--db", help="the current DB, to tell whether a charged_and_owed balance is still owed "
                                 "(default: $SCOOTER_DB_PATH or scooter_db.json; read-only, lock-free)")
+    p = sub.add_parser("rollback-check",
+                       help="what a DB rollback (restore of an older snapshot) erased: lost balances, rides erased "
+                            "in progress (free rides) (exit 1 if any)")
+    p.add_argument("--since", help="only rides started since: duration (30s, 15m, 1h, 2d, 1h30m) or ISO-8601 time")
+    p.add_argument("--db", help="the current DB (default: $SCOOTER_DB_PATH or scooter_db.json; read-only, lock-free)")
+    p.add_argument("--ledger", help="ledger path (default: $SCOOTER_PAYMENTS_LEDGER_PATH or data/payments_ledger.jsonl)")
     p = sub.add_parser("ledger-check",
                        help="cross-check the payments ledger with the records: requests that died mid-payment, "
                             "double charges, charges under foreign keys (exit 1 if any)")
@@ -698,9 +887,27 @@ def main(argv=None, now=None):
                 print(f"records_query: cannot read ledger {ledger!r}: {exc.strerror or exc}", file=sys.stderr)
                 return 2
             result = ledger_check(entries, records, now=now, min_age_s=args.min_age)
+        elif args.command == "rollback-check":
+            args.ledger_used = args.ledger or os.environ.get("SCOOTER_PAYMENTS_LEDGER_PATH") or os.path.join("data", "payments_ledger.jsonl")
+            args.db_used = args.db or os.environ.get("SCOOTER_DB_PATH") or "scooter_db.json"
+            db, problem = read_db(args.db_used)
+            if problem:
+                print(f"records_query: cannot read DB {problem}", file=sys.stderr)
+                return 2
+            try:
+                entries = read_ledger(args.ledger_used,
+                                      warn=lambda n, reason: warnings.append((n, f"{reason} (in {args.ledger_used})")))
+            except FileNotFoundError:
+                entries = []                             # no payment has ever been made
+                args.ledger_used += " (absent: no payments yet)"
+            except OSError as exc:
+                print(f"records_query: cannot read ledger {args.ledger_used!r}: {exc.strerror or exc}", file=sys.stderr)
+                return 2
+            result = rollback_check(records, db, entries, args.since_dt)
         else:
-            db, args.db_problem = read_db(args.db or os.environ.get("SCOOTER_DB_PATH") or "scooter_db.json")
-            result = anomalies(records, args.since_dt, db)
+            db_used = args.db or os.environ.get("SCOOTER_DB_PATH") or "scooter_db.json"
+            db, args.db_problem = read_db(db_used)
+            result = anomalies(records, args.since_dt, db, db_path=db_used)
     except OSError as exc:
         print(f"records_query: cannot read records file {path!r}: {exc.strerror or exc}", file=sys.stderr)
         return 2
@@ -719,6 +926,8 @@ def main(argv=None, now=None):
     if args.command == "anomalies" and unresolved(result):
         return 1
     if args.command == "ledger-check" and ledger_problems(result):
+        return 1
+    if args.command == "rollback-check" and rollback_problems(result):
         return 1
     return 0
 

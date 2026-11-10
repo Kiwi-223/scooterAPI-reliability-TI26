@@ -711,3 +711,26 @@ strongest entries.
     not only within a timeline.** For each identity a restore can bring back (reservation,
     key), ask what happens when its *earlier* outcome (decline, charge, balance) meets a
     *new* attempt.
+
+### 36. A data-loss gap described by one symptom hid the bigger loss
+- **Where:** PLAN PR 15b's write-up (AGENTS.md "A restore from before a ride started loses
+  that ride's balance"); fixed in PLAN PR 15c.
+- **What the AI claimed:** the open gap after a DB restore was a **lost declined balance**:
+  one narrow case, documented as known behaviour, with I2 to flag it.
+- **Reality:** a whole-DB rollback erases *everything* the DB learned since the snapshot.
+  The 15b tests restored one scooter at a time, which hid most of it. With whole-DB
+  rollbacks, most I2 hits weren't lost balances at all: they were **rides in progress that
+  the rollback erased**, never ended, never paid: free rides. The seeded histories showed
+  11–31 of them per 300-step history, against 0–12 lost balances. Settled markers,
+  rebuilt balances and the legacy migration are erased too, while the ledger and the
+  records survive.
+- **How it was caught:** PR #21's reviewer re-ran the random histories with whole-DB
+  restores and counted dozens of I2 hits per history. `git restore scooter_db.json` is the
+  documented reset, so a cold agent would meet this often.
+- **What changed:** reconcile rebuilds every balance the ledger proves
+  (`rebuild_lost_balance`); `make records ARGS="rollback-check"` lists what was erased,
+  labelling the unrecoverable free rides; AGENTS.md has a table of everything a rollback
+  erases and a runbook. Lesson: **describe a data-loss gap by everything the rollback
+  erases** (each kind of state, and what survives), not by the first symptom found; and
+  test it with the *real* rollback (the whole file), not a narrower one that is easier to
+  reason about.

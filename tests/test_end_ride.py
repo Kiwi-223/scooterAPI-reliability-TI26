@@ -273,6 +273,9 @@ def _db(**entry_33):
      "outstanding_balances[0] is missing ['settled_at', 'settled_reason']"),
     (_db(outstanding_balances=[dict(BALANCE, settled_by_txn_id="", settled_at="2026-11-10T00:00:00.000Z",
                                     settled_reason="paid")]), "outstanding_balances[0].settled_by_txn_id is not a non-empty string"),
+    # PLAN PR 15c: a rebuilt balance says what it originally was
+    (_db(outstanding_balances=[dict(BALANCE, reason="rebuilt_from_ledger", original_reason="")]),
+     "outstanding_balances[0].original_reason is not a non-empty string"),
 ])
 def test_invalid_payment_fields_are_storage_error(client, db_path, data, why):
     db_path.write_text(json.dumps(data))
