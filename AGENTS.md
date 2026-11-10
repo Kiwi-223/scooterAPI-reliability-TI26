@@ -58,6 +58,7 @@ before.
 
 | Variable | Default | Used by | Notes |
 |---|---|---|---|
+| `SCOOTER_RECORDS_PATH` | `data/records.jsonl` | `records.py`, once per request | Where request records are appended (see Request records). Relative to the cwd. The directory is created on demand. Read on every request, like `SCOOTER_DB_PATH`. |
 | `SCOOTER_DB_PATH` | `scooter_db.json` | `app.py` on every DB read/write, under both the dev server and gunicorn | Read on **every request**, so changing `os.environ` in a test takes effect without re-importing `app`. A relative path is resolved against the cwd. The file must already exist; the app doesn't create it. |
 | `HOST` | `localhost` | `python app.py` / `make run` only | gunicorn ignores it; use `--bind`. |
 | `PORT` | `8080` | `python app.py` / `make run` | Must be an integer. **gunicorn reads `PORT` too**: with no `--bind` it then listens on `0.0.0.0:$PORT` (see below). |
@@ -65,7 +66,7 @@ before.
 ```sh
 # Run against a scratch copy of the DB so the real scooter_db.json is never touched:
 SCRATCH_DB=$(mktemp) && cp scooter_db.json "$SCRATCH_DB"
-SCOOTER_DB_PATH="$SCRATCH_DB" PORT=8099 make run
+SCOOTER_DB_PATH="$SCRATCH_DB" SCOOTER_RECORDS_PATH="$(mktemp -d)/records.jsonl" PORT=8099 make run
 ```
 
 `HOST` is a common name. zsh and bash don't export it by default, but some shells (e.g.
@@ -117,7 +118,7 @@ same command (see CI below).
   - `tests/seed_db.json` is the test-owned seed data: 5 scooters, and `33` starts reserved.
   - `tests/messages.py` holds the exact `msg` strings the API returns today.
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
-    `test_failure_kinds.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
+    `test_failure_kinds.py`, `test_records.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
 - **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
@@ -150,6 +151,9 @@ same command (see CI below).
   - `get_json(url, status)`: asserts the status code and a JSON content type, then returns
     the parsed body.
   - `read_db()`: returns what the app actually persisted, as `{id: scooter}`.
+  - `records_path` (autouse) points `SCOOTER_RECORDS_PATH` at `<tmp_path>/records.jsonl`.
+    `read_records()` returns the test's records as a list of dicts, and the autouse
+    `_guard_real_records` fails a test that touches the live `data/records.jsonl`.
 - **Strictness:** `pytest.ini` sets `strict = true` and `filterwarnings = error`. Unknown
   markers and config keys are errors, an xfail that unexpectedly passes **fails** the run,
   and any warning fails the test, including a leaked file handle's `ResourceWarning`.
@@ -206,10 +210,11 @@ every pull request and on every push to `master`.
   `{id, lat, lng, is_reserved}`. The app **rewrites it** whenever a reservation starts or
   ends, so any manual testing changes it. **Don't commit changes to it.** To restore it:
   `git restore scooter_db.json`.
-- **Request records** (what each request did and how it ended) are **coming in PLAN
-  PR 9**, with a query CLI in PLAN PR 10. There are no persisted records today. The only trace of
-  a request is the server log: the dev server prints request lines to **stderr**, and
-  gunicorn logs none unless run with `--access-logfile -` (see Run).
+- **Request records:** `data/records.jsonl` (or `SCOOTER_RECORDS_PATH`), one JSON line
+  per request: what was asked, every decision, the scooter before and after, the DB write,
+  the failure kind and the code version. They're git-ignored and survive restarts. See
+  "Request records". The server log (stderr for the dev server) has tracebacks and storage
+  details on top of that.
 - **Payment gateway ledger:** coming in PLAN PR 13. Today `payment_gateway()` in `app.py`
   always succeeds and always returns the same `txn_id`.
 
@@ -217,8 +222,10 @@ every pull request and on every push to `master`.
 
 | Path | What it is |
 |---|---|
-| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `write_db`, `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). |
+| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `find_db_shape_problem`, `write_db`, `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
 | `failures.py` | The failure-kind registry (`FailureKind`) and `StorageError` (see Failure kinds). |
+| `records.py` | Request records: request ids, one JSON line per request (see Request records). |
+| `data/` | Default home of `records.jsonl`. Git-ignored except `.gitkeep`. |
 | `scooter_db.json` | Live JSON database, mutated by the app (see above). |
 | `README.md` | API contract: endpoints, params, responses. |
 | `ACTIVITY.md` | The activity brief and Required outcomes 0–7. |
@@ -247,8 +254,116 @@ ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
   the README says it's a string *(xfail, PLAN PR 13)*.
 - The DB read/write isn't locked, and the write isn't atomic, so concurrent requests can
   lose updates (PLAN PR 11).
+- `lat`/`lng`/`radius` are parsed with Python's lenient `float()`, so `+5`, `1_000`,
+  surrounding whitespace and Unicode digits (e.g. `٥`) are all accepted as numbers.
 - With an unwritable DB, `/reservation/end` charges the gateway first and only then fails
   to save (`storage_error`). The rider pays for a ride that didn't end *(xfail, PLAN PR 14)*.
+
+## Request records
+
+Every request leaves **exactly one JSON line** in the records file, written when the
+request finishes (success, any failure kind, 404/405, or an unhandled exception). This is
+the evidence to use when debugging. Read the records before reading code.
+
+- **Where:** `data/records.jsonl` by default (relative to the working directory), or
+  `SCOOTER_RECORDS_PATH`. The directory is created on demand. `data/*` is git-ignored
+  (only `data/.gitkeep` is committed). Records survive restarts: the file is only ever
+  appended to.
+- **Request id:** every response carries `X-Request-ID`, which is the record's
+  `request_id`. A client can send its own `X-Request-ID` to find its request later. It's
+  honoured only if it's 1–64 characters of `[A-Za-z0-9._-]`; anything else is replaced
+  with a fresh uuid4 hex, and the record notes `request_id: client_value_rejected`.
+- **Atomicity:** each record is one `write()` of one line to an `O_APPEND` descriptor,
+  under an exclusive `fcntl.flock`. Lines from threads, gunicorn workers or separate
+  processes never interleave. Tests cover 4 processes writing 70 KB lines, and a live
+  check ran 4 gunicorn workers with 400 parallel requests.
+- **If a record can't be written:** the API response is still served unchanged, plus an
+  `X-Record-Error: <ExceptionType>` header. The server log gets an ERROR line,
+  `REQUEST RECORD NOT WRITTEN: … (records=<path>, request_id=…)`, with the traceback.
+- **Code:** `records.py`. Route code calls `records.note(step, outcome, **detail)` for each
+  decision, `records.scooter(scooter_id=…, before=…, in_memory=…)` for the affected
+  scooter, and `records.unchanged()` when it decides not to write. `write_db` calls
+  `records.db_write(ok, error)` and `records.written(db_list)`. The latter is the only thing
+  that sets `scooter_after` after a write. `records.init_app(app)` adds the before/after/teardown
+  hooks. The teardown hook is a safety net that still writes a record if no response was
+  produced.
+- **Not done yet:** there's no log rotation (future work). The file grows until you move
+  it aside. A query CLI is **coming in PLAN PR 10**.
+
+### Schema (`schema: 1`)
+
+```json
+{"schema": 1, "ts": "2026-11-10T01:39:40.482Z", "request_id": "135dba2cd5be4391b8a1255217a242f8",
+ "method": "GET", "path": "/reservation/end", "params": {"id": "18", "lat": "23.01", "lng": "19.01"},
+ "scooter_id": "18",
+ "decisions": [
+   {"step": "db_read", "outcome": "ok", "detail": {"db_path": "scooter_db.json", "scooters": 5}},
+   {"step": "params", "outcome": "ok", "detail": {"lat": 23.01, "lng": 19.01}},
+   {"step": "lookup", "outcome": "found", "detail": {"id": "18"}},
+   {"step": "end", "outcome": "allowed", "detail": {"reason": "scooter is reserved"}},
+   {"step": "payment", "outcome": "requested", "detail": {"distance_m": 1509, "cost": 1509}},
+   {"step": "payment", "outcome": "ok", "detail": {"txn_id": 379892831, "gateway_msg": null, "gateway_code": null}},
+   {"step": "db_write", "outcome": "ok", "detail": {"db_path": "scooter_db.json"}}],
+ "params_truncated": false,
+ "scooter_before": {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": true},
+ "scooter_after": {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": false},
+ "scooter_in_memory": {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": false},
+ "db_write": {"attempted": true, "ok": true, "error": null},
+ "status": 200, "error": null, "duration_ms": 0.81,
+ "git_commit": "1b65c022a8abc8307a90eb5ef2aea6f348521818", "git_dirty": false, "git_dirty_paths": [],
+ "pid": 16070}
+```
+
+(On disk each record is a single line; it's wrapped here for reading.)
+
+| Field | Meaning |
+|---|---|
+| `ts` | When the request started, UTC ISO-8601 with milliseconds and a `Z`. Plain string comparison sorts and filters by time. |
+| `request_id` | Same as the `X-Request-ID` response header. |
+| `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
+| `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `db_write` (`ok`/`failed`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `scooter_before` | The scooter as read from the DB at lookup. |
+| `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed. |
+| `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
+| `db_write` | `{attempted, ok, error}`. `error` is the exception type. |
+| `status`, `error` | The HTTP status. `error` is `{kind, msg}` on failure (see Failure kinds), otherwise `null`. |
+| `exception` | Only on `internal_error` / `storage_error`: `{type, message}` of the underlying exception. The traceback is in the server log. |
+| `duration_ms` | Server-side time to produce the response. |
+| `git_commit`, `git_dirty`, `git_dirty_paths` | The source tree at **server startup**. `git_dirty` is `true` if any *code* file, tracked or untracked (not git-ignored), differed from `HEAD`. That's how a planted, uncommitted bug shows up, and `git_dirty_paths` lists those files (first 20). Data files the app rewrites (`scooter_db.json`) don't count. All are `null` if git isn't available. **They describe the files on disk at startup, not necessarily the code that's running:** restart the server after changing code, and delete `__pycache__/` after planting or reverting a bug (a same-second, same-size revert can leave stale bytecode in use; AI_NOTES #22). |
+| `pid` | The process that served it, so you can tell gunicorn workers and restarts apart. |
+
+### Querying records (until the CLI in PLAN PR 10)
+
+These recipes are verified with jq 1.7 (`jq` ships with macOS).
+
+```sh
+R=data/records.jsonl     # or "$SCOOTER_RECORDS_PATH"
+
+# Follow one request (id from the X-Request-ID header):
+jq 'select(.request_id == "probe-42")' $R
+grep '"request_id": "probe-42"' $R                       # same, without jq
+
+# One scooter's history, oldest first. File order is completion order (several workers
+# can finish out of order), so sort by ts:
+jq -s -c 'map(select(.scooter_id == "18")) | sort_by(.ts)[] | {ts, path, status, kind: .error.kind,
+       before: .scooter_before.is_reserved, after: .scooter_after.is_reserved}' $R
+
+# Requests where the code's view and what was written disagree (a persistence bug):
+jq -c 'select(.db_write.ok == true and .scooter_after != .scooter_in_memory)
+       | {ts, request_id, path, after: .scooter_after, in_memory: .scooter_in_memory}' $R
+
+# Failures by kind in the last hour (BSD date first, GNU date as fallback):
+SINCE=$(date -u -v-1H +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S)
+jq -r --arg since "$SINCE" 'select(.ts >= $since and .error != null) | .error.kind' $R | sort | uniq -c
+
+# Recent failures, and which code served them:
+jq -c 'select(.error != null) | {ts, request_id, path, kind: .error.kind}' $R | tail -20
+jq -r '[.git_commit[0:12], .git_dirty] | @tsv' $R | sort | uniq -c
+```
+
+To produce evidence while reproducing a symptom, run the server against scratch copies
+(see Configuration), make the requests, then query the scratch records file.
 
 ## Failure kinds
 
@@ -285,9 +400,9 @@ Every error response is JSON with a human message and a **stable failure kind**:
   (404, 405 and `abort(...)`, including `InternalServerError`, which is itself an
   `HTTPException`), and a catch-all for `Exception`. Because the catch-all is registered
   for `Exception` rather than `500`, it also runs with `TESTING=True`.
-- **Counting failures:** group by `error.kind`, never by parsing `msg`. Request records
-  (PLAN PR 9) will carry the same kind, and the records CLI (PLAN PR 10) will answer
-  "how many of each kind since T".
+- **Counting failures:** group by `error.kind`, never by parsing `msg`. Every request
+  record carries the same `error.kind`; see "Request records" for the jq recipe, and the
+  records CLI (PLAN PR 10) will wrap it.
 - **Tests:** `tests/test_failure_kinds.py` pins the shipped ids and statuses and produces
   **every** kind through a real request. Adding a kind to `failures.py` without adding it
   to `SHIPPED` and `TRIGGERS` there fails the suite. Update this table and README.md in the

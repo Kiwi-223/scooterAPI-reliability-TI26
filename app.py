@@ -4,9 +4,11 @@ import json, math, os, werkzeug
 from http import HTTPStatus
 from werkzeug.exceptions import HTTPException
 
+import records
 from failures import FailureKind, StorageError
 
 app=Flask(__name__)
+records.init_app(app)	# request ids + one JSON line per request (records.py, AGENTS.md)
 
 # Configuration from environment variables (unset or empty -> README default)
 DEFAULT_DB_PATH = 'scooter_db.json'
@@ -25,6 +27,7 @@ def get_db_path():
 def error_response(kind, msg, status=None):
 	# Every error response: {"msg": ..., "error": {"kind": <stable id>}} (see failures.py).
 	body = { 'msg': msg, 'error': { 'kind': kind.value } }
+	records.failure(kind.value, msg)
 	return json.dumps(body), status or kind.status, {'Content-Type':'application/json'}
 
 @app.errorhandler(StorageError)
@@ -32,6 +35,7 @@ def handle_storage_error(e):
 	# The log gets the DB path and the original exception (with its traceback); the
 	# response stays path-free.
 	app.logger.error('storage error: %s (db=%s)', e, e.path, exc_info=e.__cause__)
+	records.exception(e.__cause__ or e)
 	return error_response(FailureKind.STORAGE_ERROR, f'Error 500 - {e}')
 
 @app.errorhandler(HTTPException)
@@ -55,6 +59,7 @@ def handle_unexpected_exception(e):
 	# Registered for Exception (not 500) so it also runs when TESTING=True (AGENTS.md).
 	# HTTPExceptions never reach here: the more specific handler above takes them.
 	app.logger.exception('unhandled exception')
+	records.exception(e)
 	return error_response(FailureKind.INTERNAL_ERROR, 'Error 500 - Internal server error.')
 
 # root
@@ -66,6 +71,7 @@ def home():
 def view_all_available():
 	db = init_db()
 	available_scooters = [scooter for scooter in db if not scooter.is_reserved]
+	records.note('filter', 'ok', available=len(available_scooters))
 	available_scooters_dictlist = convert_db_to_dictlist(available_scooters)
 	return json.dumps(available_scooters_dictlist), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# return a json-ified list of all the scooters with status 200
 
@@ -102,6 +108,7 @@ def search():
 	# scooter, which is a legitimate "everything" query and costs nothing extra.
 	if not (math.isfinite(search_radius) and search_radius >= 0):
 		return error_response(FailureKind.INVALID_RADIUS, 'Error 422 - Radius must be a finite number of metres that is 0 or more.')
+	records.note('params', 'ok', lat=search_lat, lng=search_lng, radius_m=search_radius)
 	
 	db = init_db()	# initialize db
 
@@ -116,6 +123,7 @@ def search():
 									'lng':scooter.lng
 								  })
 			
+	records.note('search', 'ok', matches=[r['id'] for r in search_results])
 	return json.dumps(search_results), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# return json-ified search results list with status 200
 
 	
@@ -128,22 +136,28 @@ def start_reservation():
 	except werkzeug.exceptions.BadRequestKeyError:
 		# the required parameters are not present in the search query
 		return error_response(FailureKind.MISSING_PARAM, 'Error 422 - Please include all required parameters in search query')
+	records.scooter(scooter_id=reserve_id)
 
 	db = init_db()
 	
 	# try and find the scooter with specified id
-	scooter = get_scooter_with_id(reserve_id, db)
+	scooter = find_scooter(reserve_id, db)
 	if scooter:
 		# reserve if possible
 		if not scooter.is_reserved:
 			# scooter can be reserved
+			records.note('reserve', 'allowed', reason='scooter is not reserved')
 			scooter.is_reserved = True
 			write_db(db)	# update db
+			records.scooter(in_memory=scooter.to_dict())
 			success = { 'msg': f'Scooter {reserve_id} was reserved successfully.' }
 			return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
 
 		else:
 			# the scooter is already reserved
+			records.note('reserve', 'refused', reason='scooter is already reserved')
+			records.scooter(in_memory=scooter.to_dict())
+			records.unchanged()
 			return error_response(FailureKind.SCOOTER_ALREADY_RESERVED, f'Error 422 - Scooter with id {reserve_id} is already reserved.')
 	else:
 		# no scooter with the reserve id was found
@@ -156,6 +170,7 @@ def end_reservation():
 	# parse request params
 	try:
 		scooter_id_to_end = request.args['id']	# parse request for id of scooter whose reservation to be ended
+		records.scooter(scooter_id=scooter_id_to_end)
 		end_lat, end_lng = \
 			float(request.args['lat']), \
 			float(request.args['lng'])
@@ -172,12 +187,14 @@ def end_reservation():
 	if not -180 <= end_lng <= 180:
 		return error_response(FailureKind.INVALID_COORDINATE, 'Error 422 - Longitude must be in the [-180, 180] range.')
 		
+	records.note('params', 'ok', lat=end_lat, lng=end_lng)
 	# try and find the scooter with specified id
-	scooter = get_scooter_with_id(scooter_id_to_end, db)
+	scooter = find_scooter(scooter_id_to_end, db)
 	if scooter:
 		# end reservation if possible
 		if scooter.is_reserved:
 			# scooter is reserved and can be ended
+			records.note('end', 'allowed', reason='scooter is reserved')
 			
 			# initiate payment
 			payment_response = pay(scooter, end_lat, end_lng)
@@ -188,6 +205,7 @@ def end_reservation():
 				scooter.is_reserved = False
 				scooter.lat, scooter.lng = end_lat, end_lng
 				write_db(db)
+				records.scooter(in_memory=scooter.to_dict())
 				# construct successful response
 				success =	{	'msg': f'Payment for scooter {scooter_id_to_end} was made successfully and the reservation was ended.',
 								'txn_id': payment_response['txn_id']
@@ -196,6 +214,8 @@ def end_reservation():
 			else:
 				# the payment failed: the reservation is NOT ended (unchanged behaviour; PLAN PRs 13/14
 				# define decline/timeout handling). Use the gateway's msg/code when it gives them.
+				records.scooter(in_memory=scooter.to_dict())	# expected: still reserved, not moved
+				records.unchanged()
 				code = payment_response.get('code')
 				if not (isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599):
 					code = None  # a failed payment never carries a non-error status: fall back to 502
@@ -204,6 +224,9 @@ def end_reservation():
 					code)
 		else:
 			# the scooter is not currently reserved
+			records.note('end', 'refused', reason='scooter is not reserved')
+			records.scooter(in_memory=scooter.to_dict())
+			records.unchanged()
 			return error_response(FailureKind.NO_ACTIVE_RESERVATION, f'Error 422 - No reservation for scooter {scooter_id_to_end} presently exists.')
 	else:
 		# no scooter with the id was found
@@ -225,8 +248,12 @@ def pay(scooter, end_lat, end_lng):
 	distance_ridden = round(distance_ridden)
 	# calculate cost (currently a dummy function that returns the distance as the cost)
 	cost = calculate_cost(distance_ridden)	# returns cost = distance for now
+	records.note('payment', 'requested', distance_m=distance_ridden, cost=cost)
 	# redirect to payment gateway and return response (currently a dummy function that returns a hypothetical transaction id)
-	return payment_gateway(cost)	# returns hypothetical success and txn id for now
+	payment_response = payment_gateway(cost)	# returns hypothetical success and txn id for now
+	records.note('payment', 'ok' if payment_response.get('status') else 'failed',
+		txn_id=payment_response.get('txn_id'), gateway_msg=payment_response.get('msg'), gateway_code=payment_response.get('code'))
+	return payment_response
 	
 def payment_gateway(cost):
 	# TODO: Implement real payment processing in future
@@ -250,12 +277,16 @@ def init_db():
 			db_json = db_file.read()
 		db_list = json.loads(db_json)
 	except OSError as e:
+		records.note('db_read', 'failed', db_path=path, error=type(e).__name__)
 		raise StorageError(f'The scooter database could not be read ({type(e).__name__}).', path) from e
 	except ValueError as e:
+		records.note('db_read', 'failed', db_path=path, error=type(e).__name__)
 		raise StorageError(f'The scooter database is corrupt ({type(e).__name__}).', path) from e
 	problem = find_db_shape_problem(db_list)
 	if problem:
+		records.note('db_read', 'failed', db_path=path, error=problem)
 		raise StorageError(f'The scooter database is corrupt ({problem}).', path)
+	records.note('db_read', 'ok', db_path=path, scooters=len(db_list))
 	# populate Scooter objects for easier access later
 	db = []
 	for scooter in db_list:
@@ -295,6 +326,17 @@ def find_db_shape_problem(db_list):
 	return None
 	
 	
+def find_scooter(search_id, db):
+	# get_scooter_with_id plus a record of the lookup and the scooter's state before the change
+	scooter = get_scooter_with_id(search_id, db)
+	if scooter:
+		records.note('lookup', 'found', id=search_id)
+		records.scooter(before=scooter.to_dict())
+	else:
+		records.note('lookup', 'not_found', id=search_id)
+	return scooter
+
+
 def get_scooter_with_id(search_id, db):
 	try:
 		scooter = next(scooter for scooter in db if scooter.id == search_id)	# get the scooter with specified id
@@ -308,11 +350,17 @@ def write_db(db):
 	# serialize Scooter objects 
 	db_list = convert_db_to_dictlist(db)
 	db_json = json.dumps(db_list)
+	path = get_db_path()
 	try:
-		with open(get_db_path(), 'w') as db_file:
+		with open(path, 'w') as db_file:
 			db_file.write(db_json)
 	except OSError as e:
-		raise StorageError(f'The scooter database could not be written ({type(e).__name__}).', get_db_path()) from e
+		records.db_write(False, type(e).__name__)
+		records.note('db_write', 'failed', db_path=path, error=type(e).__name__)
+		raise StorageError(f'The scooter database could not be written ({type(e).__name__}).', path) from e
+	records.db_write(True)
+	records.written(db_list)	# scooter_after = what was actually serialised
+	records.note('db_write', 'ok', db_path=path)
 	return True
 		
 # class scooter for internal use
