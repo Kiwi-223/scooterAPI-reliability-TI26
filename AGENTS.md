@@ -353,7 +353,8 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
 - **File:** `--file PATH`, else `$SCOOTER_RECORDS_PATH`, else `data/records.jsonl`.
 - **`--since`:** a duration (`30s`, `15m`, `1h`, `2d`, `1h30m`) or an ISO-8601 time (naive
   means UTC). The window is inclusive (`ts >= since`). A record without a valid `ts` is
-  outside every window.
+  outside every window. A duration too large for a date (e.g. `99999999d`) is a bad
+  argument (exit 2).
 - **Output:** human-readable by default; `--json` prints exactly one JSON value on stdout.
   Warnings go to stderr.
 - **Exit codes:**
@@ -365,17 +366,35 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   `make` turns any non-zero exit into its own error (exit 2), so call
   `.venv/bin/python -m records_query` when the exact code matters.
 - **Robustness:** reading streams the file line by line, so memory stays flat on large
-  files. A line that isn't a complete JSON object (e.g. a partially written last line or a
+  files. A leading byte-order mark is ignored (`utf-8-sig`). A line that isn't a complete JSON object (e.g. a partially written last line or a
   stray `42`) is skipped with `warning: <file>:<line>: skipped line, …` on stderr; the
   query still answers.
-- **`anomalies`** flags three contradictions:
+- **`anomalies`** flags five contradictions, each within a single record:
   - **`write_not_persisted`:** `db_write.ok` is true but `scooter_after` ≠
     `scooter_in_memory`. The code changed the scooter, but the written data didn't contain
     the change.
   - **`success_without_write`:** a `/reservation/*` request returned 200 without
-    attempting a DB write.
+    attempting a DB write. (PLAN PR 14's idempotent end retries will need an exemption
+    here.)
+  - **`start_left_free`:** `/reservation/start` returned 200 but `scooter_after` isn't
+    reserved.
   - **`end_left_reserved`:** `/reservation/end` returned 200 but `scooter_after` is still
     reserved.
+  - **`end_location_not_persisted`:** `/reservation/end` returned 200 but `scooter_after`'s
+    `lat`/`lng` differ from the requested end coordinates. They're compared as floats, the
+    way the app parses them, so `+23.01` equals `23.01`. This one also catches code that
+    never moves the scooter at all, where in-memory and written state agree.
+
+  Tested to have zero false positives on every legitimate flow: start, end, re-reserve
+  after end, refused starts and ends, an unknown scooter, lenient-float coordinates, a
+  failed payment, search, view, and 404. Every rule is also tested on records from a
+  planted bug.
+  - **Deliberately not included: a cross-record continuity check** ("this request's
+    `scooter_before` equals the previous `scooter_after`"). Concurrent workers,
+    `git restore` of the DB and manual edits all break that chain legitimately, so it would
+    mostly be noise. The per-record rules catch persistence bugs inside the request that
+    caused them. For a manual continuity view, use `make records ARGS="scooter <id>"`,
+    which prints before/after for each request in `ts` order.
 - **Code:** `records_query.py`. These are pure functions over any iterable of records:
   `read_records(path, warn)`, `parse_since`, `failure_counts`, `recent_failures`,
   `scooter_history`, `find_requests`, `anomalies`. `main()` is the CLI.

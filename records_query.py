@@ -40,7 +40,8 @@ def records_path():
 def read_records(path, warn=None):
     """Yield record dicts from a JSONL file, streaming. Bad lines are skipped and reported
     as warn(line_number, reason). Raises OSError if the file can't be opened."""
-    with open(path, "r", encoding="utf-8", errors="replace", newline="\n") as handle:
+    # utf-8-sig: a byte-order mark (e.g. from an editor) must not swallow the first record.
+    with open(path, "r", encoding="utf-8-sig", errors="replace", newline="\n") as handle:
         for number, line in enumerate(handle, start=1):
             text = line.rstrip("\n")
             if not text.strip():
@@ -81,7 +82,11 @@ def parse_since(value, now=None):
     match = _DURATION_RE.fullmatch(value.strip()) if value.strip() else None
     if match and any(match.groups()):
         d, h, m, s = (int(x or 0) for x in match.groups())
-        return now - datetime.timedelta(days=d, hours=h, minutes=m, seconds=s)
+        try:
+            return now - datetime.timedelta(days=d, hours=h, minutes=m, seconds=s)
+        except OverflowError:
+            raise ValueError(f"--since {value!r} reaches back further than a date can represent; "
+                             "use an ISO-8601 time instead") from None
     parsed = parse_ts(value.strip())
     if parsed is None:
         raise ValueError(f"--since must be a duration like 30s, 15m, 1h, 2d, 1h30m or an ISO-8601 time, got {value!r}")
@@ -130,6 +135,21 @@ def find_requests(records, request_id):
     return [r for r in records if r.get("request_id") == request_id]
 
 
+def _float_pair(lat, lng):
+    try:
+        return (float(lat), float(lng))
+    except (TypeError, ValueError):
+        return None
+
+
+def _requested_end(params):
+    """The lat/lng an end request asked for, as the app parsed them (first value of each)."""
+    if not isinstance(params, dict):
+        return None
+    first = lambda v: v[0] if isinstance(v, list) and v else v
+    return _float_pair(first(params.get("lat")), first(params.get("lng")))
+
+
 def anomalies(records, since=None):
     """Records whose own fields contradict each other. Each finding is a dict with
     `type`, `request_id`, `ts`, `path`, `scooter_id`, `status` and `detail`.
@@ -138,6 +158,14 @@ def anomalies(records, since=None):
       changed the scooter, but what was written doesn't contain that change)
     - success_without_write: a /reservation/* request returned 200 without attempting a write
     - end_left_reserved: /reservation/end returned 200 but scooter_after is still reserved
+    - start_left_free: /reservation/start returned 200 but scooter_after isn't reserved
+    - end_location_not_persisted: /reservation/end returned 200 but scooter_after's lat/lng
+      differ from the requested end coordinates (compared as floats)
+
+    Deliberately not included: a cross-record continuity check (a scooter's scooter_before
+    should equal its previous scooter_after). Concurrent workers, `git restore` of the DB
+    and manual edits all break that chain legitimately, so it would mostly be noise; the
+    per-record rules above catch persistence bugs inside the request that caused them.
     """
     found = []
     for r in records:
@@ -154,10 +182,21 @@ def anomalies(records, since=None):
 
         if db_write.get("ok") is True and after is not None and in_memory is not None and after != in_memory:
             flag("write_not_persisted", {"scooter_after": after, "scooter_in_memory": in_memory})
+        # NOTE for PLAN PR 14: an idempotent retry of /reservation/end (same idempotency key,
+        # already settled) may legitimately return 200 without writing. That PR must exempt
+        # such retries here (e.g. via a decision it records) or this rule will flag them.
         if path in RESERVATION_PATHS and status == 200 and not db_write.get("attempted"):
             flag("success_without_write", {"db_write": db_write})
         if path == "/reservation/end" and status == 200 and isinstance(after, dict) and after.get("is_reserved") is True:
             flag("end_left_reserved", {"scooter_after": after})
+        if path == "/reservation/start" and status == 200 and isinstance(after, dict) and after.get("is_reserved") is not True:
+            flag("start_left_free", {"scooter_after": after})
+        if path == "/reservation/end" and status == 200 and isinstance(after, dict):
+            wanted = _requested_end(r.get("params"))
+            got = _float_pair(after.get("lat"), after.get("lng"))
+            if wanted is not None and got != wanted:
+                flag("end_location_not_persisted", {"requested": {"lat": wanted[0], "lng": wanted[1]},
+                                                    "scooter_after": after})
     return sorted(found, key=_ts_key)
 
 

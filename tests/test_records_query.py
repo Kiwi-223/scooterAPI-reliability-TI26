@@ -334,7 +334,7 @@ def test_anomalies_catch_a_lost_write_in_real_records(client, monkeypatch, recor
     monkeypatch.setattr(app_module, "convert_db_to_dictlist", stale)
     client.get("/reservation/end?id=18&lat=23.01&lng=19.01")
     found = rq.anomalies(rq.read_records(records_path))
-    assert {a["type"] for a in found} == {"write_not_persisted", "end_left_reserved"}
+    assert {a["type"] for a in found} == {"write_not_persisted", "end_left_reserved", "end_location_not_persisted"}
     assert {a["path"] for a in found} == {"/reservation/end"}
 
 
@@ -342,3 +342,129 @@ def test_anomalies_catch_a_success_without_write_in_real_records(client, monkeyp
     monkeypatch.setattr(app_module, "write_db", lambda db: True)      # a "forgot to save" bug
     assert client.get("/reservation/start?id=18").status_code == 200
     assert [a["type"] for a in rq.anomalies(rq.read_records(records_path))] == ["success_without_write"]
+
+
+# ---- PR #12 review: overflow, BOM, start-side and location anomalies -------------------
+
+@pytest.mark.parametrize("value", ["99999999d", "1000000000000h", "9" * 30 + "s"])
+def test_huge_durations_are_a_clean_bad_argument(value, fixture_file, capsys):
+    with pytest.raises(ValueError, match="reaches back further"):
+        rq.parse_since(value, NOW)
+    with pytest.raises(SystemExit) as exc:
+        rq.main(["--file", str(fixture_file), "failure-counts", "--since", value], now=NOW)
+    assert exc.value.code == 2 and "reaches back further" in capsys.readouterr().err
+
+
+def test_a_byte_order_mark_does_not_swallow_the_first_record(tmp_path):
+    path = tmp_path / "bom.jsonl"
+    path.write_bytes(b"\xef\xbb\xbf" + (json.dumps(rec("first", 1)) + "\n" + json.dumps(rec("second", 1)) + "\n").encode())
+    warnings = []
+    assert [r["request_id"] for r in rq.read_records(path, warn=lambda *a: warnings.append(a))] == ["first", "second"]
+    assert warnings == []
+
+
+def _end(after, lat="23.01", lng="19.01", **extra):
+    return rec("x", 1, path="/reservation/end", scooter="18", db_write=WROTE, params={"id": "18", "lat": lat, "lng": lng},
+               scooter_before=TAKEN, scooter_after=after, scooter_in_memory=after, **extra)
+
+
+def test_anomaly_start_left_free():
+    record = rec("x", 1, path="/reservation/start", scooter="18", db_write=WROTE,
+                 scooter_before=FREE, scooter_after=FREE, scooter_in_memory=FREE)
+    assert [a["type"] for a in rq.anomalies([record])] == ["start_left_free"]
+
+
+def test_anomaly_end_location_not_persisted():
+    moved_wrong = dict(FREE)                                # freed, but still at the old spot
+    found = rq.anomalies([_end(moved_wrong)])
+    assert [a["type"] for a in found] == ["end_location_not_persisted"]
+    assert found[0]["detail"]["requested"] == {"lat": 23.01, "lng": 19.01}
+
+
+@pytest.mark.parametrize("lat,lng", [("23.01", "19.01"), ("+23.01", " 19.010 "), (["23.01", "1"], "19.01")])
+def test_end_location_compares_as_floats_like_the_app(lat, lng):
+    after = {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
+    assert rq.anomalies([_end(after, lat=lat, lng=lng)]) == []
+
+
+def test_end_location_rule_skips_unparseable_params():
+    assert rq.anomalies([_end(dict(FREE), lat="x")]) == []
+
+
+def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, records_path):
+    calls = [
+        "/reservation/start?id=18",                       # start
+        "/reservation/end?id=18&lat=23.01&lng=19.01",     # end
+        "/reservation/start?id=18",                       # re-reserve after end
+        "/reservation/start?id=18",                       # refused: already reserved
+        "/reservation/start?id=33",                       # refused: seed-reserved
+        "/reservation/end?id=15&lat=0&lng=0",             # refused: not reserved
+        "/reservation/start?id=nope",                     # unknown scooter
+        "/reservation/end?id=18&lat=+1e1&lng=٥",          # lenient float() coordinates
+        "/reservation/start?id=18",
+        "/search?lat=0&lng=0&radius=10", "/view_all_available", "/nope",
+    ]
+    for url in calls:
+        client.get(url)
+    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: {"status": False})
+    client.get("/reservation/end?id=18&lat=1&lng=1")      # failed payment: ride left open
+    records = list(rq.read_records(records_path))
+    assert len(records) == len(calls) + 1
+    assert [r["status"] for r in records] == [200, 200, 200, 422, 422, 422, 422, 200, 200, 200, 200, 404, 502]
+    assert rq.anomalies(records) == []
+
+
+def _stale_convert(monkeypatch, **forced):
+    real = app_module.convert_db_to_dictlist
+
+    def stale(db):
+        rows = real(db)
+        for row in rows:
+            if row["id"] == "18":
+                row.update(forced)
+        return rows
+    monkeypatch.setattr(app_module, "convert_db_to_dictlist", stale)
+
+
+def test_real_planted_start_bug_is_flagged(client, monkeypatch, records_path):
+    _stale_convert(monkeypatch, is_reserved=False)        # start "succeeds" but writes it free
+    assert client.get("/reservation/start?id=18").status_code == 200
+    found = rq.anomalies(rq.read_records(records_path))
+    assert {a["type"] for a in found} == {"start_left_free", "write_not_persisted"}
+
+
+def test_real_planted_end_location_bug_is_flagged(client, monkeypatch, records_path):
+    client.get("/reservation/start?id=18")
+    _stale_convert(monkeypatch, lat=23.0, lng=19.0)        # freed, but the move isn't written
+    assert client.get("/reservation/end?id=18&lat=23.01&lng=19.01").status_code == 200
+    found = rq.anomalies(rq.read_records(records_path))
+    assert {a["type"] for a in found} == {"end_location_not_persisted", "write_not_persisted"}
+
+
+_LOCATION_LINE = "\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng\n"
+
+
+def test_real_planted_bug_that_never_moves_the_scooter_is_flagged(tmp_path, db_path, records_path):
+    # A bug the in-memory comparison can't see: the code itself forgets to move the scooter,
+    # so scooter_after == scooter_in_memory. Only the requested-vs-persisted rule flags it.
+    src = (REPO / "app.py").read_text()
+    assert src.count(_LOCATION_LINE) == 1, "end_reservation changed shape; update this test"
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "app.py").write_text(src.replace(_LOCATION_LINE, ""))
+    for name in ("records.py", "failures.py"):
+        (planted / name).write_text((REPO / name).read_text())
+    script = ("import sys; sys.path.insert(0, sys.argv[1]); import app; c = app.app.test_client(); "
+              "c.get('/reservation/start?id=18'); print(c.get('/reservation/end?id=18&lat=23.01&lng=19.01').status_code)")
+    env = dict(os.environ, SCOOTER_DB_PATH=str(db_path), SCOOTER_RECORDS_PATH=str(records_path), PYTHONDONTWRITEBYTECODE="1")
+    out = subprocess.run([sys.executable, "-c", script, str(planted)], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "200"
+    found = rq.anomalies(rq.read_records(records_path))
+    assert [a["type"] for a in found] == ["end_location_not_persisted"]
+
+
+def test_start_rule_only_applies_to_successful_starts():
+    # A failed start that leaves the scooter free (e.g. refused before writing) is fine.
+    failed = rec("x", 1, path="/reservation/start", scooter="18", status=500, kind="internal_error",
+                 scooter_before=FREE, scooter_after=FREE, scooter_in_memory=FREE)
+    assert rq.anomalies([failed]) == []
