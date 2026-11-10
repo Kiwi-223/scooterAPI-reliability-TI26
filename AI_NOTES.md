@@ -513,3 +513,41 @@ strongest entries.
   `_guard_real_ledger` guard. AGENTS.md lists them. Lesson: whenever a change adds a new
   file the app writes, add the per-test redirect and the guard **before** the first test
   run, the way `records_path` and `_guard_real_records` were.
+
+### 27. "A different end location gives `payment_conflict`" was claimed, but the code matched on the amount
+- **Where:** PR #16 (PLAN PR 13): its description, AGENTS.md "Payments & fault
+  injection", and `payments._matches`.
+- **What the AI claimed:** a restored ride ended "the same way" settles with the original
+  charge, and "ending it a different way (e.g. another end location, so another amount)
+  is `payment_conflict`". The docs and the PR body presented this as how the code behaves.
+- **Reality:** the match compared (scooter, reservation, amount), and the amount is just
+  the rounded distance ridden. Two different end points at the same distance give the same
+  amount. The reviewer started scooter 18 at (23, 19), took a snapshot, ended at
+  (23.009, 19) (charged 997), restored, and ended at (22.991, 19), about 2 km away. The
+  result was 200 `already_charged` with the first ride's `txn_id`, and the scooter saved at
+  the south point: a different ride, closed for free. The tests only ever moved the end
+  point in ways that also changed the distance, so they couldn't see this.
+- **How it was caught:** the reviewer tried two equidistant end points after a restore.
+- **What changed:** each ledger entry stores `end_lat`/`end_lng`, and ride identity is
+  scooter, reservation, exact end location and amount. A test now covers the reviewer's
+  equidistant pair, and mutations that drop either coordinate (or go back to amount-only)
+  are caught. AGENTS.md, the PR body and PLAN row 13 are corrected. Lesson: when a claim
+  says "X differs, so Y happens", test a case where X differs but the proxy the code
+  actually compares does not.
+
+### 28. The match rule itself came from a review recommendation that used a derived value
+- **Where:** PR #15's review (PLAN PR 12) and the PLAN row 13 text it produced: "a ledger hit
+  … counts as already charged only if it matches the ride (scooter id, reservation id,
+  amount)".
+- **What the AI claimed:** the reviewer agent recommended (scooter, reservation, amount) as
+  the identity of a ride. The writer then implemented it verbatim, as a settled rule.
+- **Reality:** the amount is a value **derived** from the ride (the rounded distance), not
+  part of the ride's identity. Matching on it is what let the free ride in #27 through. The
+  reviewer said so in PR #16's review: end location is what it should have said.
+- **How it was caught:** the same reviewer, testing PR #16 adversarially, with equidistant
+  end points.
+- **What changed:** PLAN row 13 now reads "ride identity = scooter, reservation, end
+  location (and amount)". Lesson for both roles: decide "is this the same transaction?"
+  from the event's identity (who, which reservation, where it ended), never from a value
+  computed from it, and don't carry a review's wording into code without testing its edge
+  cases.

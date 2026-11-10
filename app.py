@@ -285,7 +285,7 @@ def pay(scooter, end_lat, end_lng):
 	if override_note:
 		records.note('payment_fault_override', override_note[0], **override_note[1])
 	payment_response = payments.charge(reservation['idempotency_key'], scooter.id, reservation['reservation_id'],
-		cost, request_id=records.current_request_id(), override=override)
+		cost, end_lat=end_lat, end_lng=end_lng, request_id=records.current_request_id(), override=override)
 	records.note('payment', 'ok' if payment_response.ok else 'failed', **payment_response.record_detail())
 	return payment_response
 

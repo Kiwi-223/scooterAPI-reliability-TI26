@@ -44,7 +44,7 @@ def test_success_ends_the_ride_with_a_string_txn_id(client, read_db, read_ledger
     [entry] = read_ledger()
     assert (entry["idempotency_key"], entry["outcome"], entry["charged"], entry["txn_id"], entry["attempt"]) == \
         (key, "success", True, body["txn_id"], 1)
-    assert (entry["scooter_id"], entry["reservation_id"], entry["amount"]) == ("18", key, entry["amount"])
+    assert (entry["scooter_id"], entry["reservation_id"], entry["end_lat"], entry["end_lng"]) == ("18", key, 1.0, 1.0)
     assert entry["amount"] == payment_decisions(read_records()[-1])[0]["detail"]["cost"] > 0
     assert entry["request_id"] == read_records()[-1]["request_id"]
 
@@ -94,9 +94,11 @@ def test_a_retry_after_an_uncharged_failure_is_a_new_attempt(client, monkeypatch
 
 @pytest.mark.parametrize("change", [
     {"amount": 101}, {"scooter_id": "15"}, {"reservation_id": "other"},
+    {"end_lat": 1.5000001}, {"end_lng": -2.0},                       # same everything, another place
 ])
 def test_a_ledger_hit_for_another_ride_is_a_conflict_never_a_charge(change):
-    ride = {"idempotency_key": "k1", "scooter_id": "18", "reservation_id": "r1", "amount": 100}
+    ride = {"idempotency_key": "k1", "scooter_id": "18", "reservation_id": "r1", "amount": 100,
+            "end_lat": 1.5, "end_lng": 2.0}
     first = payments.charge(**ride)
     assert first.outcome == "success" and first.charged
     other = payments.charge(**dict(ride, **change))
@@ -118,9 +120,38 @@ def test_conflict_through_the_api_leaves_the_ride_open(client, monkeypatch, read
     assert sum(e["charged"] for e in read_ledger()) == 1
 
 
+def test_an_equidistant_end_after_a_restore_is_a_conflict_not_a_free_ride(client, db_path, read_db, read_ledger):
+    # PR #16's review: scooter 18 starts at (23, 19). North (23.009, 19) and south
+    # (22.991, 19) are ~2 km apart but the same distance away, so the same amount. Matching
+    # on the amount alone closed the second, different ride with the first ride's charge.
+    key = start_18(client)
+    snapshot = db_path.read_bytes()
+    north = client.get("/reservation/end?id=18&lat=23.009&lng=19")
+    assert north.status_code == 200
+    db_path.write_bytes(snapshot)                                     # the restore
+    assert_envelope(client.get("/reservation/end?id=18&lat=22.991&lng=19"), FailureKind.PAYMENT_CONFLICT)
+    assert read_db()["18"]["reservation"]["idempotency_key"] == key   # still open, not moved south
+    charged, conflict = read_ledger()
+    assert charged["amount"] == conflict["amount"] > 0                # the amounts really are equal
+    assert (charged["end_lat"], conflict["end_lat"]) == (23.009, 22.991)
+    assert conflict["existing_charge"]["txn_id"] == north.get_json()["txn_id"] and not conflict["charged"]
+    # and the genuine retry of the north ride still settles with its own charge
+    again = client.get("/reservation/end?id=18&lat=23.009&lng=19")
+    assert again.status_code == 200 and again.get_json()["txn_id"] == north.get_json()["txn_id"]
+
+
+@pytest.mark.parametrize("lat,lng", [("+23.009", "19.0"), ("23.0090", " 19 ")])
+def test_the_end_location_is_compared_as_the_app_parses_it(client, db_path, lat, lng):
+    start_18(client)
+    snapshot = db_path.read_bytes()
+    txn = client.get("/reservation/end?id=18&lat=23.009&lng=19").get_json()["txn_id"]
+    db_path.write_bytes(snapshot)
+    assert client.get(f"/reservation/end?id=18&lat={lat}&lng={lng}").get_json()["txn_id"] == txn
+
+
 def test_other_keys_are_independent():
-    a = payments.charge("ka", "18", "ra", 5)
-    b = payments.charge("kb", "18", "rb", 5)
+    a = payments.charge("ka", "18", "ra", 5, end_lat=1.0, end_lng=2.0)
+    b = payments.charge("kb", "18", "rb", 5, end_lat=1.0, end_lng=2.0)
     assert a.charged and b.charged and a.txn_id != b.txn_id and (a.attempt, b.attempt) == (1, 1)
 
 
@@ -134,7 +165,7 @@ sync_dir, me = sys.argv[2], sys.argv[3]
 open(os.path.join(sync_dir, "ready-" + me), "w").close()
 while not os.path.exists(os.path.join(sync_dir, "go")):
     time.sleep(0.0005)
-r = payments.charge("shared-key", "18", "r1", 100, request_id="p" + me)
+r = payments.charge("shared-key", "18", "r1", 100, end_lat=1.0, end_lng=2.0, request_id="p" + me)
 print(json.dumps({"outcome": r.outcome, "txn_id": r.txn_id, "charged": r.charged}))
 """
 
@@ -169,12 +200,12 @@ def test_concurrent_charges_for_one_key_charge_exactly_once(tmp_path, read_ledge
 def test_the_ledger_survives_a_restart(read_ledger):
     # A charge made by another process (a previous server run) is found by this one.
     script = ("import sys; sys.path.insert(0, sys.argv[1]); import payments; "
-              "print(payments.charge('k-restart', '18', 'r1', 7).txn_id)")
+              "print(payments.charge('k-restart', '18', 'r1', 7, end_lat=1.0, end_lng=2.0).txn_id)")
     out = subprocess.run([sys.executable, "-c", script, str(REPO)], env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"),
                          capture_output=True, text=True, check=True)
     earlier = out.stdout.strip()
     assert HEX32.fullmatch(earlier)
-    now = payments.charge("k-restart", "18", "r1", 7)
+    now = payments.charge("k-restart", "18", "r1", 7, end_lat=1.0, end_lng=2.0)
     assert (now.outcome, now.txn_id, now.attempt) == ("already_charged", earlier, 2)
 
 
@@ -313,15 +344,15 @@ def test_an_unreadable_ledger_fails_closed(client, ledger_path, read_db):
 def test_timeouts_wait_only_the_configured_short_delay(monkeypatch):
     monkeypatch.setenv("PAYMENT_FAULT", "timeout_not_charged")
     t0 = time.perf_counter()
-    payments.charge("k1", "18", "r", 1)
+    payments.charge("k1", "18", "r", 1, end_lat=1.0, end_lng=2.0)
     assert time.perf_counter() - t0 < 1                               # default: 20 ms, never a real wait
     monkeypatch.setenv("PAYMENT_TIMEOUT_DELAY_MS", "150")
     t0 = time.perf_counter()
-    payments.charge("k2", "18", "r", 1)
+    payments.charge("k2", "18", "r", 1, end_lat=1.0, end_lng=2.0)
     assert time.perf_counter() - t0 >= 0.15
     monkeypatch.setenv("PAYMENT_FAULT", "decline")                    # only timeouts wait
     t0 = time.perf_counter()
-    payments.charge("k3", "18", "r", 1)
+    payments.charge("k3", "18", "r", 1, end_lat=1.0, end_lng=2.0)
     assert time.perf_counter() - t0 < 0.15
 
 
@@ -334,7 +365,7 @@ def test_cli_draw_replays_a_record(capsys):
 
 
 def test_cli_lookup(capsys):
-    payments.charge("k-cli", "18", "r", 3)
+    payments.charge("k-cli", "18", "r", 3, end_lat=1.0, end_lng=2.0)
     assert payments.main(["lookup", "k-cli"]) == 0
     assert json.loads(capsys.readouterr().out)["charged"] is True
     assert payments.main(["lookup", "nope"]) == 1
@@ -344,3 +375,53 @@ def test_cli_runs_as_a_module():
     out = subprocess.run([sys.executable, "-m", "payments", "draw", "--seed", "1", "--key", "k", "--attempt", "1"],
                          cwd=REPO, capture_output=True, text=True, env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
     assert out.returncode == 0 and json.loads(out.stdout)["outcome"] in payments.OUTCOMES
+
+
+# ---- verify: the unreadable-ledger runbook's first step ---------------------------------------
+
+def _ledger_with_one_charge(ledger_path):
+    payments.charge("k-ok", "18", "r", 3, end_lat=1.0, end_lng=2.0)
+    return ledger_path.read_text()
+
+
+def test_verify_a_good_ledger(ledger_path, capsys):
+    _ledger_with_one_charge(ledger_path)
+    assert payments.main(["verify"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report == {"path": str(ledger_path), "exists": True, "entries": 1, "ok": True, "problem": None}
+
+
+def test_verify_a_missing_ledger_is_fine(ledger_path, capsys):
+    assert payments.main(["verify"]) == 0
+    assert json.loads(capsys.readouterr().out)["exists"] is False
+
+
+def test_verify_finds_an_interrupted_append(ledger_path, capsys):
+    good = _ledger_with_one_charge(ledger_path)
+    ledger_path.write_text(good + '{"ts": "2026-11-10T00:00:00.000Z", "idempotency_key": "k-cut", "att')
+    assert payments.main(["verify"]) == 1
+    out = capsys.readouterr()
+    assert json.loads(out.out)["problem"] == {"line": 2, "reason": "not valid JSON", "last_line": True,
+                                              "missing_newline": True, "interrupted_append": True}
+    assert "line 2" in out.err and "interrupted append" in out.err
+    # the documented repair: keep the good lines, drop the partial one -> verify passes again
+    ledger_path.write_text(good)
+    assert payments.main(["verify"]) == 0
+
+
+@pytest.mark.parametrize("bad", ["{not json}\n", "[1, 2]\n", '{"no_key": 1}\n'])
+def test_verify_flags_a_bad_line_in_the_middle_as_not_repairable_by_hand(ledger_path, capsys, bad):
+    good = _ledger_with_one_charge(ledger_path)
+    ledger_path.write_text(bad + good)
+    assert payments.main(["verify"]) == 1
+    out = capsys.readouterr()
+    problem = json.loads(out.out)["problem"]
+    assert (problem["line"], problem["interrupted_append"]) == (1, False)
+    assert "escalate" in out.err
+
+
+def test_verify_runs_through_make(ledger_path):
+    _ledger_with_one_charge(ledger_path)
+    out = subprocess.run(["make", "-s", "payments", "ARGS=verify"], cwd=REPO, capture_output=True, text=True,
+                         env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+    assert out.returncode == 0 and json.loads(out.stdout)["entries"] == 1

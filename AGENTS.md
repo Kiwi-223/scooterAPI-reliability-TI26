@@ -349,10 +349,10 @@ every pull request and on every push to `master`.
   `idempotency_key`, legacy (`legacy-33` returns on every `git restore`) or uuid. Ending
   it again uses that key a second time.
   - **Since PLAN PR 13 the ledger decides** (see "Payments & fault injection"): ending it
-    the same way again (same scooter, reservation and amount) returns the **original**
-    charge's `txn_id` and ends the ride, with no second charge. Ending it differently (e.g.
-    another end location, so another amount) is `payment_conflict` (409): nothing is
-    charged and the ride stays open. Never a free ride, never a double charge
+    the same way again (same scooter, reservation, **end location** and amount) returns
+    the **original** charge's `txn_id` and ends the ride, with no second charge. Ending it
+    anywhere else, even at the same distance (so the same amount), is `payment_conflict`
+    (409): nothing is charged and the ride stays open. Never a free ride, never a double charge
     (`test_a_restored_reservation_is_not_charged_twice_or_ridden_free`).
 - **Request records** show the same full form (`reservation` and unknown fields) in
   `scooter_before`, `scooter_after` and `scooter_in_memory`. A legacy reserved scooter's
@@ -375,7 +375,7 @@ replayed on demand (ACTIVITY Outcome 3).
 | Outcome | Money taken? | API answer | Ride |
 |---|---|---|---|
 | `success` | yes | 200 + `txn_id` (32 hex chars, a string) | ended |
-| `already_charged` | no (found the key's earlier charge, same scooter/reservation/amount) | 200 + **that** charge's `txn_id` | ended |
+| `already_charged` | no (found the key's earlier charge for the same ride: scooter, reservation, end location, amount) | 200 + **that** charge's `txn_id` | ended |
 | `decline` | no | 422 `payment_declined` | open |
 | `timeout_not_charged` | no | 504 `payment_timeout` | open |
 | `timeout_charged` | **yes** (the caller isn't told) | 504 `payment_timeout` | open |
@@ -391,24 +391,56 @@ without the DB lock.
 - **At most one charge per idempotency key.** Check-then-append happens under the lock, so
   workers and processes racing on one key produce exactly one charge (tested with 8
   processes).
-- **Ride matching.** A key that already has a charge returns `already_charged` only if the
-  scooter id, reservation id and amount all match that charge; otherwise `conflict`.
+- **Ride matching.** A key that already has a charge returns `already_charged` only if it's
+  the **same ride**: scooter id, reservation id, **end location** (`end_lat`/`end_lng`,
+  exactly, as the app parsed them, so `+23.009` equals `23.009`) and amount all match that
+  charge. Otherwise `conflict`. The amount alone isn't enough: it's the rounded distance,
+  so two end points ~2 km apart at the same distance would have looked like one ride
+  (PR #16's review; AI_NOTES #27).
   `already_charged`/`conflict` win over any forced fault: the gateway knows it was paid.
 - **Attempt numbers** are counted from the ledger (1 + earlier entries for the key), so
   they're the same whichever worker serves the retry.
 - **Fails closed.** If any line can't be parsed, the gateway can't know whether a key was
-  charged, so it answers `error` (502) without charging or appending. Fix or move the
-  ledger to recover.
+  charged, so it answers `error` (502) without charging or appending, for **every** end,
+  until the ledger is repaired. See "Unreadable ledger" below.
 - Each entry: `ts`, `idempotency_key`, `attempt`, `outcome`, `charged`, `txn_id` (when
-  charged), `scooter_id`, `reservation_id`, `amount`, `request_id` (the end request's
+  charged), `scooter_id`, `reservation_id`, `end_lat`, `end_lng`, `amount`, `request_id` (the end request's
   `X-Request-ID`), `fault`, `existing_charge` (for `already_charged`/`conflict`), `pid`.
 
 **Why a restored DB doesn't charge twice (and doesn't ride free).** A restored snapshot
 replays reservations with their idempotency keys (see Database schema). A restored
 reservation is the **same ride**: keys are per reservation, and nobody else can be riding
-under it. So ending it the same way returns the original charge: the rider paid once, for
-that ride. Ending it a different way is a conflict to surface, not to guess at. This is
-PLAN row 13's rule, applied literally.
+under it. So ending it **at the same place** returns the original charge: the rider paid
+once, for that ride. Ending it anywhere else is a different ride, a conflict to surface,
+not to guess at (`test_an_equidistant_end_after_a_restore_is_a_conflict_not_a_free_ride`).
+This is PLAN row 13's rule: ride identity = scooter, reservation, end location (and
+amount).
+
+**Unreadable ledger (runbook).** Symptom: every end returns `502 payment_failed`, and the
+records' payment `fault` is `{"source": "ledger", "reason": "ledger_unreadable",
+"problem": "line N is …"}`. The usual cause is a process killed mid-append, which leaves a
+partial last line.
+
+```sh
+make payments ARGS="verify"     # readable: exit 0. Not: exit 1 (make shows "Error 1"), the first
+                                # bad line as JSON on stdout, and on stderr whether it's an
+                                # interrupted append
+```
+
+1. **Stop every server** that uses this ledger, so nothing appends while you repair it.
+2. **Back it up first:** `cp data/payments_ledger.jsonl data/payments_ledger.jsonl.bak-$(date +%s)`.
+3. If `verify` says `"interrupted_append": true` (the bad line is the **last** line and
+   has **no** trailing newline): that call died before it returned, so the app never got
+   an answer and didn't end the ride. Remove only that line:
+   `head -n <line-1> data/payments_ledger.jsonl > data/payments_ledger.jsonl.fixed && mv data/payments_ledger.jsonl.fixed data/payments_ledger.jsonl`
+   (`<line-1>` is one less than the reported line). Run `verify` again and expect exit 0.
+   A retry of that ride is then a normal new attempt.
+4. If it's **anything else** (a bad line in the middle, or a complete but malformed line):
+   don't edit by hand. Keep the backup and escalate to a human. Charges after that line
+   may depend on it.
+5. **Never** delete, empty or replace the ledger with an older copy, and never edit or
+   remove a line with `"charged": true`. The ledger is the only record of which keys were
+   charged. Without it, every restored or retried ride would be charged again.
 
 **Choosing faults**, in order of precedence:
 1. The ledger (`already_charged` / `conflict`), as above.
@@ -453,6 +485,7 @@ PAYMENT_FAULT=random PAYMENT_SEED=42 PAYMENT_FAULT_RATE=0.7 make run
 make records ARGS="--file $S/records.jsonl scooter 33"     # each request's payment=<outcome>
 make payments ARGS="lookup legacy-33"                      # the ledger entries for a key (uses the export)
 make payments ARGS="draw --seed 42 --key legacy-33 --attempt 1 --rate 0.7"   # replay one draw
+make payments ARGS="verify"                                # is the ledger readable?
 ```
 
 - **Replaying a seeded failure exactly:** take `seed`, `idempotency_key`, `attempt` and
@@ -466,7 +499,7 @@ make payments ARGS="draw --seed 42 --key legacy-33 --attempt 1 --rate 0.7"   # r
 - **Full reset of local state:** `git restore scooter_db.json`, and move
   `data/payments_ledger.jsonl` aside. Otherwise restored reservations find their old
   charges (that's intended; see above).
-- **Code:** `payments.py` (`charge`, `draw`, `header_override`, `lookup`, `main`), and
+- **Code:** `payments.py` (`charge`, `draw`, `header_override`, `lookup`, `verify`, `main`), and
   `pay` / `PAYMENT_FAILURES` in `app.py`. Tests: `tests/test_payments.py`.
 
 ## Repo map
@@ -474,7 +507,7 @@ make payments ARGS="draw --seed 42 --key legacy-33 --attempt 1 --rate 0.7"   # r
 | Path | What it is |
 |---|---|
 | `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay` (calls `payments.charge`), `PAYMENT_FAILURES` (outcome → kind), `calculate_cost`, `db_transaction` (lock + read for mutating requests), `init_db`, `find_db_shape_problem` / `find_reservation_problem` (DB validation), `load_reservation` / `legacy_reservation` / `new_reservation` (see Database schema), `write_db` (atomic replace, refuses invalid state), `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
-| `payments.py` | The simulated payment gateway: `charge`, the ledger, the seeded `draw`, the `X-Payment-Fault` gating, and a CLI (`make payments ARGS=…`, `python -m payments`). See Payments & fault injection. |
+| `payments.py` | The simulated payment gateway: `charge`, the ledger, the seeded `draw`, the `X-Payment-Fault` gating, and a CLI (`make payments ARGS="lookup|draw|verify …"`, `python -m payments`). See Payments & fault injection. |
 | `failures.py` | The failure-kind registry (`FailureKind`), `StorageError` and `StorageBusy` (see Failure kinds). |
 | `records.py` | Request records: request ids, one JSON line per request (see Request records). |
 | `records_query.py` | Records query functions and CLI (`make records ARGS=…`, `python -m records_query`). |
@@ -507,9 +540,10 @@ ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
   decline ends the ride with an outstanding balance. That, `payment_pending` and retries
   are PLAN PR 14; reconcile is PR 15.
 - After `timeout_charged` the rider **has been charged** but the ride is still open. A
-  retry with the same end location settles it with that charge (`already_charged`, 200).
-  A retry from a different location asks for a different amount, so it's
-  `payment_conflict` until PR 14 stores the amount at the first attempt.
+  retry with exactly the same end location settles it with that charge
+  (`already_charged`, 200). A retry from **any** other location (even GPS jitter) is
+  `payment_conflict`, and the charged ride stays open until PR 14 stores the end location
+  and amount with `payment_pending` at the first attempt and reuses them on retries.
 - `lat`/`lng`/`radius` are parsed with Python's lenient `float()`, so `+5`, `1_000`,
   surrounding whitespace and Unicode digits (e.g. `٥`) are all accepted as numbers.
 - With an unwritable DB, `/reservation/end` charges the gateway first and only then fails
@@ -795,7 +829,7 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `payment_failed` | 502 | The payment gateway reported an **error** (outcome `error`), or its ledger is unreadable (it fails closed: no charge). The ride is **not** ended and the scooter stays reserved. Since PLAN PR 13 the msg is always `Error 502 - Payment failed; the reservation was not ended.` and the status always 502: the old pass-through of a gateway's own `msg`/`code` went away with the dummy gateway. |
 | `payment_declined` | 422 | The gateway declined the payment. The ride is **not** ended (PLAN PR 14 applies H3: end the ride with an outstanding balance). |
 | `payment_timeout` | 504 | The gateway timed out (`timeout_not_charged` or `timeout_charged`; the client can't tell which, the record's `simulator.charged` can). The ride is **not** ended. A retry is charged at most once. |
-| `payment_conflict` | 409 | The reservation's idempotency key already has a charge, but for a different ride (scooter, reservation or amount differ), e.g. a retry from another end location, or a restored DB ended elsewhere. Nothing is charged and the ride is **not** ended: never a free ride. The record's `existing_charge` shows the earlier charge. |
+| `payment_conflict` | 409 | The reservation's idempotency key already has a charge, but for a different ride (scooter, reservation, end location or amount differ), e.g. a retry from another end location, or a restored DB ended elsewhere, even at the same distance. Nothing is charged and the ride is **not** ended: never a free ride. The record's `existing_charge` shows the earlier charge. |
 | `route_not_found` | 404 | No endpoint at that path. |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
 | `storage_busy` | 503 | A mutating request (`/reservation/*`) couldn't get the DB lock within `SCOOTER_DB_LOCK_TIMEOUT` (default 5 s), because another request held it. **Nothing was read or written**, so it's safe to retry; the response has `Retry-After: 1`. The record has a `db_lock: timeout` decision with `wait_ms`. A separate kind from `storage_error` because it's transient and retryable, and agents counting failures should see "contention" apart from "broken DB". |

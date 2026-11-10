@@ -9,8 +9,10 @@ and lines are appended under an exclusive `fcntl.flock`, so:
 
 - **At most one charge per idempotency key.** Under the lock, a key that already has a
   charge is never charged again. A hit counts as "already charged" (the old `txn_id` is
-  returned) only if it matches the ride: same scooter id, reservation id and amount.
-  Anything else is a `conflict`, never a free ride and never a second charge.
+  returned) only if it is the same ride: same scooter id, reservation id, end location
+  (exact, as the app parsed it) and amount. Anything else is a `conflict`, never a free
+  ride and never a second charge. (The amount alone is a rounded distance, so two
+  different end points at the same distance would look alike: PR #16's review.)
 - **Attempt numbers** are counted from the ledger (1 + earlier lines for the key), so they
   don't depend on which worker served the request.
 
@@ -26,6 +28,7 @@ precedence, by:
 
 Every result says where its outcome came from (`fault`), with the draw's inputs, so a
 failure can be replayed exactly: `python -m payments draw --seed S --key K --attempt N`.
+`python -m payments verify` checks that the ledger is readable (AGENTS.md has the runbook).
 AGENTS.md "Payments & fault injection" has the recipes.
 """
 import argparse
@@ -152,30 +155,61 @@ def _now_iso():
     return datetime.datetime.now(datetime.UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def _read_entries(path):
-    """Every ledger entry -> (entries, problem). Any unparseable line is a problem: the gateway
-    then can't tell whether a key was charged, so it refuses to charge (fails closed)."""
+def _scan(path):
+    """Read the ledger -> (entries, problem). problem is None, or a dict describing the first
+    bad line: {"line": n, "reason": ..., "last_line": bool, "missing_newline": bool}."""
     entries = []
     try:
         with open(path, "r", encoding="utf-8") as ledger:
-            for n, line in enumerate(ledger, 1):
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    return entries, f"line {n} is not valid JSON"
-                if not isinstance(entry, dict) or not isinstance(entry.get("idempotency_key"), str):
-                    return entries, f"line {n} is not a ledger entry"
-                entries.append(entry)
+            lines = ledger.readlines()
     except FileNotFoundError:
-        pass
+        return entries, None
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        reason = None
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            reason = "not valid JSON"
+        else:
+            if not isinstance(entry, dict) or not isinstance(entry.get("idempotency_key"), str):
+                reason = "not a ledger entry"
+        if reason:
+            return entries, {"line": n, "reason": reason, "last_line": n == len(lines),
+                             "missing_newline": not line.endswith("\n")}
+        entries.append(entry)
     return entries, None
 
 
-def _matches(entry, scooter_id, reservation_id, amount):
-    return (entry.get("scooter_id"), entry.get("reservation_id"), entry.get("amount")) == \
-        (scooter_id, reservation_id, amount)
+def _read_entries(path):
+    """Every ledger entry -> (entries, problem). Any unreadable line is a problem: the gateway
+    then can't tell whether a key was charged, so it refuses to charge (fails closed)."""
+    entries, problem = _scan(path)
+    return entries, (f"line {problem['line']} is {problem['reason']}" if problem else None)
+
+
+def verify(path=None):
+    """Check the whole ledger -> {"path", "entries", "ok", "problem"}. See AGENTS.md's runbook."""
+    path = path or ledger_path()
+    entries, problem = _scan(path)
+    if problem:
+        problem = dict(problem, interrupted_append=problem["last_line"] and problem["missing_newline"])
+    return {"path": path, "exists": os.path.exists(path), "entries": len(entries), "ok": problem is None,
+            "problem": problem}
+
+
+def _ride(scooter_id, reservation_id, end_lat, end_lng, amount):
+    """A ride's identity: which scooter, which reservation, where it ended, and the amount.
+    The end location is compared exactly (floats as the app parsed them): the amount is only
+    a rounded distance, so it can't tell two end points at the same distance apart."""
+    return (scooter_id, reservation_id, end_lat, end_lng, amount)
+
+
+def _matches(entry, scooter_id, reservation_id, end_lat, end_lng, amount):
+    # An entry written without end coordinates (none should exist) never matches: conflict.
+    return _ride(entry.get("scooter_id"), entry.get("reservation_id"), entry.get("end_lat"),
+                 entry.get("end_lng"), entry.get("amount")) == _ride(scooter_id, reservation_id, end_lat, end_lng, amount)
 
 
 @dataclass(frozen=True)
@@ -200,11 +234,16 @@ class ChargeResult:
                 **self.detail}
 
 
-def charge(idempotency_key, scooter_id, reservation_id, amount, request_id=None, override=None):
+def charge(idempotency_key, scooter_id, reservation_id, amount, *, end_lat, end_lng, request_id=None, override=None):
     """Charge `amount` for one ride, at most once per idempotency key. -> ChargeResult.
 
+    The ride is (scooter_id, reservation_id, end_lat, end_lng, amount); see _ride.
     `override` is an already-gated header mode (see header_override). Raises
     PaymentConfigError for an invalid PAYMENT_* setting (before anything is appended).
+
+    Cost: every call re-reads the whole ledger under its lock (and, from the app, inside the
+    DB lock), so a payment is O(ledger size). Fine for a simulator; PLAN PR 15's reconcile
+    loop calls this once per stuck ride, so it may want an index by key if the ledger grows.
     """
     path = ledger_path()
     directory = os.path.dirname(path)
@@ -225,8 +264,10 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, request_id=None,
         if earlier is not None:
             existing = {"txn_id": earlier.get("txn_id"), "attempt": earlier.get("attempt"),
                         "scooter_id": earlier.get("scooter_id"), "reservation_id": earlier.get("reservation_id"),
+                        "end_lat": earlier.get("end_lat"), "end_lng": earlier.get("end_lng"),
                         "amount": earlier.get("amount"), "request_id": earlier.get("request_id")}
-            outcome = "already_charged" if _matches(earlier, scooter_id, reservation_id, amount) else "conflict"
+            same_ride = _matches(earlier, scooter_id, reservation_id, end_lat, end_lng, amount)
+            outcome = "already_charged" if same_ride else "conflict"
             fault = {"source": "ledger"}
             detail = {"existing_charge": existing}
         elif override is not None:
@@ -237,7 +278,8 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, request_id=None,
         ledger_txn_id = uuid.uuid4().hex if charged else (earlier.get("txn_id") if earlier is not None else None)
         entry = {"ts": _now_iso(), "idempotency_key": idempotency_key, "attempt": attempt, "outcome": outcome,
                  "charged": charged, "txn_id": ledger_txn_id if charged else None, "scooter_id": scooter_id,
-                 "reservation_id": reservation_id, "amount": amount, "request_id": request_id,
+                 "reservation_id": reservation_id, "end_lat": end_lat, "end_lng": end_lng, "amount": amount,
+                 "request_id": request_id,
                  "fault": fault, "existing_charge": detail.get("existing_charge"), "pid": os.getpid()}
         delay = _timeout_delay_s() if outcome in TIMEOUTS else 0.0
         line = (json.dumps(entry, ensure_ascii=True, default=str) + "\n").encode("utf-8")
@@ -273,7 +315,24 @@ def main(argv=None):
     p = sub.add_parser("lookup", help="every ledger entry for an idempotency key")
     p.add_argument("key")
     p.add_argument("--file", help=f"ledger path (default: $SCOOTER_PAYMENTS_LEDGER_PATH or {DEFAULT_LEDGER_PATH})")
+    p = sub.add_parser("verify", help="check every ledger line; report the first bad one (exit 1)")
+    p.add_argument("--file", help=f"ledger path (default: $SCOOTER_PAYMENTS_LEDGER_PATH or {DEFAULT_LEDGER_PATH})")
     args = parser.parse_args(argv)
+    if args.command == "verify":
+        try:
+            report = verify(args.file)
+        except OSError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(report))
+        if not report["ok"]:
+            p = report["problem"]
+            kind = ("an interrupted append (the last line, with no newline)" if p["interrupted_append"]
+                    else "NOT just an interrupted append: do not repair by hand, escalate")
+            print(f"ledger unreadable at line {p['line']} ({p['reason']}): {kind}. "
+                  "See AGENTS.md 'Payments & fault injection' -> 'Unreadable ledger'.", file=sys.stderr)
+            return 1
+        return 0
     if args.command == "draw":
         outcome, u = draw(args.seed, args.key, args.attempt, args.rate)
         print(json.dumps({"outcome": outcome, "draw": round(u, 6), "seed": args.seed, "idempotency_key": args.key,
