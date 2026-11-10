@@ -49,10 +49,9 @@ def rides(d):
     d.expect_available("18", False, "a reserved scooter isn't listed")
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "end the ride on 18 (paid)")
     d.expect_available("18", True, "after its ride ended, 18 is listed again (the ACTIVITY symptom)")
-    d.expect_db("18", lambda s: s["is_reserved"] is False and s.get("reservation") is None
-                and (s["lat"], s["lng"]) == (23.01, 19.01), "18 is free at (23.01, 19.01) in the DB")
+    d.expect_db("18", "18 is free at (23.01, 19.01) in the DB", reserved=False, state=None, at=(23.01, 19.01))
     d.req("/search?lat=23&lng=19&radius=5000", 200, "search near 18",
-          check=lambda b: "18" in [s["id"] for s in b], check_why="the search finds 18")
+          check=lambda b: "18" in [s["id"] for s in b], check_why="the search finds 18", got=found_ids)
     d.req("/reservation/start?id=15", 200, "start a ride on 15")
     d.req("/reservation/end?id=15&lat=0.01&lng=-129.01", 200, "end the ride on 15")
     d.expect_available("15", True, "15 is listed again")
@@ -75,8 +74,7 @@ def errors(d):
     d.req("/reservation/start?id=18", 200, "start 18")
     d.req("/reservation/end?id=18&lat=91&lng=19", (422, "invalid_coordinate"), "end with lat out of range")
     d.req("/reservation/end?id=18&lat=23&lng=x", (422, "invalid_number"), "end with non-numeric lng")
-    d.expect_db("18", lambda s: s["is_reserved"] and s["reservation"]["payment_state"] == "active",
-                "a refused end leaves 18's ride active")
+    d.expect_db("18", "a refused end leaves 18's ride active", reserved=True, state="active")
     d.req("/reservation/end?id=18&lat=23&lng=19.5", 200, "a valid end still works")
     d.req("/nope", (404, "route_not_found"), "unknown path")
     d.req("/view_all_available", (405, "method_not_allowed"), "wrong method", method="POST")
@@ -91,20 +89,18 @@ def payment_faults(d):
     for sid, fault, expected in FAULT_CASES:
         d.req(f"/reservation/start?id={sid}", 200, f"start {sid}")
         d.req(f"/reservation/end?id={sid}&lat=1&lng=1", expected, f"end {sid} with {fault}", fault=fault)
-    d.expect_db("18", lambda s: not s["is_reserved"] and len(open_balances(s)) == 1,
-                "a decline ends the ride with an outstanding balance (H3)")
+    d.expect_db("18", "a decline ends the ride with an outstanding balance (H3)", reserved=False,
+                balances=["payment_declined"])
     for sid in ("15", "9", "14"):
-        d.expect_db(sid, lambda s: s["is_reserved"] and s["reservation"]["payment_state"] == "payment_pending",
-                    f"{sid}'s ride is payment_pending after a timeout or error")
+        d.expect_db(sid, f"{sid}'s ride is payment_pending after a timeout or error", reserved=True,
+                    state="payment_pending")
         d.expect_available(sid, False, f"{sid} isn't listed while its payment is pending")
         d.expect_found(sid, False, f"{sid} isn't found by search while its payment is pending")
         d.req(f"/reservation/start?id={sid}", (422, "scooter_payment_pending"), f"{sid} can't be started while pending")
     for sid in ("15", "9", "14"):
         d.req(f"/reservation/end?id={sid}&lat=5&lng=5", 200, f"a retry settles {sid} (at the stored location)")
-        d.expect_db(sid, lambda s: not s["is_reserved"] and (s["lat"], s["lng"]) == (1.0, 1.0),
-                    f"{sid} is free at the stored end location (1, 1)")
-    d.expect_ledger(lambda entries: sum(e["charged"] for e in entries) == 3,
-                    "exactly 3 charges: one per paid ride, none for the decline, none twice")
+        d.expect_db(sid, f"{sid} is free at the stored end location (1, 1)", reserved=False, at=(1.0, 1.0))
+    d.expect_ledger("exactly 3 charges: one per paid ride, none for the decline, none twice", charges=3)
 
 
 def retry_settle(d):
@@ -114,12 +110,11 @@ def retry_settle(d):
           fault="timeout_charged")
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "the retry settles with the earlier charge")
     d.expect_available("18", True, "18 is free after the retry")
-    d.expect_ledger(lambda entries: [e["outcome"] for e in entries] == ["timeout_charged", "already_charged"],
-                    "the retry wasn't charged again")
+    d.expect_ledger("the retry wasn't charged again", outcomes=["timeout_charged", "already_charged"])
     d.req("/reservation/start?id=15", 200, "start 15")
     d.req("/reservation/end?id=15&lat=0.01&lng=-129.01", (502, "payment_failed"), "gateway error", fault="error")
     d.req("/reservation/end?id=15&lat=10&lng=10", 200, "retry from elsewhere")
-    d.expect_db("15", lambda s: (s["lat"], s["lng"]) == (0.01, -129.01), "15 ends where it was first asked to")
+    d.expect_db("15", "15 ends where it was first asked to", at=(0.01, -129.01))
 
 
 def decline(d):
@@ -128,8 +123,7 @@ def decline(d):
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", (422, "payment_declined"), "declined", fault="decline",
           check=lambda b: b.get("ride_ended") is True, check_why="the body says the ride ended")
     d.expect_available("18", True, "a declined ride still frees the scooter")
-    d.expect_db("18", lambda s: [b["reason"] for b in open_balances(s)] == ["payment_declined"],
-                "18 owes one payment_declined balance")
+    d.expect_db("18", "18 owes one payment_declined balance", balances=["payment_declined"])
     d.req("/reservation/start?id=18", 200, "18 can be reserved again")
     d.req("/reservation/end?id=18&lat=23&lng=19", 200, "and that ride is paid")
 
@@ -137,11 +131,11 @@ def decline(d):
 def concurrent(d):
     """8 riders race for 18 (one wins), then 4 end it at once (one ends it)."""
     starts = d.concurrent(["/reservation/start?id=18"] * 8, "8 concurrent starts of 18")
-    d.check(sum(s == 200 for s in starts) == 1, "exactly one concurrent start wins", starts)
+    d.check("exactly one concurrent start wins", got=sum(s == 200 for s in starts), want=1, detail=starts)
     ends = d.concurrent(["/reservation/end?id=18&lat=23.01&lng=19.01"] * 4, "4 concurrent ends of 18")
-    d.check(sum(s == 200 for s in ends) == 1, "exactly one concurrent end ends it", ends)
+    d.check("exactly one concurrent end ends it", got=sum(s == 200 for s in ends), want=1, detail=ends)
     d.expect_available("18", True, "18 is free after the races")
-    d.expect_ledger(lambda entries: sum(e["charged"] for e in entries) == 1, "the ride was charged once")
+    d.expect_ledger("the ride was charged once", charges=1)
 
 
 def restore(d):
@@ -154,17 +148,16 @@ def restore(d):
     d.req("/reservation/end?id=18&lat=23.5&lng=19.5", (409, "payment_conflict"),
           "ending the restored ride elsewhere is a conflict, not a second ride",
           check=lambda b: b.get("ride_ended") is False, check_why="the body says the ride didn't end")
-    d.expect_db("18", lambda s: s["is_reserved"] and s["reservation"]["payment_state"] == "active"
-                and "amount" not in s["reservation"], "after a conflict 18's ride is active again, payment fields dropped")
+    d.expect_db("18", "after a conflict 18's ride is active again, payment fields dropped", reserved=True,
+                state="active", amount=None)
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "ending it the same way returns the original charge")
-    d.expect_ledger(lambda entries: sum(e["charged"] for e in entries) == 1, "still one charge: no double charge")
+    d.expect_ledger("still one charge: no double charge", charges=1)
     d.snapshot("before-9")
     d.req("/reservation/start?id=9", 200, "start 9")
     d.req("/reservation/end?id=9&lat=-14.01&lng=-153.01", (422, "payment_declined"), "9 is declined", fault="decline")
     d.restore("before-9", "roll back past 9's ride: its balance is erased (the ledger keeps the decline)")
     d.reconcile("reconcile rebuilds the lost balance from the ledger")
-    d.expect_db("9", lambda s: [b["reason"] for b in open_balances(s)] == ["rebuilt_from_ledger"],
-                "9 owes the rebuilt balance")
+    d.expect_db("9", "9 owes the rebuilt balance", balances=["rebuilt_from_ledger"])
 
 
 def reconcile_stuck(d):
@@ -181,17 +174,15 @@ def reconcile_stuck(d):
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", (502, "payment_failed"), "18's payment fails once", fault="error")
     d.reconcile("reconcile now (N=3 attempts, T=15 min)",
                 expect={"15": "settle_charged", "9": "end_unpaid", "18": "retry"})
-    d.expect_db("15", lambda s: not s["is_reserved"] and not open_balances(s), "15 settled with its charge")
-    d.expect_db("9", lambda s: not s["is_reserved"] and [b["reason"] for b in open_balances(s)] == ["payment_unresolved"],
-                "after 3 failed attempts 9 ended unpaid with a payment_unresolved balance (H3)")
-    d.expect_ledger(lambda entries: sum(e["scooter_id"] == "9" for e in entries) == 3,
-                    "reconcile made no 4th gateway call for 9")
-    d.expect_db("18", lambda s: not s["is_reserved"] and not open_balances(s), "18's retry paid")
+    d.expect_db("15", "15 settled with its charge", reserved=False, balances=[])
+    d.expect_db("9", "after 3 failed attempts 9 ended unpaid with a payment_unresolved balance (H3)",
+                reserved=False, balances=["payment_unresolved"])
+    d.expect_ledger("reconcile made no 4th gateway call for 9", calls_for_9=3)
+    d.expect_db("18", "18's retry paid", reserved=False, balances=[])
     d.req("/reservation/start?id=14", 200, "start 14")
     d.req("/reservation/end?id=14&lat=0.01&lng=0.01", (502, "payment_failed"), "14's payment fails once", fault="error")
     d.reconcile("reconcile an hour later: the age rule (T) ends 14 unpaid", hours_later=1, expect={"14": "end_unpaid"})
-    d.expect_db("14", lambda s: not s["is_reserved"] and [b["reason"] for b in open_balances(s)] == ["payment_unresolved"],
-                "14 ended unpaid by age")
+    d.expect_db("14", "14 ended unpaid by age", reserved=False, balances=["payment_unresolved"])
 
 
 SCENARIOS = {"rides": rides, "errors": errors, "payment-faults": payment_faults, "retry-settle": retry_settle,
@@ -200,6 +191,45 @@ SCENARIOS = {"rides": rides, "errors": errors, "payment-faults": payment_faults,
 
 def open_balances(scooter):
     return [b for b in scooter.get("outstanding_balances") or [] if "settled_by_txn_id" not in b]
+
+
+def found_ids(body):
+    return [s.get("id") for s in body] if isinstance(body, list) else body
+
+
+# What expect_db can check, by name: each step prints "expected <field>=<want>, got <field>=<actual>"
+# for every field that differs, so a failure shows the actual values (PLAN PR 20a: the cold-agent
+# rehearsal got "expected: 18 is free at (23.01, 19.01)" with no hint of where 18 really was).
+DB_FIELDS = {
+    "reserved": lambda s: s["is_reserved"],
+    "state": lambda s: (s.get("reservation") or {}).get("payment_state"),
+    "at": lambda s: (s["lat"], s["lng"]),
+    "balances": lambda s: [b["reason"] for b in open_balances(s)],          # open balances' reasons
+    "amount": lambda s: (s.get("reservation") or {}).get("amount"),          # set only while payment_pending
+}
+LEDGER_FIELDS = {
+    "charges": lambda entries: sum(bool(e.get("charged")) for e in entries),
+    "outcomes": lambda entries: [e.get("outcome") for e in entries],
+    "calls_for_9": lambda entries: sum(e.get("scooter_id") == "9" for e in entries),
+}
+
+
+def _fmt(value):
+    return "(" + ", ".join(map(repr, value)) + ")" if isinstance(value, tuple) else json.dumps(value)
+
+
+def mismatch(fields, actual_of, want):
+    """'expected a=1, got a=2; expected b=x, got b=y' for each differing field, or None."""
+    parts = []
+    for name, wanted in want.items():
+        try:
+            got = fields[name](actual_of)
+            shown = _fmt(got)
+        except Exception as exc:               # the data has an unexpected shape
+            got, shown = object(), f"<{type(exc).__name__}: {exc}>"
+        if got != wanted:
+            parts.append(f"expected {name}={_fmt(wanted)}, got {name}={shown}")
+    return "; ".join(parts) or None
 
 
 # ---- the child: drives the working-tree app through its test client -------------------------------
@@ -228,7 +258,7 @@ class Driver:
         kind = (body or {}).get("error", {}).get("kind") if isinstance(body, dict) else None
         return rid, resp.status_code, kind, body
 
-    def req(self, url, expect, why, fault=None, method="GET", check=None, check_why=None):
+    def req(self, url, expect, why, fault=None, method="GET", check=None, check_why=None, got=None):
         rid, status, kind, body = self._request(url, fault, method)
         want_status, want_kind = expect if isinstance(expect, tuple) else (expect, None)
         ok = status == want_status and (want_kind is None or kind == want_kind)
@@ -240,32 +270,40 @@ class Driver:
                 ok = False
                 problem = f"{check_why}: {type(exc).__name__}"
             if not ok and problem is None:
-                problem = f"expected: {check_why}"
+                try:
+                    shown = got(body) if got else body
+                except Exception as exc:
+                    shown = f"<{type(exc).__name__}>"
+                problem = f"expected: {check_why}; got {json.dumps(shown)[:300]}"
         return self._step(kind="request", request_id=rid, request=f"{method} {url}", fault=fault, status=status,
                           error_kind=kind, why=why, ok=ok, problem=problem,
                           body=body if isinstance(body, dict) else None)
 
-    def check(self, ok, why, detail=None):
-        return self._step(kind="check", why=why, ok=bool(ok), problem=None if ok else f"expected: {why}", detail=detail)
+    def check(self, why, got, want, detail=None):
+        ok = got == want
+        return self._step(kind="check", why=why, ok=ok, detail=detail,
+                          problem=None if ok else f"expected {_fmt(want)}, got {_fmt(got)}"
+                                                  + (f" (detail: {json.dumps(detail)[:300]})" if detail is not None else ""))
 
     def db(self):
         with open(os.environ["SCOOTER_DB_PATH"]) as f:
             return {s["id"]: s for s in json.load(f)}
 
-    def expect_db(self, sid, predicate, why):
+    def expect_db(self, sid, why, **want):
+        """want: DB_FIELDS names -> values, e.g. reserved=False, at=(23.01, 19.01)."""
+        assert want and set(want) <= set(DB_FIELDS), want
         scooter = self.db().get(sid)
-        try:
-            ok = scooter is not None and bool(predicate(scooter))
-        except Exception:
-            ok = False
-        return self._step(kind="check", why=why, ok=ok, problem=None if ok else f"expected: {why}",
-                          detail={"db": scooter})
+        problem = f"expected scooter {sid} in the DB, but it isn't there" if scooter is None \
+            else mismatch(DB_FIELDS, scooter, want)
+        return self._step(kind="check", why=why, ok=problem is None, problem=problem, detail={"db": scooter})
 
-    def expect_ledger(self, predicate, why):
+    def expect_ledger(self, why, **want):
+        """want: LEDGER_FIELDS names -> values, e.g. charges=3."""
+        assert want and set(want) <= set(LEDGER_FIELDS), want
         path = os.environ["SCOOTER_PAYMENTS_LEDGER_PATH"]
         entries = [json.loads(line) for line in open(path)] if os.path.exists(path) else []
-        ok = bool(predicate(entries))
-        return self._step(kind="check", why=why, ok=ok, problem=None if ok else f"expected: {why}",
+        problem = mismatch(LEDGER_FIELDS, entries, want)
+        return self._step(kind="check", why=why, ok=problem is None, problem=problem,
                           detail={"ledger": [{k: e.get(k) for k in ("outcome", "charged", "scooter_id", "request_id")}
                                              for e in entries]})
 
@@ -401,7 +439,9 @@ def analyse(name, paths, initial, steps):
     unexpected = [s for s in steps if not s.get("ok")]
     dirty = next((r.get("git_dirty_paths") for r in records if r.get("git_dirty")), [])
     return {"scenario": name, "dir": str(paths["db"].parent), "requests": len(records),
-            "unexpected": unexpected, "anomalies": [{"type": a["type"], "request_id": a["request_id"]} for a in found],
+            "unexpected": unexpected, "anomalies": [{"type": a["type"], "request_id": a["request_id"],
+                            **({"summary": a["detail"]["summary"]} if isinstance(a.get("detail"), dict)
+                               and a["detail"].get("summary") else {})} for a in found],
             "invariant_violations": [list(v) for v in violations],
             "ledger_problems": rq.ledger_problems(ledger_result),
             "failure_counts": rq.failure_counts(records), "git_dirty_paths": dirty,
@@ -421,7 +461,8 @@ def report(summary):
         lines.append(f"  UNEXPECTED step {s['n']}: {s.get('why')}: {s.get('problem')}"
                      + (f"  [{s['request']}, request {s['request_id']}]" if s.get("request_id") else ""))
     for a in summary["anomalies"]:
-        lines.append(f"  ANOMALY {a['type']} in request {a['request_id']}")
+        lines.append(f"  ANOMALY {a['type']} in request {a['request_id']}"
+                     + (f": {a['summary']}" if a.get("summary") else ""))
     for v in summary["invariant_violations"]:
         lines.append(f"  INVARIANT {v[0]}: {v[1]}")
     lines += [f"  evidence: {rel}/ (records.jsonl, db.json, ledger.jsonl, steps.json, summary.json)",

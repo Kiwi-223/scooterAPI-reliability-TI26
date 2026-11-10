@@ -1,5 +1,12 @@
 # AGENTS.md
 
+> **Cold start: debugging a symptom?** Read only the next section, **"Debugging a symptom
+> (start here)"** (about 11 KB). This whole file is about 160 KB, and with ACTIVITY.md and
+> AI_NOTES.md about 250 KB; you don't need the rest to start. To print just that section:
+> `sed -n '/^## Debugging a symptom/,/^## Setup/p' AGENTS.md`. Come back to the other
+> sections (Request records, Database schema, Payment state machine, …) when a step points
+> you there.
+
 Onboarding for anyone, human or AI agent, who opens this repo with no prior context.
 Keep it accurate: every PR that changes setup, commands, layout or data locations updates
 this file in the same PR.
@@ -42,11 +49,18 @@ conclude from reading the diff**: steps 3–5 get the evidence.
 
 **3. Run the test suite: the fastest signal.**
 ```sh
-make test ARGS="-x -q"           # or the MCP tool run_tests (asks first)
+make test ARGS="-q"              # or the MCP tool run_tests (asks first); about a minute
 ```
-A planted bug often breaks an existing test, and its name usually points straight at the
-cause (`test_a_scooter_waiting_for_payment_cannot_be_reserved_or_found`,
-`test_after_n_attempts_the_ride_ends_unpaid`, …). Read that test: it's a ready-made
+Run it **without `-x`**, and read the **list of failing test names** at the end (the
+`FAILED …` lines), not just the first failure. A planted bug usually breaks several tests.
+The **targeted** ones name the cause (`test_a_scooter_waiting_for_payment_cannot_be_reserved_or_found`,
+`test_after_n_attempts_the_ride_ends_unpaid`, `test_end_frees_scooter_at_new_location_and_persists_it`, …);
+the broad ones (soaks, random histories, "every scenario is clean", "no false positives")
+fail as a side effect of almost any bug and say little about which. The first failure in
+file order is often one of those: with PLAN step 20's swapped-`lat`/`lng` plant, `-x`
+stopped at `test_a_random_fault_soak_keeps_every_invariant`, while the full list also had
+`test_end_frees_scooter_at_new_location_and_persists_it` and
+`test_ended_scooter_is_available_at_new_location`. Read the most specific failing test: it's a ready-made
 reproduction. A green suite doesn't clear the code, though; carry on.
 
 **4. Reproduce on an isolated instance.** A fresh checkout has no records, so make some:
@@ -63,8 +77,12 @@ make scenario NAME=all           # every scenario: rides, errors, payment-faults
   and ledger in `data/scenarios/<name>/`. The live files are never touched. A previous run
   is moved to `data/scenarios/<name>.<timestamp>/`.
 - Every step states what it expected. It prints **`UNEXPECTED`** for each step that
-  didn't happen as specified, then the anomalies, the invariant violations, where the
-  evidence is, and the exact commands to query it. It exits 1 if anything is off.
+  didn't happen as specified, with **expected vs actual** (e.g.
+  `expected at=(23.01, 19.01), got at=(19.01, 23.01)`), then the anomalies (with a
+  one-line summary where the rule has one), the invariant violations, where the evidence
+  is, and the exact commands to query it. It exits 1 if anything is off.
+- `make scenario` with no `NAME` only lists the scenarios and installs nothing. With a
+  `NAME`, the first run installs the dependencies (it says so; one-time).
 - Faults are forced per request, so a re-run makes the same requests with the same
   request ids (`scn-<name>-<n>`); only reservation ids (uuids) differ.
 - If the symptom needs something no scenario does, make the requests by hand on a scratch
@@ -85,7 +103,7 @@ show 0 for a request whose write was refused (its `db_write: refused` decision a
 | Which records contradict themselves? | `anomalies` | `make records ARGS="--file data/scenarios/rides/records.jsonl anomalies --db data/scenarios/rides/db.json"` |
 | Payments vs records | `ledger_check`, `payment_lookup` | `make records ARGS="--file data/scenarios/rides/records.jsonl ledger-check --ledger data/scenarios/rides/ledger.jsonl --min-age 0"` |
 | DB + ledger + records consistent? | `check_invariants` | `SCOOTER_DB_PATH=data/scenarios/rides/db.json SCOOTER_RECORDS_PATH=data/scenarios/rides/records.jsonl SCOOTER_PAYMENTS_LEDGER_PATH=data/scenarios/rides/ledger.jsonl .venv/bin/python tests/invariants.py` |
-| What's in the DB now? | `scooter_state(scooter_id="18")` | `cat data/scenarios/rides/db.json` |
+| What's in the DB now? | `scooter_state(scooter_id="18")` | `jq '.[] \| select(.id=="18")' data/scenarios/rides/db.json` (the file is a JSON **list** of scooters, not keyed by id) |
 
 **6. Locate the bad code path** with the record's three snapshots and its decisions:
 - `scooter_before`: what the request read. `scooter_after`: what is **on disk** after it.
@@ -95,6 +113,12 @@ show 0 for a request whose write was refused (its `db_write: refused` decision a
   `write_not_persisted`.
 - `in_memory` wrong too → the logic itself is wrong; read the `decisions` in order to see
   which step went the wrong way.
+- anomaly `end_location_not_persisted` → the scooter isn't where the ride ended. Despite
+  the name, read its `cause`, not the name: `logic` means `in_memory` is at the same wrong
+  place as `after` (the code computed the wrong location and saved it faithfully, e.g.
+  swapped `lat`/`lng`: read the code that sets the scooter's position, `finish_ride`);
+  `persistence` means the right location was in memory but not written. Its `summary`
+  gives the expected and actual coordinates.
 - `db_write: refused` with a problem, or an `exception` field → the code built an invalid
   state, or crashed; the message names the field.
 - `params: ok` on input that should have been rejected → validation.
@@ -1295,7 +1319,14 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     since PLAN PR 14; for reconcile, its `reconcile` decision's `end_lat`/`end_lng`), or for
     older records the requested coordinates. They're compared as floats, the
     way the app parses them, so `+23.01` equals `23.01`. This one also catches code that
-    never moves the scooter at all, where in-memory and written state agree.
+    never moves the scooter at all, where in-memory and written state agree. **The name
+    is historical (kept, because tests and docs reference it): it fires for a wrong
+    location however it got there.** The detail says which (PLAN PR 20a): `cause` is
+    `logic` when `scooter_in_memory` is at the same wrong place (the code computed it: a
+    swapped `lat`/`lng`, a missing move), `persistence` when the in-memory location was
+    right but the written one isn't, `unknown` with no in-memory snapshot. It also has
+    `expected` and `actual` (`{lat, lng}`), `in_memory`, and a one-line `summary`, which
+    the CLI and `make scenario` print.
   - **`reservation_flag_mismatch`:** `scooter_after` breaks the DB invariant
     (`is_reserved` true without a `reservation`, or false with one). `write_db` refuses
     such writes, so this flags records from older code or from a broken guard.

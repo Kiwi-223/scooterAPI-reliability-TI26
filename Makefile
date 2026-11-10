@@ -22,6 +22,7 @@ setup: $(STAMP) ## Create .venv (Python 3.15) and install the locked runtime + d
 
 # Reinstall whenever a lock file changes.
 $(STAMP): requirements.txt requirements-dev.txt
+	@echo "make: installing the locked dependencies into $(VENV) first (one-time; again only when a lock file changes)"
 	@test -x $(BIN)/python || $(PYTHON) -m venv $(VENV)
 	@$(BIN)/python -c 'import sys; assert sys.version_info[:2] == (3, 15), \
 		f"$(VENV) uses Python {sys.version.split()[0]}, need 3.15: delete $(VENV) and re-run make setup"'
@@ -43,8 +44,10 @@ records: $(STAMP) ## Query request records: make records ARGS="failure-counts --
 reconcile: $(STAMP) ## Settle stuck (payment_pending) rides: make reconcile [ARGS="--dry-run"] (see AGENTS.md)
 	@$(BIN)/python -m reconcile $(ARGS)
 
-scenario: $(STAMP) ## Reproduce realistic traffic on an isolated instance: make scenario NAME=rides (no NAME: list them)
-	@$(BIN)/python scenarios.py $(NAME) $(ARGS)
+# Listing the scenarios (no NAME) needs only the standard library, so it doesn't install anything
+# first (PLAN PR 20a): it uses the venv's python if there is one, else python3.
+scenario: $(if $(strip $(NAME)),$(STAMP)) ## Reproduce realistic traffic on an isolated instance: make scenario NAME=rides (no NAME: list them)
+	@$(if $(strip $(NAME)),$(BIN)/python,$(if $(wildcard $(BIN)/python),$(BIN)/python,python3)) scenarios.py $(NAME) $(ARGS)
 
 reset-local: ## Back up and reset local state (DB from git, data/ moved aside; deletes nothing): [DRY_RUN=1]
 	@python3 scripts/reset_local.py $(if $(DRY_RUN),--dry-run)
