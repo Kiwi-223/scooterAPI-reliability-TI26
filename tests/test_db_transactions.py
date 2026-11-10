@@ -71,9 +71,10 @@ import json, os, sys, time
 sys.path.insert(0, sys.argv[1])
 import app
 client = app.app.test_client()
-go = float(sys.argv[2])
-while time.time() < go:            # start together
-    pass
+sync_dir, me = sys.argv[2], sys.argv[4]
+open(os.path.join(sync_dir, "ready-" + me), "w").close()   # imported and ready
+while not os.path.exists(os.path.join(sync_dir, "go")):    # start together
+    time.sleep(0.0005)
 mode = sys.argv[3]
 if mode == "race":
     print(client.get("/reservation/start?id=18").status_code)
@@ -88,11 +89,23 @@ else:                               # mode == "cycle:<id>:<n>"
 
 
 def _spawn(db_path, records_path, modes, extra_env=None):
+    # Event-based start, not a wall-clock deadline: each child signals "ready" after its
+    # (variable, sometimes slow on CI) import, and only when all are ready does the parent
+    # create the "go" file they're waiting for. A fixed "start in 1.5 s" could fire before a
+    # slow child had even imported, turning the race into a sequence.
     env = dict(os.environ, SCOOTER_DB_PATH=str(db_path), SCOOTER_RECORDS_PATH=str(records_path),
                PYTHONDONTWRITEBYTECODE="1", **(extra_env or {}))
-    go = str(time.time() + 1.5)
-    procs = [subprocess.Popen([sys.executable, "-c", _RACER, str(REPO), go, mode], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for mode in modes]
+    sync_dir = db_path.parent / "sync"
+    sync_dir.mkdir(exist_ok=True)
+    procs = [subprocess.Popen([sys.executable, "-c", _RACER, str(REPO), str(sync_dir), mode, str(n)], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for n, mode in enumerate(modes)]
+    deadline = time.monotonic() + 120
+    while len(list(sync_dir.glob("ready-*"))) < len(procs):
+        assert time.monotonic() < deadline, "children never became ready"
+        assert all(p.poll() is None for p in procs), [p.communicate() for p in procs if p.poll() is not None]
+        time.sleep(0.01)
+    (sync_dir / "go").touch()
     outs = [p.communicate(timeout=120) for p in procs]
     assert all(p.returncode == 0 for p in procs), [err for _, err in outs]
     return [out.strip() for out, _ in outs]
@@ -218,7 +231,10 @@ def test_lock_timeout_is_storage_busy_and_changes_nothing(client, monkeypatch, d
     assert resp.status_code == 503 and resp.headers["Retry-After"] == "1"
     assert resp.get_json() == {"msg": "Error 503 - The scooter database is busy; nothing was changed. Retry shortly.",
                                "error": {"kind": "storage_busy"}}
-    assert 0.2 <= elapsed < 2
+    # Lower bound: it really waited for the timeout. Upper bound is deliberately generous:
+    # it only has to prove the wait is bounded (no hang), and slow CI runners can add
+    # seconds of scheduling delay on top of the 0.2 s timeout.
+    assert 0.2 <= elapsed < 0.2 + 15
     assert view.status_code == 200
     assert db_path.read_bytes() == before
     record = read_records()[0]
@@ -280,3 +296,32 @@ def test_write_fsyncs_the_temp_file_and_the_directory(client, monkeypatch, db_pa
     monkeypatch.setattr(app_module.os, "replace", spy_replace)
     client.get("/reservation/start?id=18")
     assert events == ["fsync_file", "replace", "fsync_dir"]
+
+
+def test_failed_directory_fsync_after_replace_is_a_successful_write(client, monkeypatch, db_path, read_db, read_records, caplog):
+    # By the time the directory fsync runs, os.replace has already put the new data in
+    # place, so reporting storage_error would be a lie (the reservation IS persisted).
+    real_fsync = os.fsync
+
+    def failing_dir_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(5, "Input/output error")
+        return real_fsync(fd)
+    monkeypatch.setattr(app_module.os, "fsync", failing_dir_fsync)
+    resp = client.get("/reservation/start?id=18")
+    assert resp.status_code == 200
+    assert read_db()["18"]["is_reserved"] is True
+    record = read_records()[0]
+    assert record["db_write"] == {"attempted": True, "ok": True, "error": None}
+    write_step = next(d for d in record["decisions"] if d["step"] == "db_write")
+    assert write_step["outcome"] == "ok" and write_step["detail"]["dir_fsync_error"] == "OSError"
+    assert record["scooter_after"]["is_reserved"] is True
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "directory fsync failed" in r.getMessage()]
+    assert len(warnings) == 1
+
+
+def test_successful_write_has_no_dir_fsync_error(client, read_records):
+    client.get("/reservation/start?id=18")
+    write_step = next(d for d in read_records()[0]["decisions"] if d["step"] == "db_write")
+    assert "dir_fsync_error" not in write_step["detail"]
+

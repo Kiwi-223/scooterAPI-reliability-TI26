@@ -78,7 +78,11 @@ tcsh) and CI images do. If `make run` binds somewhere unexpected, check `env | g
   `.venv/bin/gunicorn --no-control-socket --bind 127.0.0.1:8000 app:app`.
   Without `--no-control-socket`, gunicorn 26 creates a control socket at
   `~/.gunicorn/gunicorn.ctl`, outside the repo, and the Claude Code sandbox blocks that
-  write (see Agent boundaries). Deploy readiness is PLAN PR 19.
+  write (see Agent boundaries).
+  - Keep gunicorn's `--timeout` (default 30 s) longer than `SCOOTER_DB_LOCK_TIMEOUT` plus
+    the slowest payment call. Otherwise a worker killed mid-request returns gunicorn's HTML
+    500 instead of our JSON (see Concurrency).
+  - Deploy readiness is PLAN PR 19.
 - Server logs: the Flask dev server prints request lines (`"GET /search?... 200"`) to
   **stderr**; only its banner goes to stdout. gunicorn logs **no** requests unless you run
   it with `--access-logfile -`, which sends them to stdout. Neither log is persisted.
@@ -294,6 +298,25 @@ The JSON file DB is safe under threads, several gunicorn workers and separate pr
 - **Known cost:** `/reservation/end` calls the payment gateway while holding the lock, so a
   slow gateway delays every writer. PLAN PRs 13/14 persist `payment_pending` first and can
   release the lock around the gateway call.
+- **gunicorn `--timeout` must be longer than `SCOOTER_DB_LOCK_TIMEOUT` plus the slowest
+  gateway call** (gunicorn's default is 30 s; the lock timeout's is 5 s).
+  - If a worker hits gunicorn's timeout first, gunicorn kills it. The client then gets
+    **gunicorn's HTML 500** (`text/html`, no `X-Request-ID`), not our JSON envelope.
+  - The request record is still written, by the teardown safety net, as `internal_error`
+    with `msg` "no response was produced" and `exception: {type: SystemExit}`. The
+    gunicorn log shows `WORKER TIMEOUT`.
+  - Verified with `--timeout 2` and a held lock with `SCOOTER_DB_LOCK_TIMEOUT=10`.
+- **Directory fsync failure after a successful replace:** the new data is already in place
+  and every reader sees it, so it's reported as a **successful** write, not
+  `storage_error`.
+  - The server log gets a WARNING, `db written but directory fsync failed …`.
+  - The record keeps `db_write.ok: true`, and its `db_write` decision carries
+    `dir_fsync_error: "<ExceptionType>"`.
+  - The only risk is that the rename may not survive a power loss.
+- **Error precedence on `/reservation/end` (changed in PLAN PR 11):** parameters are
+  validated *before* the lock and the DB read. A request with a bad `lat`/`lng` and a
+  corrupt DB now gets **422 `invalid_coordinate`** (or `invalid_number`), where it used to
+  get 500 `storage_error`. This matches `/search`, which always validated first.
 - **Verified:**
   - Threads: 8 threads racing to reserve one scooter → exactly one wins, every time.
   - Processes: 6 processes racing → exactly one wins.

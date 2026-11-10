@@ -437,6 +437,9 @@ def get_scooter_with_id(search_id, db):
 def _replace_atomically(path, data):
 	# temp file in the same directory (so os.replace is a same-filesystem rename), fsync it,
 	# rename it over the DB, then fsync the directory so the rename itself is durable.
+	# Returns None, or the exception type name if only that final directory fsync failed:
+	# by then the new data IS in place (visible to every reader), so that is not a failed
+	# write; the caller logs a WARNING and records it, instead of reporting storage_error.
 	if os.path.exists(path) and not os.access(path, os.W_OK):
 		# A read-only DB means "don't write". os.replace only needs the directory to be
 		# writable, so honour the file's permission explicitly.
@@ -457,11 +460,16 @@ def _replace_atomically(path, data):
 		except OSError:
 			pass
 		raise
-	dir_fd = os.open(directory, os.O_RDONLY)
 	try:
-		os.fsync(dir_fd)
-	finally:
-		os.close(dir_fd)
+		dir_fd = os.open(directory, os.O_RDONLY)
+		try:
+			os.fsync(dir_fd)
+		finally:
+			os.close(dir_fd)
+	except OSError as e:
+		app.logger.warning('db written but directory fsync failed: %s (db=%s); the rename may not survive a power loss', e, path)
+		return type(e).__name__
+	return None
 
 
 def write_db(db, path=None):
@@ -470,14 +478,17 @@ def write_db(db, path=None):
 	db_json = json.dumps(db_list)
 	path = path or get_db_path()
 	try:
-		_replace_atomically(path, db_json)
+		dir_fsync_error = _replace_atomically(path, db_json)
 	except OSError as e:
 		records.db_write(False, type(e).__name__)
 		records.note('db_write', 'failed', db_path=path, error=type(e).__name__)
 		raise StorageError(f'The scooter database could not be written ({type(e).__name__}).', path) from e
 	records.db_write(True)
 	records.written(db_list)	# scooter_after = what was actually serialised
-	records.note('db_write', 'ok', db_path=path)
+	if dir_fsync_error:
+		records.note('db_write', 'ok', db_path=path, dir_fsync_error=dir_fsync_error)
+	else:
+		records.note('db_write', 'ok', db_path=path)
 	return True
 		
 # class scooter for internal use
