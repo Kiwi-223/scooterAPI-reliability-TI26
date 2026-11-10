@@ -393,3 +393,43 @@ strongest entries.
   fails it. Lesson: a stress test that "never saw a problem" isn't evidence that the
   mechanism exists. Test the mechanism directly, and mutation-test the tests.
 
+### 21. `scooter_after` was documented as "the state afterwards" but was the code's in-memory object
+- **Where:** `records.py` / `app.py` and AGENTS.md "Request records", PR #11 (PLAN PR 9),
+  first version.
+- **What the AI claimed:** `scooter_after` is the scooter's "state afterwards". Any reader,
+  and a cold agent above all, takes that to mean the persisted state.
+- **Reality:** routes set it from `scooter.to_dict()` after calling `write_db`, which is the
+  object in memory, not what was written. With a planted bug that calls `write_db`
+  **before** changing the scooter, the response was 200 "ended" and the record said
+  `db_write: ok` and `scooter_after: {is_reserved: false, …new location}`. The file still
+  held the scooter reserved at the old location. The record was confidently wrong about
+  exactly the kind of bug the cold-agent test plants.
+- **How it was caught:** the reviewer planted that ordering bug and compared the record
+  with the DB file.
+- **What changed:**
+  - `scooter_after` is now taken from the exact data `write_db` serialised
+    (`records.written(db_list)`). It equals `scooter_before` when the request chose not to
+    write, and is `null` when the write failed.
+  - A separate `scooter_in_memory` keeps the code's view, so the discrepancy itself is
+    evidence. There's a jq recipe for it.
+  - `test_planted_write_ordering_bug_is_visible_in_the_record` plants the bug in a copy of
+    `app.py` and checks the record.
+
+  Lesson: a record field must say where its value comes from. Evidence about persistence
+  has to be read from what was persisted.
+
+### 22. The reviewer's near-miss: stale bytecode kept running a reverted bug
+- **Where:** the reviewer's own probe of PR #11.
+- **What happened:** the reviewer planted a bug in `app.py` and then reverted it within the
+  same second, leaving the file the same size. Python's `__pycache__` check (mtime + size)
+  saw no change, so the server kept running the planted bug's bytecode while the source,
+  and `git_dirty: false`, said the code was clean.
+- **How it was caught:** the reviewer disassembled the cached `.pyc` and found the planted
+  logic still in it.
+- **What changed:** AGENTS.md now says that `git_dirty` describes the source tree at
+  startup, not the code that's actually running. Delete `__pycache__/` after planting or
+  reverting bugs, and restart the server. The planted-bug test runs its subprocess with
+  `PYTHONDONTWRITEBYTECODE=1`. Lesson: "the files are clean" and "the running code is
+  clean" are different claims. The cold-agent playbook (PLAN PR 17) should include clearing
+  `__pycache__`.
+

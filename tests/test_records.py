@@ -16,9 +16,9 @@ from test_failure_kinds import TRIGGERS
 
 REPO = Path(__file__).resolve().parent.parent
 TOP_LEVEL_KEYS = {
-    "schema", "ts", "request_id", "method", "path", "params", "scooter_id", "decisions",
-    "scooter_before", "scooter_after", "db_write", "status", "error", "duration_ms",
-    "git_commit", "git_dirty", "pid",
+    "schema", "ts", "request_id", "method", "path", "params", "params_truncated", "scooter_id",
+    "decisions", "scooter_before", "scooter_after", "scooter_in_memory", "db_write", "status",
+    "error", "duration_ms", "git_commit", "git_dirty", "git_dirty_paths", "pid",
 }
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 SEED = {
@@ -88,11 +88,41 @@ def test_git_state_is_computed_from_this_repo():
         pytest.skip("git not available")
     assert records.GIT_COMMIT == head.stdout.strip()
     assert isinstance(records.GIT_DIRTY, bool)
+    assert records.GIT_DIRTY == bool(records.GIT_DIRTY_PATHS)
+    assert "scooter_db.json" not in records.GIT_DIRTY_PATHS
 
 
 def test_git_state_falls_back_when_git_is_missing(monkeypatch):
     monkeypatch.setattr(records.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git")))
-    assert records._git_state() == (None, None)
+    assert records._git_state() == (None, None, None)
+
+
+def _fake_git(monkeypatch, porcelain):
+    def fake(*args):
+        return "a" * 40 + "\n" if args[0] == "rev-parse" else porcelain
+    monkeypatch.setattr(records, "_git", fake)
+
+
+def test_data_only_changes_are_not_dirty(monkeypatch):
+    # A reservation against the live DB rewrites the tracked scooter_db.json: that's data.
+    _fake_git(monkeypatch, " M scooter_db.json\0")
+    assert records._git_state() == ("a" * 40, False, [])
+
+
+def test_code_changes_are_dirty_and_listed(monkeypatch):
+    _fake_git(monkeypatch, " M app.py\0 M scooter_db.json\0?? planted.py\0R  new_name.py\0old_name.py\0")
+    assert records._git_state() == ("a" * 40, True, ["app.py", "new_name.py", "planted.py"])
+
+
+def test_dirty_paths_are_capped(monkeypatch):
+    _fake_git(monkeypatch, "".join(f"?? f{i:03}.py\0" for i in range(100)))
+    commit, dirty, paths = records._git_state()
+    assert dirty is True and len(paths) == records.MAX_DIRTY_PATHS == 20 and paths[0] == "f000.py"
+
+
+def test_clean_tree_is_not_dirty(monkeypatch):
+    _fake_git(monkeypatch, "")
+    assert records._git_state() == ("a" * 40, False, [])
 
 
 # ---- per endpoint and outcome ----------------------------------------------------------
@@ -103,7 +133,7 @@ def test_start_success_records_the_transition(client, read_records):
     assert (r["method"], r["path"], r["params"], r["scooter_id"], r["status"], r["error"]) == \
         ("GET", "/reservation/start", {"id": "18"}, "18", 200, None)
     assert r["scooter_before"] == SEED["18"]
-    assert r["scooter_after"] == dict(SEED["18"], is_reserved=True)
+    assert r["scooter_after"] == r["scooter_in_memory"] == dict(SEED["18"], is_reserved=True)
     assert r["db_write"] == {"attempted": True, "ok": True, "error": None}
     assert steps(r) == [("db_read", "ok"), ("lookup", "found"), ("reserve", "allowed"), ("db_write", "ok")]
 
@@ -111,7 +141,7 @@ def test_start_success_records_the_transition(client, read_records):
 def test_start_already_reserved_records_no_change(client, read_records):
     client.get("/reservation/start?id=33")
     r = only_record(read_records)
-    assert r["scooter_before"] == r["scooter_after"] == SEED["33"]
+    assert r["scooter_before"] == r["scooter_after"] == r["scooter_in_memory"] == SEED["33"]
     assert r["db_write"] == {"attempted": False, "ok": None, "error": None}
     assert r["error"]["kind"] == "scooter_already_reserved" and r["status"] == 422
     assert steps(r)[-2:] == [("reserve", "refused"), ("respond", "error")]
@@ -129,7 +159,7 @@ def test_end_success_records_payment_and_move(client, read_records):
     client.get("/reservation/end?id=18&lat=23.01&lng=19.01")
     r = read_records()[-1]
     assert r["scooter_before"] == dict(SEED["18"], is_reserved=True)
-    assert r["scooter_after"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
+    assert r["scooter_after"] == r["scooter_in_memory"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
     assert r["db_write"]["ok"] is True and r["status"] == 200
     assert steps(r) == [("db_read", "ok"), ("params", "ok"), ("lookup", "found"), ("end", "allowed"),
                         ("payment", "requested"), ("payment", "ok"), ("db_write", "ok")]
@@ -354,3 +384,108 @@ def test_append_waits_for_the_exclusive_lock(tmp_path):
     assert done.wait(5)
     writer.join()
     assert path.read_text() == '{"x": 1}\n'
+
+
+# ---- PR #11 review: honest after-state, params cap, line safety ----------------------------
+
+_PLANT = """
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import app
+resp = app.app.test_client().get("/reservation/end?id=18&lat=23.01&lng=19.01")
+print(resp.status_code)
+"""
+_CORRECT_ORDER = """\t\t\t\tscooter.is_reserved = False
+\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
+\t\t\t\twrite_db(db)
+"""
+_BUGGY_ORDER = """\t\t\t\twrite_db(db)
+\t\t\t\tscooter.is_reserved = False
+\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
+"""
+
+
+def test_planted_write_ordering_bug_is_visible_in_the_record(tmp_path, db_path, records_path, read_db, read_records):
+    # The reviewer's planted bug: end_reservation writes the DB *before* changing the
+    # scooter. The response still says 200 "ended", but the file keeps it reserved. The
+    # record must show what was written (scooter_after) next to what the code believed
+    # (scooter_in_memory), so the discrepancy is in the evidence itself.
+    src = (REPO / "app.py").read_text()
+    assert src.count(_CORRECT_ORDER) == 1, "end_reservation changed shape; update this test"
+    planted = tmp_path / "planted"
+    planted.mkdir()
+    (planted / "app.py").write_text(src.replace(_CORRECT_ORDER, _BUGGY_ORDER))
+    for name in ("records.py", "failures.py"):
+        (planted / name).write_text((REPO / name).read_text())
+    data = json.loads(db_path.read_text())
+    next(s for s in data if s["id"] == "18")["is_reserved"] = True
+    db_path.write_text(json.dumps(data))
+    env = dict(os.environ, SCOOTER_DB_PATH=str(db_path), SCOOTER_RECORDS_PATH=str(records_path),
+               PYTHONDONTWRITEBYTECODE="1")
+    out = subprocess.run([sys.executable, "-c", _PLANT, str(planted)], env=env, capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == "200"                                   # the bug "succeeds"
+    on_disk = read_db()["18"]
+    assert on_disk == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True}
+    r = only_record(read_records)
+    assert r["db_write"]["ok"] is True
+    assert r["scooter_after"] == on_disk                                  # the truth on disk
+    assert r["scooter_in_memory"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
+    assert r["scooter_after"] != r["scooter_in_memory"]                   # the discrepancy
+
+
+def test_after_state_comes_from_the_serialised_data(client, monkeypatch, read_db, read_records):
+    # Same idea in-process: whatever write_db actually serialises is what scooter_after shows.
+    real = app_module.convert_db_to_dictlist
+
+    def stale(db):
+        rows = real(db)
+        for row in rows:
+            if row["id"] == "18":
+                row["is_reserved"] = False                              # pretend the change was lost
+        return rows
+    monkeypatch.setattr(app_module, "convert_db_to_dictlist", stale)
+    client.get("/reservation/start?id=18")
+    r = only_record(read_records)
+    assert r["scooter_after"] == read_db()["18"] == SEED["18"]
+    assert r["scooter_in_memory"] == dict(SEED["18"], is_reserved=True)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write a read-only file")
+def test_end_with_unwritable_db_has_no_after_state(client, db_path, read_records):
+    client.get("/reservation/start?id=18")
+    db_path.chmod(0o444)
+    try:
+        client.get("/reservation/end?id=18&lat=1&lng=1")
+    finally:
+        db_path.chmod(0o644)
+    r = read_records()[-1]
+    assert r["db_write"] == {"attempted": True, "ok": False, "error": "PermissionError"}
+    assert r["scooter_after"] is None                       # nothing known to be persisted
+    assert r["scooter_in_memory"] is None                   # the route never got past write_db
+    assert r["scooter_before"] == dict(SEED["18"], is_reserved=True)
+
+
+def test_param_count_is_capped(client, read_records):
+    query = "&".join(f"k{i}=v" for i in range(2000))
+    client.get("/view_all_available?" + query)
+    r = only_record(read_records)
+    assert r["params_truncated"] is True and len(r["params"]) == records.MAX_PARAMS == 50
+    assert list(r["params"])[:2] == ["k0", "k1"]
+
+
+def test_params_under_the_cap_are_not_marked_truncated(client, read_records):
+    client.get("/view_all_available?" + "&".join(f"k{i}=v" for i in range(50)))
+    r = only_record(read_records)
+    assert r["params_truncated"] is False and len(r["params"]) == 50
+
+
+@pytest.mark.parametrize("char", ["\u2028", "\u2029", "\u0085", "\x1c", "\x0b", "\r"])
+def test_unicode_line_breaks_stay_on_one_ascii_line(client, records_path, read_records, char):
+    from urllib.parse import quote
+    client.get("/reservation/start?id=" + quote("a" + char + "b"))
+    raw = records_path.read_bytes()
+    assert raw.isascii(), "records must be written with ensure_ascii=True"
+    assert raw.count(b"\n") == 1 and raw.endswith(b"\n")
+    assert raw.decode().splitlines() == [raw.decode().rstrip("\n")]  # even Python's splitlines agrees
+    assert only_record(read_records)["scooter_id"] == "a" + char + "b"
+

@@ -61,7 +61,9 @@ def read_records(records_path):
     def _read():
         if not records_path.exists():
             return []
-        return [json.loads(line) for line in records_path.read_text().splitlines()]
+        # Split on "\n" only: str.splitlines() also breaks on U+2028, U+0085 etc., which a
+        # record could contain if it weren't ASCII-escaped (records use ensure_ascii=True).
+        return [json.loads(line) for line in records_path.read_text().split("\n") if line]
     return _read
 
 

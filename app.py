@@ -149,14 +149,15 @@ def start_reservation():
 			records.note('reserve', 'allowed', reason='scooter is not reserved')
 			scooter.is_reserved = True
 			write_db(db)	# update db
-			records.scooter(after=scooter.to_dict())
+			records.scooter(in_memory=scooter.to_dict())
 			success = { 'msg': f'Scooter {reserve_id} was reserved successfully.' }
 			return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
 
 		else:
 			# the scooter is already reserved
 			records.note('reserve', 'refused', reason='scooter is already reserved')
-			records.scooter(after=scooter.to_dict())	# unchanged
+			records.scooter(in_memory=scooter.to_dict())
+			records.unchanged()
 			return error_response(FailureKind.SCOOTER_ALREADY_RESERVED, f'Error 422 - Scooter with id {reserve_id} is already reserved.')
 	else:
 		# no scooter with the reserve id was found
@@ -204,7 +205,7 @@ def end_reservation():
 				scooter.is_reserved = False
 				scooter.lat, scooter.lng = end_lat, end_lng
 				write_db(db)
-				records.scooter(after=scooter.to_dict())
+				records.scooter(in_memory=scooter.to_dict())
 				# construct successful response
 				success =	{	'msg': f'Payment for scooter {scooter_id_to_end} was made successfully and the reservation was ended.',
 								'txn_id': payment_response['txn_id']
@@ -213,7 +214,8 @@ def end_reservation():
 			else:
 				# the payment failed: the reservation is NOT ended (unchanged behaviour; PLAN PRs 13/14
 				# define decline/timeout handling). Use the gateway's msg/code when it gives them.
-				records.scooter(after=scooter.to_dict())	# unchanged: still reserved, not moved
+				records.scooter(in_memory=scooter.to_dict())	# expected: still reserved, not moved
+				records.unchanged()
 				code = payment_response.get('code')
 				if not (isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599):
 					code = None  # a failed payment never carries a non-error status: fall back to 502
@@ -223,7 +225,8 @@ def end_reservation():
 		else:
 			# the scooter is not currently reserved
 			records.note('end', 'refused', reason='scooter is not reserved')
-			records.scooter(after=scooter.to_dict())	# unchanged
+			records.scooter(in_memory=scooter.to_dict())
+			records.unchanged()
 			return error_response(FailureKind.NO_ACTIVE_RESERVATION, f'Error 422 - No reservation for scooter {scooter_id_to_end} presently exists.')
 	else:
 		# no scooter with the id was found
@@ -356,6 +359,7 @@ def write_db(db):
 		records.note('db_write', 'failed', db_path=path, error=type(e).__name__)
 		raise StorageError(f'The scooter database could not be written ({type(e).__name__}).', path) from e
 	records.db_write(True)
+	records.written(db_list)	# scooter_after = what was actually serialised
 	records.note('db_write', 'ok', db_path=path)
 	return True
 		

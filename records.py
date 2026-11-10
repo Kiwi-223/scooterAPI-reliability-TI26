@@ -34,6 +34,11 @@ RECORD_ERROR_HEADER = "X-Record-Error"
 # id and the rejection is noted, so nothing a client sends can break or forge a log line.
 _CLIENT_ID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 MAX_VALUE_CHARS = 1024   # longer param values are truncated in the record (not in the request)
+MAX_PARAMS = 50          # at most this many distinct param keys are recorded (params_truncated)
+MAX_DIRTY_PATHS = 20     # at most this many changed paths are listed in git_dirty_paths
+# Files the app itself rewrites. A change to them is data, not code, so it doesn't make the
+# code "dirty" (a reservation against the live DB rewrites scooter_db.json).
+DATA_PATHS = {"scooter_db.json"}
 SCHEMA_VERSION = 1
 
 _REPO = Path(__file__).resolve().parent
@@ -51,18 +56,39 @@ def _git(*args):
     return out.stdout if out.returncode == 0 else None
 
 
-def _git_state():
-    """(commit, dirty) of the code that is running, computed once at startup.
+def _changed_paths(porcelain_z):
+    """Paths from `git status --porcelain=v1 -z` output (renames give their new path)."""
+    entries = porcelain_z.split("\0")
+    paths, i = [], 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        status, path = entry[:2], entry[3:]
+        if "R" in status or "C" in status:
+            i += 1                              # the next entry is the original path
+        paths.append(path)
+    return paths
 
-    commit is the full HEAD sha or None; dirty is True if tracked or untracked files differ
-    from HEAD (a planted, uncommitted bug shows up here), None if git isn't available.
+
+def _git_state():
+    """(commit, dirty, dirty_paths) of the source tree, computed once at startup.
+
+    commit: the full HEAD sha, or None. dirty: True if any *code* file (tracked or untracked,
+    not git-ignored) differs from HEAD, i.e. how a planted, uncommitted bug shows up; data
+    files in DATA_PATHS don't count. dirty_paths: those code paths (capped). dirty and
+    dirty_paths are None if git isn't available.
     """
     head = _git("rev-parse", "HEAD")
-    status = _git("status", "--porcelain")
-    return (head.strip() if head else None, None if status is None else bool(status.strip()))
+    status = _git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status is None:
+        return (head.strip() if head else None, None, None)
+    code_paths = sorted(p for p in _changed_paths(status) if p not in DATA_PATHS)
+    return (head.strip() if head else None, bool(code_paths), code_paths[:MAX_DIRTY_PATHS])
 
 
-GIT_COMMIT, GIT_DIRTY = _git_state()
+GIT_COMMIT, GIT_DIRTY, GIT_DIRTY_PATHS = _git_state()
 
 
 def _now_iso(epoch):
@@ -76,11 +102,14 @@ def _clip(value):
 
 
 def _params():
+    """The query args (repeated keys as lists), capped at MAX_PARAMS keys -> (params, truncated)."""
     params = {}
-    for key, values in request.args.lists():
+    for n, (key, values) in enumerate(request.args.lists()):
+        if n == MAX_PARAMS:
+            return params, True
         values = [_clip(v) for v in values]
         params[_clip(key)] = values[0] if len(values) == 1 else values
-    return params
+    return params, False
 
 
 def _current():
@@ -96,8 +125,9 @@ def note(step, outcome, **detail):
         record["decisions"].append({"step": step, "outcome": outcome, "detail": detail})
 
 
-def scooter(scooter_id=None, before=None, after=None):
-    """Record the scooter this request is about, and its state before/after (dicts)."""
+def scooter(scooter_id=None, before=None, in_memory=None):
+    """Record the scooter this request is about, its persisted state before the request,
+    and the state the route's in-memory object ended with (dicts)."""
     record = _current()
     if record is None:
         return
@@ -105,8 +135,25 @@ def scooter(scooter_id=None, before=None, after=None):
         record["scooter_id"] = _clip(scooter_id)
     if before is not None:
         record["scooter_before"] = dict(before)
-    if after is not None:
-        record["scooter_after"] = dict(after)
+    if in_memory is not None:
+        record["scooter_in_memory"] = dict(in_memory)
+
+
+def unchanged():
+    """The request decided not to write: the persisted state is still scooter_before."""
+    record = _current()
+    if record is not None and record["scooter_before"] is not None and not record["db_write"]["attempted"]:
+        record["scooter_after"] = dict(record["scooter_before"])
+
+
+def written(db_list):
+    """Called by write_db with the exact list it serialised: scooter_after becomes this
+    request's scooter as written to disk, not as the code believes it to be."""
+    record = _current()
+    if record is None or record["scooter_id"] is None:
+        return
+    entries = [s for s in db_list if isinstance(s, dict) and s.get("id") == record["scooter_id"]]
+    record["scooter_after"] = dict(entries[0]) if len(entries) == 1 else None
 
 
 def db_write(ok, error=None):
@@ -180,20 +227,24 @@ def init_app(app):
             "request_id": supplied if valid else uuid.uuid4().hex,
             "method": request.method,
             "path": _clip(request.path),
-            "params": _params(),
+            "params": None,
+            "params_truncated": False,
             "scooter_id": None,
             "decisions": [],
             "scooter_before": None,
             "scooter_after": None,
+            "scooter_in_memory": None,
             "db_write": {"attempted": False, "ok": None, "error": None},
             "status": None,
             "error": None,
             "duration_ms": None,
             "git_commit": GIT_COMMIT,
             "git_dirty": GIT_DIRTY,
+            "git_dirty_paths": GIT_DIRTY_PATHS,
             "pid": os.getpid(),
             "_t0": time.perf_counter(),
         }
+        record["params"], record["params_truncated"] = _params()
         g._record = record
         if supplied is not None and not valid:
             note("request_id", "client_value_rejected", reason="must be 1-64 chars of [A-Za-z0-9._-]")

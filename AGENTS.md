@@ -281,8 +281,10 @@ the evidence to use when debugging. Read the records before reading code.
   `X-Record-Error: <ExceptionType>` header. The server log gets an ERROR line,
   `REQUEST RECORD NOT WRITTEN: … (records=<path>, request_id=…)`, with the traceback.
 - **Code:** `records.py`. Route code calls `records.note(step, outcome, **detail)` for each
-  decision, `records.scooter(scooter_id=…, before=…, after=…)` for the affected scooter,
-  and `records.db_write(ok, error)`. `records.init_app(app)` adds the before/after/teardown
+  decision, `records.scooter(scooter_id=…, before=…, in_memory=…)` for the affected
+  scooter, and `records.unchanged()` when it decides not to write. `write_db` calls
+  `records.db_write(ok, error)` and `records.written(db_list)`. The latter is the only thing
+  that sets `scooter_after` after a write. `records.init_app(app)` adds the before/after/teardown
   hooks. The teardown hook is a safety net that still writes a record if no response was
   produced.
 - **Not done yet:** there's no log rotation (future work). The file grows until you move
@@ -302,11 +304,14 @@ the evidence to use when debugging. Read the records before reading code.
    {"step": "payment", "outcome": "requested", "detail": {"distance_m": 1509, "cost": 1509}},
    {"step": "payment", "outcome": "ok", "detail": {"txn_id": 379892831, "gateway_msg": null, "gateway_code": null}},
    {"step": "db_write", "outcome": "ok", "detail": {"db_path": "scooter_db.json"}}],
+ "params_truncated": false,
  "scooter_before": {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": true},
  "scooter_after": {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": false},
+ "scooter_in_memory": {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": false},
  "db_write": {"attempted": true, "ok": true, "error": null},
  "status": 200, "error": null, "duration_ms": 0.81,
- "git_commit": "1b65c022a8abc8307a90eb5ef2aea6f348521818", "git_dirty": true, "pid": 16070}
+ "git_commit": "1b65c022a8abc8307a90eb5ef2aea6f348521818", "git_dirty": false, "git_dirty_paths": [],
+ "pid": 16070}
 ```
 
 (On disk each record is a single line; it's wrapped here for reading.)
@@ -315,15 +320,17 @@ the evidence to use when debugging. Read the records before reading code.
 |---|---|
 | `ts` | When the request started, UTC ISO-8601 with milliseconds and a `Z`. Plain string comparison sorts and filters by time. |
 | `request_id` | Same as the `X-Request-ID` response header. |
-| `method`, `path`, `params` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. |
+| `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
 | `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `db_write` (`ok`/`failed`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
-| `scooter_before`, `scooter_after` | The scooter's state at lookup, and its state afterwards. When nothing was written (refused, payment failed) they're equal. `after` is `null` if the request crashed or the write failed. |
+| `scooter_before` | The scooter as read from the DB at lookup. |
+| `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed. |
+| `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
 | `db_write` | `{attempted, ok, error}`. `error` is the exception type. |
 | `status`, `error` | The HTTP status. `error` is `{kind, msg}` on failure (see Failure kinds), otherwise `null`. |
 | `exception` | Only on `internal_error` / `storage_error`: `{type, message}` of the underlying exception. The traceback is in the server log. |
 | `duration_ms` | Server-side time to produce the response. |
-| `git_commit`, `git_dirty` | The code that served the request, computed **once at startup**. `git_dirty` is `true` if any tracked or untracked (not ignored) file differed from `HEAD`, which is how a planted, uncommitted bug shows up. Both are `null` if git isn't available. Restart the server after changing code. |
+| `git_commit`, `git_dirty`, `git_dirty_paths` | The source tree at **server startup**. `git_dirty` is `true` if any *code* file, tracked or untracked (not git-ignored), differed from `HEAD`. That's how a planted, uncommitted bug shows up, and `git_dirty_paths` lists those files (first 20). Data files the app rewrites (`scooter_db.json`) don't count. All are `null` if git isn't available. **They describe the files on disk at startup, not necessarily the code that's running:** restart the server after changing code, and delete `__pycache__/` after planting or reverting a bug (a same-second, same-size revert can leave stale bytecode in use; AI_NOTES #22). |
 | `pid` | The process that served it, so you can tell gunicorn workers and restarts apart. |
 
 ### Querying records (until the CLI in PLAN PR 10)
@@ -337,9 +344,14 @@ R=data/records.jsonl     # or "$SCOOTER_RECORDS_PATH"
 jq 'select(.request_id == "probe-42")' $R
 grep '"request_id": "probe-42"' $R                       # same, without jq
 
-# One scooter's history, oldest first:
-jq -c 'select(.scooter_id == "18") | {ts, path, status, kind: .error.kind,
+# One scooter's history, oldest first. File order is completion order (several workers
+# can finish out of order), so sort by ts:
+jq -s -c 'map(select(.scooter_id == "18")) | sort_by(.ts)[] | {ts, path, status, kind: .error.kind,
        before: .scooter_before.is_reserved, after: .scooter_after.is_reserved}' $R
+
+# Requests where the code's view and what was written disagree (a persistence bug):
+jq -c 'select(.db_write.ok == true and .scooter_after != .scooter_in_memory)
+       | {ts, request_id, path, after: .scooter_after, in_memory: .scooter_in_memory}' $R
 
 # Failures by kind in the last hour (BSD date first, GNU date as fallback):
 SINCE=$(date -u -v-1H +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S)
