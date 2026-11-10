@@ -21,10 +21,21 @@ TOP_LEVEL_KEYS = {
     "error", "duration_ms", "git_commit", "git_dirty", "git_dirty_paths", "pid",
 }
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+# The seed is legacy-shaped (no "reservation" key), so 33 loads with a synthesised legacy
+# reservation (app.legacy_reservation) and records show it that way.
+LEGACY_33 = {"reservation_id": "legacy-33", "started_at": None, "start_request_id": None,
+             "payment_state": "active", "idempotency_key": "legacy-33", "legacy": True}
 SEED = {
-    "18": {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": False},
-    "33": {"id": "33", "lat": 24.0, "lng": -28.0, "is_reserved": True},
+    "18": {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": False, "reservation": None},
+    "33": {"id": "33", "lat": 24.0, "lng": -28.0, "is_reserved": True, "reservation": LEGACY_33},
 }
+
+
+def reserved_18(snapshot):
+    """SEED 18 reserved, with the (random) reservation the snapshot carries, after checking it's real."""
+    reservation = snapshot["reservation"]
+    assert isinstance(reservation, dict) and re.fullmatch(r"[0-9a-f]{32}", reservation["reservation_id"])
+    return dict(SEED["18"], is_reserved=True, reservation=reservation)
 
 
 def only_record(read_records):
@@ -133,9 +144,13 @@ def test_start_success_records_the_transition(client, read_records):
     assert (r["method"], r["path"], r["params"], r["scooter_id"], r["status"], r["error"]) == \
         ("GET", "/reservation/start", {"id": "18"}, "18", 200, None)
     assert r["scooter_before"] == SEED["18"]
-    assert r["scooter_after"] == r["scooter_in_memory"] == dict(SEED["18"], is_reserved=True)
+    assert r["scooter_after"] == r["scooter_in_memory"] == reserved_18(r["scooter_after"])
+    assert r["scooter_after"]["reservation"]["start_request_id"] == r["request_id"]
     assert r["db_write"] == {"attempted": True, "ok": True, "error": None}
-    assert steps(r) == [("db_lock", "acquired"), ("db_read", "ok"), ("lookup", "found"), ("reserve", "allowed"), ("db_write", "ok")]
+    assert steps(r) == [("db_lock", "acquired"), ("db_read", "ok"), ("lookup", "found"), ("reserve", "allowed"),
+                        ("reservation", "created"), ("db_write", "ok")]
+    created = [d for d in r["decisions"] if d["step"] == "reservation"][0]
+    assert created["detail"] == {"reservation_id": r["scooter_after"]["reservation"]["reservation_id"]}
 
 
 def test_start_already_reserved_records_no_change(client, read_records):
@@ -158,11 +173,14 @@ def test_end_success_records_payment_and_move(client, read_records):
     client.get("/reservation/start?id=18")
     client.get("/reservation/end?id=18&lat=23.01&lng=19.01")
     r = read_records()[-1]
-    assert r["scooter_before"] == dict(SEED["18"], is_reserved=True)
-    assert r["scooter_after"] == r["scooter_in_memory"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
+    assert r["scooter_before"] == reserved_18(r["scooter_before"])
+    assert r["scooter_after"] == r["scooter_in_memory"] == \
+        {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False, "reservation": None}
     assert r["db_write"]["ok"] is True and r["status"] == 200
     assert steps(r) == [("params", "ok"), ("db_lock", "acquired"), ("db_read", "ok"), ("lookup", "found"), ("end", "allowed"),
-                        ("payment", "requested"), ("payment", "ok"), ("db_write", "ok")]
+                        ("payment", "requested"), ("payment", "ok"), ("reservation", "cleared"), ("db_write", "ok")]
+    cleared = [d for d in r["decisions"] if d["step"] == "reservation"][0]
+    assert cleared["detail"] == {"reservation_id": r["scooter_before"]["reservation"]["reservation_id"], "legacy": False}
     payment = [d for d in r["decisions"] if d["step"] == "payment"]
     assert payment[0]["detail"]["cost"] == payment[0]["detail"]["distance_m"] > 0
     assert payment[1]["detail"]["txn_id"] == 379892831
@@ -174,7 +192,7 @@ def test_end_payment_failed_records_ride_left_open(client, monkeypatch, read_rec
     client.get("/reservation/end?id=18&lat=1&lng=1")
     r = read_records()[-1]
     assert ("payment", "failed") in steps(r)
-    assert r["scooter_before"] == r["scooter_after"] == dict(SEED["18"], is_reserved=True)
+    assert r["scooter_before"] == r["scooter_after"] == reserved_18(r["scooter_before"])
     assert r["db_write"]["attempted"] is False
     assert r["error"]["kind"] == "payment_failed" and r["status"] == 502
 
@@ -240,7 +258,7 @@ def test_internal_error_record_has_exception_details(client, monkeypatch, read_r
     client.get("/reservation/end?id=18&lat=1&lng=1")
     r = read_records()[-1]
     assert r["exception"] == {"type": "RuntimeError", "message": "planted bug"}
-    assert r["scooter_before"] == dict(SEED["18"], is_reserved=True) and r["scooter_after"] is None
+    assert r["scooter_before"] == reserved_18(r["scooter_before"]) and r["scooter_after"] is None
     assert ("payment", "requested") not in steps(r)        # it crashed while computing the cost
 
 
@@ -395,11 +413,13 @@ import app
 resp = app.app.test_client().get("/reservation/end?id=18&lat=23.01&lng=19.01")
 print(resp.status_code)
 """
-_CORRECT_ORDER = """\t\t\t\t\tscooter.is_reserved = False
+_CORRECT_ORDER = """\t\t\t\t\tscooter.reservation = None
+\t\t\t\t\tscooter.is_reserved = False
 \t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
 \t\t\t\t\twrite_db(db, txn.path)
 """
 _BUGGY_ORDER = """\t\t\t\t\twrite_db(db, txn.path)
+\t\t\t\t\tscooter.reservation = None
 \t\t\t\t\tscooter.is_reserved = False
 \t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
 """
@@ -425,11 +445,13 @@ def test_planted_write_ordering_bug_is_visible_in_the_record(tmp_path, db_path, 
     out = subprocess.run([sys.executable, "-c", _PLANT, str(planted)], env=env, capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "200"                                   # the bug "succeeds"
     on_disk = read_db()["18"]
-    assert on_disk == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True}
+    # 18 was set reserved in a legacy-shaped seed, so it carries the synthesised legacy reservation
+    assert on_disk == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True,
+                       "reservation": dict(LEGACY_33, reservation_id="legacy-18", idempotency_key="legacy-18")}
     r = only_record(read_records)
     assert r["db_write"]["ok"] is True
     assert r["scooter_after"] == on_disk                                  # the truth on disk
-    assert r["scooter_in_memory"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
+    assert r["scooter_in_memory"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False, "reservation": None}
     assert r["scooter_after"] != r["scooter_in_memory"]                   # the discrepancy
 
 
@@ -441,13 +463,13 @@ def test_after_state_comes_from_the_serialised_data(client, monkeypatch, read_db
         rows = real(db)
         for row in rows:
             if row["id"] == "18":
-                row["is_reserved"] = False                              # pretend the change was lost
+                row.update(is_reserved=False, reservation=None)         # pretend the change was lost
         return rows
     monkeypatch.setattr(app_module, "convert_db_to_dictlist", stale)
     client.get("/reservation/start?id=18")
     r = only_record(read_records)
     assert r["scooter_after"] == read_db()["18"] == SEED["18"]
-    assert r["scooter_in_memory"] == dict(SEED["18"], is_reserved=True)
+    assert r["scooter_in_memory"] == reserved_18(r["scooter_in_memory"])
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write a read-only file")
@@ -462,7 +484,7 @@ def test_end_with_unwritable_db_has_no_after_state(client, db_path, read_records
     assert r["db_write"] == {"attempted": True, "ok": False, "error": "PermissionError"}
     assert r["scooter_after"] is None                       # nothing known to be persisted
     assert r["scooter_in_memory"] is None                   # the route never got past write_db
-    assert r["scooter_before"] == dict(SEED["18"], is_reserved=True)
+    assert r["scooter_before"] == reserved_18(r["scooter_before"])
 
 
 def test_param_count_is_capped(client, read_records):

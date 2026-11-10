@@ -12,10 +12,14 @@ def available_ids(get_json):
 # ---- start -------------------------------------------------------------------------
 
 def test_start_reserves_scooter_and_persists_it(get_json, read_db):
-    assert get_json("/reservation/start?id=18", 200) == {"msg": reserved_ok("18")}
-    assert read_db()["18"]["is_reserved"] is True
-    # Nothing else about the scooter changes.
-    assert read_db()["18"] == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True}
+    body = get_json("/reservation/start?id=18", 200)
+    assert body == {"msg": reserved_ok("18"), "reservation_id": body["reservation_id"]}
+    on_disk = read_db()["18"]
+    assert on_disk["is_reserved"] is True
+    # The reservation is persisted with it (its fields: test_reservation_state.py) ...
+    assert on_disk.pop("reservation")["reservation_id"] == body["reservation_id"]
+    # ... and nothing else about the scooter changes.
+    assert on_disk == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True}
 
 
 def test_reserved_scooter_disappears_from_available_and_search(get_json):
@@ -58,7 +62,7 @@ def test_end_frees_scooter_at_new_location_and_persists_it(get_json, read_db):
     body = get_json("/reservation/end?id=18&lat=23.01&lng=19.01", 200)
     assert body["msg"] == ended_ok("18")
     assert "txn_id" in body  # its type is a known bug, see test_known_bugs.py
-    assert read_db()["18"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
+    assert read_db()["18"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False, "reservation": None}
 
 
 def test_ended_scooter_is_available_at_new_location(get_json):
@@ -112,7 +116,8 @@ def test_end_non_numeric_coordinate(get_json, read_db, query):
 @pytest.mark.parametrize("lat,lng", [("90", "180"), ("-90", "-180")])
 def test_end_accepts_coordinate_bounds(get_json, read_db, lat, lng):
     assert get_json(f"/reservation/end?id=33&lat={lat}&lng={lng}", 200)["msg"] == ended_ok("33")
-    assert read_db()["33"] == {"id": "33", "lat": float(lat), "lng": float(lng), "is_reserved": False}
+    assert read_db()["33"] == {"id": "33", "lat": float(lat), "lng": float(lng), "is_reserved": False,
+                               "reservation": None}
 
 
 @pytest.mark.parametrize("lat", ["-91", "90.5"])

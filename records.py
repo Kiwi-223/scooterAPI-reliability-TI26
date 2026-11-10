@@ -118,6 +118,12 @@ def _current():
 
 # ---- API used by route code -----------------------------------------------------------
 
+def current_request_id():
+    """The current request's id (its X-Request-ID), or None outside a request."""
+    record = _current()
+    return record["request_id"] if record is not None else None
+
+
 def note(step, outcome, **detail):
     """Append a decision: what the request did at `step` and how it came out."""
     record = _current()

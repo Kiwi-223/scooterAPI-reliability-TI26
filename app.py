@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-import fcntl, tempfile, time
+import copy, datetime, fcntl, tempfile, time, uuid
 from flask import Flask, render_template, request, redirect, url_for, make_response
 from geopy.distance import distance as geodesic
 import json, math, os, werkzeug
@@ -89,7 +89,7 @@ def view_all_available():
 	db = init_db(get_db_path())	# lock-free read: writers replace the file atomically
 	available_scooters = [scooter for scooter in db if not scooter.is_reserved]
 	records.note('filter', 'ok', available=len(available_scooters))
-	available_scooters_dictlist = convert_db_to_dictlist(available_scooters)
+	available_scooters_dictlist = [scooter.to_public_dict() for scooter in available_scooters]
 	return json.dumps(available_scooters_dictlist), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# return a json-ified list of all the scooters with status 200
 
 
@@ -165,10 +165,13 @@ def start_reservation():
 			if not scooter.is_reserved:
 				# scooter can be reserved
 				records.note('reserve', 'allowed', reason='scooter is not reserved')
+				scooter.reservation = new_reservation()
 				scooter.is_reserved = True
+				records.note('reservation', 'created', reservation_id=scooter.reservation['reservation_id'])
 				write_db(db, txn.path)	# update db
 				records.scooter(in_memory=scooter.to_dict())
-				success = { 'msg': f'Scooter {reserve_id} was reserved successfully.' }
+				success = { 'msg': f'Scooter {reserve_id} was reserved successfully.',
+							'reservation_id': scooter.reservation['reservation_id'] }
 				return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
 
 			else:
@@ -224,7 +227,10 @@ def end_reservation():
 				if payment_response['status']:
 					# the payment was completed successfully
 				
-					# update scooter's reserved status and location
+					# close the reservation, then update scooter's reserved status and location
+					records.note('reservation', 'cleared', reservation_id=scooter.reservation['reservation_id'],
+						legacy=scooter.reservation.get('legacy', False))
+					scooter.reservation = None
 					scooter.is_reserved = False
 					scooter.lat, scooter.lng = end_lat, end_lng
 					write_db(db, txn.path)
@@ -381,37 +387,124 @@ def init_db(path=None):
 		scooter_obj = Scooter(	scooter['id'], 
 								scooter['lat'], 
 								scooter['lng'], 
-								scooter['is_reserved']
+								scooter['is_reserved'],
+								load_reservation(scooter),
+								{ key: value for key, value in scooter.items() if key not in SCOOTER_FIELDS }
 							 )
 		db.append(scooter_obj)
 	return db
 
 
-DB_FIELDS = { 'id', 'lat', 'lng', 'is_reserved' }
+DB_FIELDS = { 'id', 'lat', 'lng', 'is_reserved' }	# required in every entry
+SCOOTER_FIELDS = DB_FIELDS | { 'reservation' }		# known; any other field is kept as-is (Scooter.extra)
+# A reservation object (AGENTS.md "Database schema"). Unknown keys inside it are kept as-is.
+RESERVATION_FIELDS = { 'reservation_id', 'started_at', 'start_request_id', 'payment_state', 'idempotency_key' }
+# The payment states this code knows how to handle. PLAN PRs 13-15 add more (payment_pending,
+# paid, outstanding_balance, ...). A state this code doesn't know is refused as storage_error
+# rather than guessed at: ending a ride in an unknown payment state could charge twice.
+PAYMENT_STATES = { 'active' }
+LAT_RANGE, LNG_RANGE = (-90, 90), (-180, 180)
 
 def _is_number(value):
 	# bool is an int subclass in Python, so reject it explicitly; NaN/inf aren't coordinates.
 	return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float('inf')
 
+def _is_nonempty_str(value):
+	return isinstance(value, str) and value != ''
+
+def find_reservation_problem(reservation):
+	# Returns a short, client-safe description of what's wrong with a reservation object, or None.
+	if not isinstance(reservation, dict):
+		return f'reservation is {type(reservation).__name__}, not an object or null'
+	missing = RESERVATION_FIELDS - set(reservation)
+	if missing:
+		return f'reservation is missing {sorted(missing)}'
+	for field in ('reservation_id', 'idempotency_key'):
+		if not _is_nonempty_str(reservation[field]):
+			return f'reservation.{field} is not a non-empty string'
+	for field in ('started_at', 'start_request_id'):
+		if reservation[field] is not None and not isinstance(reservation[field], str):
+			return f'reservation.{field} is {type(reservation[field]).__name__}, not a string or null'
+	if not isinstance(reservation['payment_state'], str) or reservation['payment_state'] not in PAYMENT_STATES:	# (a list isn't hashable)
+		return f'reservation.payment_state is not one of {sorted(PAYMENT_STATES)}'
+	if 'legacy' in reservation and not isinstance(reservation['legacy'], bool):
+		return 'reservation.legacy is not a boolean'
+	return None
+
 def find_db_shape_problem(db_list):
 	# Returns a short, client-safe description of the first shape problem, or None.
+	# Messages name entry indexes and fields, never values from the file.
 	if not isinstance(db_list, list):
 		return f'top level is {type(db_list).__name__}, not a list'
+	first_index_of_id = {}
 	for i, scooter in enumerate(db_list):
 		if not isinstance(scooter, dict):
 			return f'entry {i} is {type(scooter).__name__}, not an object'
 		missing = DB_FIELDS - set(scooter)
 		if missing:
-			# Extra fields are tolerated (forward compatibility, e.g. PLAN PR 12's reservation state).
+			# Extra fields are tolerated (forward compatibility) and written back unchanged.
 			return f'entry {i} is missing {sorted(missing)}'
 		if not isinstance(scooter['id'], str):
 			return f'entry {i}: id is {type(scooter["id"]).__name__}, not a string'
-		for field in ('lat', 'lng'):
+		if scooter['id'] in first_index_of_id:
+			return f'entry {i}: duplicate id (same as entry {first_index_of_id[scooter["id"]]})'
+		first_index_of_id[scooter['id']] = i
+		for field, (low, high) in (('lat', LAT_RANGE), ('lng', LNG_RANGE)):
 			if not _is_number(scooter[field]):
 				return f'entry {i}: {field} is not a finite number'
+			if not low <= scooter[field] <= high:
+				return f'entry {i}: {field} is outside [{low}, {high}]'
 		if not isinstance(scooter['is_reserved'], bool):
 			return f'entry {i}: is_reserved is {type(scooter["is_reserved"]).__name__}, not a boolean'
+		if 'reservation' in scooter:
+			# The invariant: a scooter is reserved exactly when it has a reservation object.
+			# (No 'reservation' key at all is the legacy, pre-PLAN PR 12 shape: see load_reservation.)
+			reservation = scooter['reservation']
+			if scooter['is_reserved'] and reservation is None:
+				return f'entry {i}: is_reserved is true but reservation is null'
+			if not scooter['is_reserved'] and reservation is not None:
+				return f'entry {i}: is_reserved is false but reservation is set'
+			if reservation is not None:
+				problem = find_reservation_problem(reservation)
+				if problem:
+					return f'entry {i}: {problem}'
 	return None
+
+def legacy_reservation(scooter_id):
+	# A reservation for a scooter that was reserved before reservations were persisted
+	# (PLAN PR 12): there is no record of when or by which request it started. Deterministic,
+	# so every read of the same legacy entry gives the same reservation_id.
+	reservation_id = f'legacy-{scooter_id}'
+	return {	'reservation_id': reservation_id,
+				'started_at': None,
+				'start_request_id': None,
+				'payment_state': 'active',
+				'idempotency_key': reservation_id,
+				'legacy': True
+		   }
+
+def load_reservation(scooter):
+	# The reservation for a DB entry that passed find_db_shape_problem.
+	if 'reservation' in scooter:
+		return scooter['reservation']
+	# Legacy entry (no 'reservation' key): free -> None; reserved -> a synthesised legacy
+	# reservation. Either way the next write of the DB stores the new shape.
+	return legacy_reservation(scooter['id']) if scooter['is_reserved'] else None
+
+def utc_now_iso():
+	return datetime.datetime.now(datetime.UTC).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+
+def new_reservation():
+	# A reservation created by /reservation/start. idempotency_key equals reservation_id:
+	# one reservation is one ride is one charge. It's stored as its own field so that a later
+	# PR can derive it differently (e.g. per payment attempt) without changing the id.
+	reservation_id = uuid.uuid4().hex
+	return {	'reservation_id': reservation_id,
+				'started_at': utc_now_iso(),
+				'start_request_id': records.current_request_id(),
+				'payment_state': 'active',
+				'idempotency_key': reservation_id
+		   }
 	
 	
 def find_scooter(search_id, db):
@@ -475,8 +568,16 @@ def _replace_atomically(path, data):
 def write_db(db, path=None):
 	# serialize Scooter objects 
 	db_list = convert_db_to_dictlist(db)
-	db_json = json.dumps(db_list)
 	path = path or get_db_path()
+	problem = find_db_shape_problem(db_list)
+	if problem:
+		# A code bug produced state that init_db would refuse (e.g. reserved without a
+		# reservation). Writing it would turn every later request into storage_error, so
+		# refuse the write and leave the DB as it was; this request becomes internal_error.
+		records.db_write(False, 'InvalidDbState')
+		records.note('db_write', 'refused', db_path=path, error=problem)
+		raise RuntimeError(f'refusing to write an invalid scooter database ({problem})')
+	db_json = json.dumps(db_list)
 	try:
 		dir_fsync_error = _replace_atomically(path, db_json)
 	except OSError as e:
@@ -493,18 +594,29 @@ def write_db(db, path=None):
 		
 # class scooter for internal use
 class Scooter:
-	def __init__(self, scooter_id, lat, lng, is_reserved):
+	def __init__(self, scooter_id, lat, lng, is_reserved, reservation=None, extra=None):
 		self.id = scooter_id
 		self.lat = lat
 		self.lng = lng
 		self.is_reserved = is_reserved
+		self.reservation = reservation	# dict while reserved, None while free (see RESERVATION_FIELDS)
+		self.extra = extra or {}		# unknown top-level DB fields, written back unchanged
 	
 	def to_dict(self):
-		return {	'id':self.id, 
-					'lat':self.lat, 
-					'lng':self.lng, 
-					'is_reserved':self.is_reserved
-			   }
+		# The full persisted form: what write_db serialises and what request records show.
+		scooter_dict = {	'id':self.id, 
+							'lat':self.lat, 
+							'lng':self.lng, 
+							'is_reserved':self.is_reserved,
+							'reservation':copy.deepcopy(self.reservation)
+					   }
+		for key, value in self.extra.items():
+			scooter_dict[key] = copy.deepcopy(value)
+		return scooter_dict
+
+	def to_public_dict(self):
+		# The README's public shape for /view_all_available: exactly these four fields.
+		return { 'id':self.id, 'lat':self.lat, 'lng':self.lng, 'is_reserved':self.is_reserved }
 		
 def convert_db_to_dictlist(db):
 	db_list = []

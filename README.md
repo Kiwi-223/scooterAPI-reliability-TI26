@@ -107,7 +107,11 @@ GET /reservation/start
 #### Success Responses:
 
 * **Code**: 200 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the successful operation.
+  **Content**: JSON object with a `msg` property that gives a brief description of the successful operation, and a `reservation_id` property (string) that identifies the reservation just started. Each start gets a new `reservation_id`.
+  ```json
+  {"msg": "Scooter 18 was reserved successfully.", "reservation_id": "f36f087baa0842929afe8d9eaf0e8598"}
+  ```
+  `reservation_id` was added later; clients that only read `msg` are unaffected.
 
 
 #### Error Responses:
