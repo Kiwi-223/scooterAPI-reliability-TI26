@@ -135,7 +135,8 @@ same command (see CI below).
   - `tests/messages.py` holds the exact `msg` strings the API returns today.
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
     `test_failure_kinds.py`, `test_records.py`, `test_records_query.py`, `test_db_transactions.py`,
-    `test_reservation_state.py`, `test_payments.py`, `test_end_ride.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
+    `test_reservation_state.py`, `test_payments.py`, `test_end_ride.py`, `test_planted_payment_bugs.py`,
+    `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
   - `tests/invariants.py` checks the end-ride invariants against the DB, the ledger and the
@@ -434,8 +435,15 @@ reservation moves through these states, and every arrow is one atomic DB write:
   records):
   - **I1** no charge without an ended or `payment_pending` ride;
   - **I2** no ended ride without exactly one charge or one outstanding balance;
-  - **I3** at most one charge per reservation;
-  - **I4** a reserved scooter always has an `active` or `payment_pending` reservation.
+  - **I3** at most one charge per reservation, **whatever key it was charged under**
+    (checked per idempotency key *and* per `reservation_id`, which every ledger entry
+    carries), and no charge under a key that no reservation ever owned. A **double charge**
+    across two keys (e.g. code that makes a new key per attempt) breaks this;
+  - **I4** a reserved scooter always has an `active` or `payment_pending` reservation;
+  - **I5** every charge's and every balance's **amount** equals the amount fixed when that
+    ride's payment started (the records' `payment: requested` cost). I1–I4 check that a
+    charge or balance *exists*; only I5 checks *how much*. (Added in PLAN PR 14b, after a
+    review planted a 0-amount balance that I1–I4 accepted.)
 
   `test_end_ride.py` checks them after every step of every fault (`none`, `decline`, both
   timeouts, `error`) × {first attempt, retry, retry from a fresh process, 4 concurrent
@@ -774,7 +782,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -796,6 +804,7 @@ make records ARGS="recent-failures --limit 20"     # newest failures first (--si
 make records ARGS="scooter 18"                     # one scooter's history, oldest first by ts
 make records ARGS="request <request_id>"           # the full record(s) for an X-Request-ID
 make records ARGS="anomalies"                      # records whose fields contradict each other
+make records ARGS="ledger-check"                   # ledger vs records: double charges, died-mid-payment requests
 make records ARGS="--json failure-counts"          # machine-readable output (global flags go first)
 .venv/bin/python -m records_query --help           # same CLI without make
 ```
@@ -819,7 +828,8 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
   files. A leading byte-order mark is ignored (`utf-8-sig`). A line that isn't a complete JSON object (e.g. a partially written last line or a
   stray `42`) is skipped with `warning: <file>:<line>: skipped line, …` on stderr; the
   query still answers.
-- **`anomalies`** flags ten contradictions, each within a single record:
+- **`anomalies`** flags fifteen contradictions. Most are within a single record;
+  `pending_location_changed` and `double_charge` also compare records with each other:
   - **`write_not_persisted`:** `db_write.ok` is true but `scooter_after` ≠
     `scooter_in_memory`. The code changed the scooter, but the written data didn't contain
     the change.
@@ -846,13 +856,70 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     later `db_write` in the same request `failed` or was `refused`. The DB still says
     `payment_pending`, so a retry or reconcile settles it. This one is expected after a
     disk failure; it says which rides need settling.
-  - **`decline_not_settled`:** `payment_declined`, but `scooter_after` is still reserved or
-    has no outstanding balance for that reservation (H3).
+  - **`decline_not_settled`:** `payment_declined`, but `scooter_after` is still reserved,
+    or has no outstanding balance for that reservation **with the amount charged for** (the
+    `payment: requested` cost) **and the reservation's idempotency key** (H3).
   - **`failed_payment_not_pending`:** `payment_timeout`/`payment_failed`, but
     `scooter_after`'s reservation isn't `payment_pending`, so the ride can't be settled.
+  - **`ended_without_payment`:** `/reservation/end` returned 200 but the request's final
+    payment result isn't `ok` (or there was none), e.g. code that treats a timeout or a
+    conflict as paid. Also a `payment_declined` whose gateway outcome wasn't a decline.
+  - **`charged_before_pending_persisted`:** a first-attempt end (it has a `payment: pending`
+    decision) asked the gateway to charge before any `db_write: ok` after that decision.
+    Phase 1 must be on disk before the charge. This shows in **every** such record, even
+    when nothing crashed.
+  - **`pending_location_changed`:** a retry (`end: retry`) re-priced the ride (it has its own
+    `payment: pending`), or charged a different end location or amount than the one stored
+    for it: the retry decision's own stored values, or any earlier record's
+    `payment: pending` for the same idempotency key (looked up across the whole file, even
+    outside `--since`).
+  - **`payment_key_mismatch`:** the payment result says the gateway charged under an
+    idempotency key (or `reservation_id`) other than the reservation's own, from
+    `scooter_before`. The gateway reports what it was actually charged under, so this
+    doesn't depend on what the app *meant* to send.
+  - **`double_charge`:** a second, different charge (ledger `txn_id`) for a reservation
+    that an earlier record (anywhere in the file) already shows charged: **one ride paid
+    twice**. This is the failure class Outcome 3 most needs to rule out. `ledger-check`
+    (below) finds it from the ledger too, including charges made by requests that left no
+    record.
 
-  The two reservation rules only judge snapshots that have a `reservation` key, so records
-  written before PLAN PR 12 aren't flagged.
+  The reservation rules only judge snapshots that have a `reservation` key, and the
+  payment-ordering rules only judge records that have a `payment: pending` decision, so
+  records written before PLAN PRs 12/14 aren't flagged.
+
+  **Tested against planted bugs** (`tests/test_planted_payment_bugs.py`): eight bugs a
+  grader might plant in the end-ride state machine. Each is planted in a copy of `app.py`,
+  a fault scenario is run against it, and the test requires `anomalies` to name it:
+
+  | Planted bug | Rule that names it |
+  |---|---|
+  | a decline records no balance | `decline_not_settled` |
+  | `timeout_not_charged` ends the ride as paid | `ended_without_payment` |
+  | the phase-1 (`payment_pending`) write removed | `charged_before_pending_persisted` |
+  | a retry re-prices at the request's coordinates | `pending_location_changed` |
+  | the ride ends at the request's coordinates | `end_location_not_persisted` |
+  | a decline keeps the ride pending | `decline_not_settled` |
+  | a conflict ends the ride (a free ride) | `ended_without_payment` |
+  | a decline's balance recorded as 0 | `decline_not_settled` |
+  | **a new idempotency key per attempt** (a charged timeout plus a retry charges the ride twice: a **double charge**) | `double_charge`, `payment_key_mismatch` |
+  | a decline's balance recorded under the wrong key | `decline_not_settled` |
+
+  The same scenarios on the real app give no anomalies.
+
+  **What `anomalies` can't see** (don't overclaim it):
+  - **Requests that left no record.** A worker killed mid-request writes nothing, so no rule
+    can judge that request. Use `ledger-check` (below) for the payment side.
+  - **Anything not in the records.** It doesn't read the DB or the ledger. It can't tell
+    that a charge in the ledger was for the wrong amount, or that the DB was restored or
+    edited by hand. That needs the cross-file invariants (`tests/invariants.py`, I1–I5;
+    PLAN PR 15's reconcile will reuse them).
+  - **Bugs that keep the records self-consistent.** For example, a `calculate_cost` that
+    charges the wrong price everywhere, or a code path that records a decision it didn't
+    actually take. The rules compare what a record says with itself; they don't
+    recompute prices.
+  - **The phase-1 rule needs the `payment: pending` decision.** Code that skips
+    `begin_payment` entirely would also skip that decision; `end_location_not_persisted`
+    and the tests catch that case instead.
 
   Tested to have zero false positives on every legitimate flow: start, end, re-reserve
   after end, refused starts and ends, ending a legacy reservation and re-reserving that
@@ -867,9 +934,37 @@ make records ARGS="--json failure-counts"          # machine-readable output (gl
     mostly be noise. The per-record rules catch persistence bugs inside the request that
     caused them. For a manual continuity view, use `make records ARGS="scooter <id>"`,
     which prints before/after for each request in `ts` order.
+- **`ledger-check`** (exit 1 if it finds a problem) cross-checks the payments ledger against
+  the records. Run it when a payment looks wrong, or after a crash, a deploy or a `kill -9`.
+  It reports:
+  - **double charges:** two or more charges for one `reservation_id`, under any keys. One
+    ride paid twice; this finds it even when the requests left no record.
+  - **charges under a foreign key:** a charge whose `idempotency_key` isn't its
+    `reservation_id`. Every key equals its reservation id, so this is a key no reservation
+    owns.
+  - **open orphans:** ledger entries whose `request_id` has no request record. The request
+    called the gateway and never finished (a SIGKILLed or crashed worker), and no later
+    request has used that key since. `anomalies` can't see these, because there's no
+    record. For each, check the key with `make payments ARGS="lookup <key>"`. The ride is
+    usually still `payment_pending` (phase 1 was saved before the charge), and a retry of
+    `/reservation/end` settles it with that charge. If the worker died after saving, the
+    ride has already ended.
+  - **resolved orphans:** the same, but a later request used the key (the retry that
+    settled it). They're listed as evidence of the crash, and don't count toward exit 1.
+  - `--ledger PATH` (default `$SCOOTER_PAYMENTS_LEDGER_PATH`, else
+    `data/payments_ledger.jsonl`). Entries younger than `--min-age` seconds (default 5) are
+    skipped, because their request may still be running. Use `--min-age 0` when nothing is
+    running. `--json` gives `{open_orphans, resolved_orphans, double_charges, foreign_keys}`.
+  - **Verified live:** a gunicorn worker `kill -9`'d during a `timeout_charged` payment
+    left the ride `payment_pending` with a charge, no record, and 0 anomalies. The orphan
+    check (then called `payment-orphans`, with the same logic) listed it, and a retry
+    settled it at the stored location with the same charge. After a settle,
+    `ledger-check` lists such an entry as resolved (`test_cli_ledger_check`).
 - **Code:** `records_query.py`. These are pure functions over any iterable of records:
   `read_records(path, warn)`, `parse_since`, `failure_counts`, `recent_failures`,
-  `scooter_history`, `find_requests`, `anomalies`. `main()` is the CLI.
+  `scooter_history`, `find_requests`, `anomalies`, `read_ledger`, `ledger_check`,
+  `ledger_problems`.
+  `main()` is the CLI.
 
 **Fallback: jq.** These recipes are verified with jq 1.7 (`jq` ships with macOS).
 

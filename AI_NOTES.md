@@ -551,3 +551,57 @@ strongest entries.
   from the event's identity (who, which reservation, where it ended), never from a value
   computed from it, and don't carry a review's wording into code without testing its edge
   cases.
+
+### 29. "Invariants + anomalies prove Outcome 3" overclaimed what was checked
+- **Where:** PR #17 (PLAN PR 14): its description and AGENTS.md "Payment state machine".
+- **What the AI claimed:** the PR presented the invariant checker (I1–I4) plus a clean
+  `anomalies` run after every fault scenario and a soak as the proof that "when payment
+  fails, the system never ends up in a bad state" (ACTIVITY Outcome 3).
+- **Reality:** the *test suite* caught all 8 bugs the reviewer planted, but the evidence
+  tools a cold agent actually has were weaker:
+  - `make records ARGS="anomalies"` was silent on four of the bugs: a timeout ending the
+    ride as paid, the phase-1 write removed, a retry re-pricing the ride, and a decline
+    recorded as a 0-amount balance.
+  - The reviewer's scenario didn't exercise a fifth (a conflict ending the ride). Running
+    the old rules on this PR's scenarios, `anomalies` named only 3 of the 8.
+  - The invariants checked that a charge or balance *existed*, never its amount, so a
+    0-amount balance for a 1 km ride passed I1–I4.
+  - "Proof" was true of the suite, not of what an agent without the code can see.
+- **How it was caught:** the reviewer planted each bug and ran three checks separately:
+  the suite, the invariants and `anomalies`.
+- **What changed (PLAN PR 14b):**
+  - New rules `ended_without_payment`, `charged_before_pending_persisted` and
+    `pending_location_changed`. `decline_not_settled` now checks the amount.
+  - Invariant I5 checks amounts.
+  - `payment-orphans` finds requests that died mid-payment.
+  - `tests/test_planted_payment_bugs.py` requires `anomalies` to name each of the 8 bugs.
+  - AGENTS.md has a "What `anomalies` can't see" list.
+  - Lesson: when claiming proof, say what was checked (presence, ordering, amounts) and
+    with which tool. A suite that catches a bug doesn't mean the operator's tool can see
+    it. Test the evidence tool against the same planted bugs as the code.
+
+### 30. "All 8 planted bugs flagged" was presented as coverage, but the worst failure wasn't in the list
+- **Where:** PR #18 (PLAN PR 14b): its description, AGENTS.md's planted-bug table, and
+  `tests/test_planted_payment_bugs.py`.
+- **What the AI claimed:** with every one of PR #17's 8 planted bugs named by `anomalies`,
+  the cold agent's evidence tool now covered the end-ride state machine's failure modes.
+- **Reality:** the reviewer planted a ninth, plausible bug: a new idempotency key per
+  attempt. A charged timeout followed by a retry then charged **one ride twice**, the
+  worst outcome Outcome 3 exists to rule out.
+  - `anomalies` was silent.
+  - The invariants misreported it as "I2 ended without a charge", because the charges
+    were under keys no reservation owned.
+  - The 8-bug list had been treated as the spec for coverage, rather than the failure
+    classes that matter.
+- **How it was caught:** the reviewer went beyond the listed bugs and asked what bug would
+  produce a double charge.
+- **What changed:**
+  - Payment results record the key and reservation the gateway actually charged under.
+  - New anomalies `payment_key_mismatch` and `double_charge` (checked across records and
+    windows).
+  - I3 now counts charges per `reservation_id` and flags keys no reservation owned.
+  - `ledger-check` finds double charges and foreign keys straight from the ledger.
+  - The bug is now planted as M9, and a decline balance under the wrong key as M10.
+  - AGENTS.md names "double charge" as the failure class.
+  - Lesson: start from the failure class that matters most (here, charging a ride twice).
+    Plant every way you can think of to cause it, not only the bugs someone else listed.

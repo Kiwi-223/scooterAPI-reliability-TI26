@@ -22,7 +22,7 @@ import app as app_module
 import payments
 import records_query as rq
 from failures import FailureKind
-from invariants import started_keys, violations
+from invariants import pending_amounts, started_keys, violations
 from test_failure_kinds import assert_envelope
 
 REPO = Path(__file__).resolve().parent.parent
@@ -54,7 +54,8 @@ def assert_invariants(db_path, read_ledger, read_records):
     initial = raw_db(db_path)
 
     def check():
-        found = violations(raw_db(db_path), read_ledger(), started_keys(read_records(), initial))
+        records = read_records()
+        found = violations(raw_db(db_path), read_ledger(), started_keys(records, initial), pending_amounts(records))
         assert found == [], found
     return check
 
@@ -414,7 +415,7 @@ def _entry(sid="18", reservation=None, reserved=None, balances=None):
 
 
 def _charge(key, txn="t1"):
-    return {"idempotency_key": key, "charged": True, "txn_id": txn}
+    return {"idempotency_key": key, "reservation_id": key, "charged": True, "txn_id": txn}
 
 
 @pytest.mark.parametrize("db,ledger,keys,expected", [
@@ -432,6 +433,41 @@ def _charge(key, txn="t1"):
 ])
 def test_the_invariant_checker_catches_each_violation(db, ledger, keys, expected):
     assert expected in [v[0] for v in violations(db, ledger, keys)]
+
+
+def test_the_invariant_checker_catches_a_double_charge_across_keys():
+    # PR #18's review: each attempt charged under its own key (k-0, k-1) for reservation k.
+    ledger = [dict(_charge("k-0", "t1"), reservation_id="k"), dict(_charge("k-1", "t2"), reservation_id="k")]
+    found = [v[0] for v in violations([_entry()], ledger, {"k"})]
+    assert "I3 one reservation charged more than once (a double charge)" in found
+    assert "I3 charged under a key no reservation owned" in found
+
+
+AMOUNTS = {"k": {1000}}
+
+
+@pytest.mark.parametrize("db,ledger,expected", [
+    ([_entry()], [dict(_charge("k"), amount=999)], "I5 charged an amount that wasn't fixed at pending"),
+    ([_entry(balances=[{"idempotency_key": "k", "amount": 0}])], [], "I5 balance amount differs from the amount fixed at pending"),
+])
+def test_the_invariant_checker_catches_wrong_amounts(db, ledger, expected):
+    assert [v[0] for v in violations(db, ledger, {"k"}, AMOUNTS)] == [expected]
+    assert violations(db, ledger, {"k"}) == []                        # I1-I4 alone can't see it
+
+
+@pytest.mark.parametrize("db,ledger", [
+    ([_entry()], [dict(_charge("k"), amount=1000)]),
+    ([_entry(balances=[{"idempotency_key": "k", "amount": 1000}])], []),
+    ([_entry()], [dict(_charge("other"), amount=5)]),                 # no known amount: not judged
+])
+def test_the_invariant_checker_accepts_right_amounts(db, ledger):
+    assert [v for v in violations(db, ledger, {"k"}, AMOUNTS) if v[0].startswith("I5")] == []
+
+
+def test_pending_amounts_come_from_the_records():
+    recs = [{"decisions": [{"step": "payment", "outcome": "requested", "detail": {"idempotency_key": "k", "cost": 7}}]},
+            {"decisions": [{"step": "payment", "outcome": "pending", "detail": {"amount": 9}}]}]
+    assert pending_amounts(recs) == {"k": {7}}
 
 
 @pytest.mark.parametrize("db,ledger,keys", [

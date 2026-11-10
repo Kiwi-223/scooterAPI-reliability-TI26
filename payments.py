@@ -259,7 +259,8 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, *, end_lat, end_
         if problem:
             # Fail closed, and don't append to a ledger we can't read.
             return ChargeResult("error", attempt, None, {"source": "ledger", "reason": "ledger_unreadable",
-                                                         "problem": problem})
+                                                         "problem": problem},
+                                detail={"idempotency_key": idempotency_key, "reservation_id": reservation_id})
         earlier = next((e for e in mine if e.get("charged") is True), None)
         if earlier is not None:
             existing = {"txn_id": earlier.get("txn_id"), "attempt": earlier.get("attempt"),
@@ -291,6 +292,8 @@ def charge(idempotency_key, scooter_id, reservation_id, amount, *, end_lat, end_
     if delay:
         time.sleep(delay)                    # a short, simulated wait; never the real thing
     known_txn = ledger_txn_id if outcome in (SUCCESS, "already_charged") else None
+    # what this call was actually charged under, so a record can be checked against its reservation
+    detail = {"idempotency_key": idempotency_key, "reservation_id": reservation_id, **detail}
     return ChargeResult(outcome, attempt, known_txn, fault, charged, ledger_txn_id, detail)
 
 
