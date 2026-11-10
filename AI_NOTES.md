@@ -344,3 +344,20 @@ strongest entries.
   sandbox itself was then observed **not** running in the agents' subagent sessions, which
   is unverified and with the human.
 
+### 18. "A missing or corrupt DB gives an HTML 500" was wrong for one endpoint
+- **Where:** AGENTS.md "Known behaviour", written in PR #4 (PLAN PR 3) and kept until
+  PLAN PR 7.
+- **What the AI claimed:** a missing or corrupt `scooter_db.json` gives an HTML 500.
+- **Reality:** on `/reservation/end`, a corrupt file returned **422 "Lat/Lng values must
+  be numbers"**. `init_db()` ran inside the `try` that catches `ValueError` for the
+  `float()` parsing, and `json.JSONDecodeError` is a `ValueError`. A cold agent seeing
+  that message would have chased a client bug, not a broken database. The claim had been
+  checked on one endpoint and generalised to all of them.
+- **How it was caught:** while writing PLAN PR 7's storage tests, the writer parametrized
+  "corrupt DB" over **every** endpoint instead of one. Confirmed against `master`:
+  `/reservation/end` gave 422 with that msg, and `/view_all_available` gave an HTML 500.
+- **What changed:** `init_db`/`write_db` now turn every read, parse and write problem into
+  `StorageError`, which becomes `storage_error` (500). `test_corrupt_db_is_storage_error_on_every_endpoint`
+  covers 3 kinds of corruption × 4 endpoints. Lesson: when documenting "X happens", test
+  it on every entry point, not the first one you try.
+

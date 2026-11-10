@@ -1,7 +1,7 @@
 """GET /search?lat=&lng=&radius= (radius in metres)."""
 import pytest
 
-from messages import LAT_RANGE, LNG_RANGE, MISSING_PARAMS, NOT_A_NUMBER
+from messages import err, LAT_RANGE, LNG_RANGE, MISSING_PARAMS, NOT_A_NUMBER
 
 
 def ids(results):
@@ -46,7 +46,7 @@ def test_search_accepts_coordinate_bounds(get_json, lat, lng):
     "",
 ])
 def test_search_missing_param(get_json, query):
-    assert get_json(f"/search?{query}", 422) == {"msg": MISSING_PARAMS}
+    assert get_json(f"/search?{query}", 422) == err(MISSING_PARAMS, "missing_param")
 
 
 @pytest.mark.parametrize("query", [
@@ -55,14 +55,14 @@ def test_search_missing_param(get_json, query):
     "lat=0&lng=0&radius=abc",  # today's msg says Lat/Lng even for radius
 ])
 def test_search_non_numeric_param(get_json, query):
-    assert get_json(f"/search?{query}", 422) == {"msg": NOT_A_NUMBER}
+    assert get_json(f"/search?{query}", 422) == err(NOT_A_NUMBER, "invalid_number")
 
 
 @pytest.mark.parametrize("lat", ["90.0001", "-91"])
 def test_search_latitude_out_of_range(get_json, lat):
-    assert get_json(f"/search?lat={lat}&lng=0&radius=1", 422) == {"msg": LAT_RANGE}
+    assert get_json(f"/search?lat={lat}&lng=0&radius=1", 422) == err(LAT_RANGE, "invalid_coordinate")
 
 
 @pytest.mark.parametrize("lng", ["180.5", "-181"])
 def test_search_longitude_out_of_range(get_json, lng):
-    assert get_json(f"/search?lat=0&lng={lng}&radius=1", 422) == {"msg": LNG_RANGE}
+    assert get_json(f"/search?lat=0&lng={lng}&radius=1", 422) == err(LNG_RANGE, "invalid_coordinate")

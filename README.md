@@ -55,7 +55,7 @@ None
 #### Error Responses:
 
 * **Code**: 422 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger.
+  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
 
 ### Search for Scooters 
 
@@ -87,7 +87,8 @@ GET /search
 #### Error Responses:
 
 * **Code**: 422 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger.
+  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
+  Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`.
 
 
 ### Reserve a Scooter
@@ -112,7 +113,8 @@ GET /reservation/start
 #### Error Responses:
 
 * **Code**: 422 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger.
+  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
+  Kinds: `missing_param`, `scooter_not_found`, `scooter_already_reserved`.
 
 
 ### End Reservation for a Scooter
@@ -144,4 +146,37 @@ GET /reservation/end
 #### Error Responses:
 
 * **Code**: 422 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger.
+  **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
+  Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `no_active_reservation`.
+
+* **Code**: 502 (or the gateway's own code) <br />
+  **Content**: the same envelope with kind `payment_failed`. The payment failed, the reservation was **not** ended and the scooter is still reserved.
+
+## Errors
+
+Every error response, on every endpoint, is a JSON object:
+
+```json
+{"msg": "Error 422 - No scooter with id 42 was found.", "error": {"kind": "scooter_not_found"}}
+```
+
+`msg` is a human-readable description. It's unchanged from earlier versions of this API,
+so match on `error.kind` instead. Besides the per-endpoint kinds listed above, any
+endpoint can return `storage_error` or `internal_error`, and unknown paths or non-`GET`
+methods return `route_not_found` or `method_not_allowed`. `error.kind` is one of the stable ids below. Ids are
+never renamed; new ones may be added.
+
+| `error.kind` | HTTP status | Meaning |
+|---|---|---|
+| `missing_param` | 422 | A required query parameter is missing. |
+| `invalid_number` | 422 | `lat`, `lng` or `radius` isn't a number. |
+| `invalid_coordinate` | 422 | Latitude outside [-90, 90] or longitude outside [-180, 180]. |
+| `scooter_not_found` | 422 | No scooter has the given id. |
+| `scooter_already_reserved` | 422 | The scooter is already reserved. |
+| `no_active_reservation` | 422 | The scooter has no reservation to end. |
+| `payment_failed` | 502 | The payment failed; the reservation was not ended. |
+| `route_not_found` | 404 | There's no endpoint at that path. |
+| `method_not_allowed` | 405 | All endpoints are `GET`. |
+| `storage_error` | 500 | The server couldn't read or write its database. |
+| `internal_error` | 500 | Unexpected server error. |
+

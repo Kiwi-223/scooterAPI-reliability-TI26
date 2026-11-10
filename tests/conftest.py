@@ -53,9 +53,10 @@ def read_db(db_path):
 @pytest.fixture
 def client(monkeypatch):
     import app as app_module
-    # TESTING=True makes unhandled exceptions propagate into the test with a traceback.
-    # setitem restores the old value after each test; a test can override it with its own
-    # monkeypatch.setitem(app.app.config, "TESTING", False) to see a real 500 response.
+    # TESTING=True for this test only (setitem restores it afterwards); a test can override
+    # it with monkeypatch.setitem(app.app.config, "TESTING", False). Since PLAN PR 7 the
+    # app's Exception catch-all turns unhandled exceptions into a JSON internal_error 500 in
+    # both modes; the traceback is logged ("unhandled exception"), so use caplog to see it.
     monkeypatch.setitem(app_module.app.config, "TESTING", True)
     return app_module.app.test_client()
 
