@@ -6,6 +6,8 @@ MISSING_PARAMS = "Error 422 - Please include all required parameters in search q
 NOT_A_NUMBER = "Error 422 - Lat/Lng values must be numbers"
 LAT_RANGE = "Error 422 - Latitude must be in the [-90, 90] range."
 LNG_RANGE = "Error 422 - Longitude must be in the [-180, 180] range."
+RADIUS_NOT_A_NUMBER = "Error 422 - Radius must be a number"
+INVALID_RADIUS = "Error 422 - Radius must be a finite number of metres that is 0 or more."
 
 
 def reserved_ok(sid):

@@ -30,6 +30,8 @@ class FailureKind(StrEnum):
                       "lat, lng or radius is not a number.")
     INVALID_COORDINATE = ("invalid_coordinate", HTTPStatus.UNPROCESSABLE_ENTITY,
                           "Latitude is outside [-90, 90] or longitude outside [-180, 180].")
+    INVALID_RADIUS = ("invalid_radius", HTTPStatus.UNPROCESSABLE_ENTITY,
+                      "radius is negative or not finite (inf, -inf, nan); it must be >= 0 metres.")
 
     # ---- scooter / reservation state (422) ---------------------------------------------
     SCOOTER_NOT_FOUND = ("scooter_not_found", HTTPStatus.UNPROCESSABLE_ENTITY,

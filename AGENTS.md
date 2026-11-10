@@ -109,7 +109,7 @@ make test                          # the single command: runs setup if needed, t
 make test ARGS="-k search -x"      # pass any pytest options through ARGS
 ```
 
-The result should be all passed plus 5 `xfailed` (see "Known behaviour" below). CI runs the
+The result should be all passed plus 2 `xfailed` (see "Known behaviour" below). CI runs the
 same command (see CI below).
 
 - **Layout:** tests live in `tests/`, and the pytest config is `pytest.ini`.
@@ -241,8 +241,6 @@ every pull request and on every push to `master`.
 These exist today and are scheduled in PLAN.md. Don't "fix" them outside their PR. The
 ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
 
-- `radius` isn't validated: a negative value or `nan` is accepted, and `inf` returns every
-  scooter (PLAN PR 8) *(xfail)*.
 - A payment failure returns `payment_failed` (502) and leaves the ride open, with the
   scooter still reserved, so a rider who never retries keeps it reserved. PLAN PRs 13/14
   define decline, timeout and reconcile behaviour (H3, H7). `txn_id` is an int, although
@@ -260,7 +258,8 @@ Every error response is JSON with a human message and a **stable failure kind**:
 {"msg": "Error 422 - No scooter with id 42 was found.", "error": {"kind": "scooter_not_found"}}
 ```
 
-- **Contract:** `msg` is kept byte-for-byte as before (README compatibility); `error.kind`
+- **Contract:** `msg` is kept byte-for-byte as before (README compatibility), except where it
+  was wrong: a non-numeric radius said "Lat/Lng values must be numbers" until PLAN PR 8. `error.kind`
   is what code and agents should match on. The ids are a contract: **once an id ships, it
   is never renamed or reused**. A new failure mode gets a new id.
 - **Where they live:** the registry is `failures.py` (`FailureKind`, a `StrEnum` whose
@@ -270,7 +269,8 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `error.kind` | HTTP | Meaning |
 |---|---|---|
 | `missing_param` | 422 | A required query parameter is missing. |
-| `invalid_number` | 422 | `lat`, `lng` or `radius` isn't a number (the msg still says "Lat/Lng values must be numbers", even for radius). |
+| `invalid_number` | 422 | `lat`, `lng` or `radius` isn't a number. The msg is "Lat/Lng values must be numbers" for lat/lng, and "Radius must be a number" for radius (since PLAN PR 8; before that, radius got the Lat/Lng msg). |
+| `invalid_radius` | 422 | `radius` is a number but negative or not finite (`inf`, `-inf`, `nan`). It's in metres; `0` is allowed (exact location) and there's no upper bound (anything over ~20,004 km covers every scooter). |
 | `invalid_coordinate` | 422 | Latitude outside [-90, 90] or longitude outside [-180, 180]. |
 | `scooter_not_found` | 422 | No scooter has the given id (ids are matched exactly; `18 ` isn't `18`). |
 | `scooter_already_reserved` | 422 | Start requested for a scooter that's already reserved. |

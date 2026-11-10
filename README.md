@@ -70,7 +70,7 @@ GET /search
 |:---------:|:----------------------:|:-----------------------------------------------------------------------------------------------------------------------------:|
 |    lat    |     floating point     | Latitude coordinate of the desired location at which to reserve a scooter.                                                    |
 |    lng    |     floating point     | Longitude coordinate of the desired location at which to reserve a scooter.                                                   |
-|   radius  | integer/floating point | The radius of the search, i.e. The radius of the area around the desired location that is acceptable for reserving a scooter. |
+|   radius  | integer/floating point | The radius of the search, i.e. The radius of the area around the desired location that is acceptable for reserving a scooter. In metres; must be a finite number ≥ 0 (`0` matches the exact location; there is no upper bound). |
 
 #### Success Responses:
 
@@ -88,7 +88,7 @@ GET /search
 
 * **Code**: 422 <br />
   **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
-  Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`.
+  Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`, `invalid_radius`.
 
 
 ### Reserve a Scooter
@@ -161,7 +161,8 @@ Every error response, on every endpoint, is a JSON object:
 ```
 
 `msg` is a human-readable description. It's unchanged from earlier versions of this API,
-so match on `error.kind` instead. Besides the per-endpoint kinds listed above, any
+except that a non-numeric `radius` now says "Radius must be a number" instead of
+"Lat/Lng values must be numbers". Match on `error.kind` instead. Besides the per-endpoint kinds listed above, any
 endpoint can return `storage_error` or `internal_error`, and unknown paths or non-`GET`
 methods return `route_not_found` or `method_not_allowed`. `error.kind` is one of the stable ids below. Ids are
 never renamed; new ones may be added.
@@ -170,6 +171,7 @@ never renamed; new ones may be added.
 |---|---|---|
 | `missing_param` | 422 | A required query parameter is missing. |
 | `invalid_number` | 422 | `lat`, `lng` or `radius` isn't a number. |
+| `invalid_radius` | 422 | `radius` is negative or not finite (`inf`, `nan`). |
 | `invalid_coordinate` | 422 | Latitude outside [-90, 90] or longitude outside [-180, 180]. |
 | `scooter_not_found` | 422 | No scooter has the given id. |
 | `scooter_already_reserved` | 422 | The scooter is already reserved. |

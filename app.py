@@ -1,6 +1,6 @@
 from flask import Flask, render_template, request, redirect, url_for, make_response
 from geopy.distance import distance as geodesic
-import json, os, werkzeug
+import json, math, os, werkzeug
 from http import HTTPStatus
 from werkzeug.exceptions import HTTPException
 
@@ -75,22 +75,33 @@ def view_all_available():
 def search():
 	# Search for scooters in the database
 	# parse request params
+	# Parsed in the same order as before (lat, lng, then radius), so which error wins when
+	# several parameters are wrong is unchanged.
 	try:
-		search_lat, search_lng, search_radius = \
+		search_lat, search_lng = \
 			float(request.args['lat']), \
-			float(request.args['lng']), \
-			float(request.args['radius'])	# parse request for search criteria
+			float(request.args['lng'])
+		raw_radius = request.args['radius']
 	except werkzeug.exceptions.BadRequestKeyError:
 		# the required parameters are not present in the search query
 		return error_response(FailureKind.MISSING_PARAM, 'Error 422 - Please include all required parameters in search query')
 	except ValueError:
 		return error_response(FailureKind.INVALID_NUMBER, 'Error 422 - Lat/Lng values must be numbers')
+	try:
+		search_radius = float(raw_radius)
+	except ValueError:
+		return error_response(FailureKind.INVALID_NUMBER, 'Error 422 - Radius must be a number')
 
 	# validate lat and long values
 	if not -90 <= search_lat <= 90:
 		return error_response(FailureKind.INVALID_COORDINATE, 'Error 422 - Latitude must be in the [-90, 90] range.')
 	if not -180 <= search_lng <= 180:
 		return error_response(FailureKind.INVALID_COORDINATE, 'Error 422 - Longitude must be in the [-180, 180] range.')
+	# validate radius (metres): finite and >= 0. Zero is allowed (exact location). No upper
+	# bound: any radius over ~20,004 km (half the Earth's circumference) simply covers every
+	# scooter, which is a legitimate "everything" query and costs nothing extra.
+	if not (math.isfinite(search_radius) and search_radius >= 0):
+		return error_response(FailureKind.INVALID_RADIUS, 'Error 422 - Radius must be a finite number of metres that is 0 or more.')
 	
 	db = init_db()	# initialize db
 
