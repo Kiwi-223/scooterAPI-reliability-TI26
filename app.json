@@ -15,7 +15,7 @@
 	},
 	"env": {
 		"WEB_CONCURRENCY": {
-			"description": "gunicorn worker processes in the one web dyno. Writers are serialised by the DB file lock, so more workers mostly help reads. Never set it to an empty value: gunicorn fails to start.",
+			"description": "gunicorn worker processes in the one web dyno. Writers are serialised by the DB file lock, so more workers mostly help reads. Empty or unset means 2 (the Procfile sets it before gunicorn reads it).",
 			"value": "2"
 		},
 		"PAYMENT_FAULT": {

@@ -24,11 +24,13 @@ HEROKU_SHUTDOWN_GRACE_S = 30    # SIGTERM, then SIGKILL 30 s later (dyno shutdow
 def test_health_reports_a_readable_db(get_json, read_records):
     body = get_json("/health", 200)
     # seed: 5 scooters, 33 reserved (legacy, active)
-    assert body == {"status": "ok", "db": {"readable": True, "scooters": 5, "reserved": 1, "payment_pending": 0}}
+    assert body == {"status": "ok", "db": {"readable": True, "scooters": 5, "reserved": 1, "payment_pending": 0,
+                                           "unsupported": 0}}
     [record] = read_records()
     assert record["path"] == "/health" and record["status"] == 200 and record["error"] is None
     assert {"step": "health", "outcome": "ok",
-            "detail": {"readable": True, "scooters": 5, "reserved": 1, "payment_pending": 0}} in record["decisions"]
+            "detail": {"readable": True, "scooters": 5, "reserved": 1, "payment_pending": 0,
+                       "unsupported": 0}} in record["decisions"]
     assert record["db_write"] == {"attempted": False, "ok": None, "error": None}
 
 
@@ -37,7 +39,22 @@ def test_health_counts_payment_pending_rides(client, get_json, monkeypatch):
     monkeypatch.setenv("PAYMENT_FAULT", "timeout_not_charged")
     assert client.get("/reservation/start?id=18").status_code == 200
     assert client.get("/reservation/end?id=18&lat=23.01&lng=19.01").status_code == 504
-    assert get_json("/health", 200)["db"] == {"readable": True, "scooters": 5, "reserved": 2, "payment_pending": 1}
+    assert get_json("/health", 200) == {"status": "ok", "db": {"readable": True, "scooters": 5, "reserved": 2,
+                                                               "payment_pending": 1, "unsupported": 0}}
+
+
+def test_health_is_degraded_by_a_reservation_in_an_unknown_payment_state(client, get_json, db_path, read_records):
+    # start/end refuse that scooter (storage_error), so "ok" would hide it (PR #26 review).
+    # Still 200: the server works for every other scooter and a restart wouldn't fix the data.
+    seed = json.loads(db_path.read_text())
+    [entry] = [e for e in seed if e["id"] == "33"]
+    entry["reservation"] = {"reservation_id": "a" * 32, "started_at": None, "start_request_id": None,
+                            "payment_state": "refund_requested", "idempotency_key": "a" * 32}
+    db_path.write_text(json.dumps(seed))
+    assert client.get("/reservation/start?id=33").status_code == 500
+    assert get_json("/health", 200) == {"status": "degraded", "db": {"readable": True, "scooters": 5, "reserved": 1,
+                                                                     "payment_pending": 0, "unsupported": 1}}
+    assert read_records()[-1]["decisions"][-1]["outcome"] == "degraded"
 
 
 def test_health_never_writes_or_locks(client, db_path):
@@ -82,10 +99,13 @@ def _flag(argv, name):
 
 def test_procfile_binds_every_interface_on_port_and_has_no_control_socket():
     argv = shlex.split(_web_command())
-    assert argv[0] == "gunicorn" and argv[-1] == "app:app"
+    # gunicorn reads WEB_CONCURRENCY itself, at config load (int(os.environ[...])), so an empty
+    # value crashes it whatever --workers says. The env prefix replaces an empty or unset
+    # value with 2 before gunicorn starts (PR #26 review; AI_NOTES #46).
+    assert argv[0] == "WEB_CONCURRENCY=${WEB_CONCURRENCY:-2}" and argv[1] == "gunicorn"
+    assert argv[-1] == "app:app" and "--workers" not in argv
     assert _flag(argv, "--bind") == "0.0.0.0:$PORT"      # explicit: never gunicorn's 127.0.0.1:8000
     assert "--no-control-socket" in argv                 # gunicorn 26 would write ~/.gunicorn/
-    assert _flag(argv, "--workers") == "${WEB_CONCURRENCY:-2}"
 
 
 def test_procfile_timeouts_fit_the_lock_the_gateway_and_heroku():
@@ -101,15 +121,17 @@ def test_procfile_timeouts_fit_the_lock_the_gateway_and_heroku():
         == app_module.DEFAULT_DB_LOCK_TIMEOUT
 
 
-@pytest.mark.parametrize("web_concurrency,workers", [(None, 2), ("3", 3)])
+@pytest.mark.parametrize("web_concurrency,workers", [(None, 2), ("", 2), ("3", 3)],
+                         ids=["unset", "empty", "three"])
 def test_gunicorn_accepts_the_procfile_command(web_concurrency, workers):
     # The Procfile line runs through a shell on Heroku ($PORT, ${WEB_CONCURRENCY:-2}); run it
-    # the same way with --print-config, which parses everything and starts nothing.
+    # the same way with --print-config, which parses everything and starts nothing. "empty"
+    # is the case that crashed gunicorn 26 (int('')) under the first Procfile.
     env = {k: v for k, v in os.environ.items() if k != "WEB_CONCURRENCY"}
     env["PORT"] = "8193"
-    if web_concurrency:
+    if web_concurrency is not None:
         env["WEB_CONCURRENCY"] = web_concurrency
-    command = _web_command().replace("gunicorn", shlex.quote(str(Path(sys.executable).parent / "gunicorn")), 1)
+    command = _web_command().replace(" gunicorn ", " " + shlex.quote(str(Path(sys.executable).parent / "gunicorn")) + " ", 1)
     out = subprocess.run(["bash", "-c", command + " --print-config"], cwd=REPO, env=env,
                          capture_output=True, text=True, timeout=60)
     assert out.returncode == 0, out.stderr

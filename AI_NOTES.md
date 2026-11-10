@@ -144,9 +144,9 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 
 ## Tally, and how this log was checked
 
-Counted from the "Who was wrong" lines of all 45 entries; an entry naming two or three
+Counted from the "Who was wrong" lines of all 46 entries; an entry naming two or three
 agents counts for each of them.
-- **Writer: 39** (every entry except #1–#5 and #22). 6 of them are shared with the
+- **Writer: 40** (every entry except #1–#5 and #22). 6 of them are shared with the
   reviewer: #9, #28, #34, #38, #43, #44. #34 counts as shared because its line names the
   reviewer's #28 as part of the pattern.
 - **Reviewer: 7** (those 6, plus #22).
@@ -221,6 +221,7 @@ round count (#17), and status lines in #3–#5 that had gone stale.
 | 43 | Both agents loosened a checker and each claimed the other checks still covered it | Identity and integrity checks |
 | 44 | The reviewer called a guardrail missing without checking the platform's built-in protections | Security boundaries and guardrails |
 | 45 | The attribution roles turned a document ("plan") into a party, hiding who wrote the plan draft | Process slips |
+| 46 | A guard for an empty `WEB_CONCURRENCY` that couldn't help, because it was never tested against an empty value | Claims that outran the evidence |
 
 ## All entries, by theme
 
@@ -670,6 +671,30 @@ Something presented as checked, proven or true everywhere that was only checked 
   saw", was *not* right for live data: it hid a double charge). A test runs every
   documented step-5 command (CLI and MCP) on every clean scenario. Lesson: **test the
   commands the docs tell people to run, exactly as written**, not an internal equivalent.
+
+#### 46. A guard for an empty `WEB_CONCURRENCY` that couldn't help, because it was never tested against an empty value
+- **Who was wrong:** writer.
+- **Where:** PLAN PR 19 (PR #26): the Procfile, `tests/test_deploy.py`, and the README,
+  AGENTS.md and `app.json` notes.
+- **What the AI claimed:** the writer found that an empty `WEB_CONCURRENCY` crashes gunicorn
+  26 at import (`int('')`), and wrote the Procfile as `--workers ${WEB_CONCURRENCY:-2}`. It
+  presented that as handling an unset or empty value, and documented "never set it to
+  an empty value" as the only remaining caveat.
+- **Reality:** the crash happens *before* gunicorn parses `--workers`. Its config module
+  reads `WEB_CONCURRENCY` from the environment on its own (`int(os.environ.get(
+  "WEB_CONCURRENCY", 1))`), so `${WEB_CONCURRENCY:-2}` on the command line changed nothing:
+  an empty config var still crash-looped the dyno. The writer had seen that traceback, and
+  it names the config module, not the argument. The test ran the Procfile line with the
+  variable **unset** and set to `3`, never **empty**, the one case the guard was written
+  for.
+- **How it was caught:** the [PR #26 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/26#issuecomment-6778334619)
+  ran the exact Procfile line with `WEB_CONCURRENCY=""`.
+- **What changed:** the Procfile sets the variable before gunicorn starts
+  (`WEB_CONCURRENCY=${WEB_CONCURRENCY:-2} gunicorn …`), and the `--print-config` test runs it
+  unset, empty and `3`. The empty case fails under the old line, as checked. Lesson: a fix
+  for a specific failure needs a test that reproduces **that** failure, and should be
+  watched failing without the fix. Reading the traceback for *where* the value is read
+  would have shown the guard was in the wrong place.
 
 ### Tests that passed for the wrong reason
 

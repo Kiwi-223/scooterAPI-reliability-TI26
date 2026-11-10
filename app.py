@@ -104,15 +104,21 @@ def view_all_available():
 # Health check (PLAN PR 19): is the DB readable and valid? Lock-free and read-only, like
 # the listings: it never waits on a writer and never writes the DB. An unreadable or corrupt
 # DB raises StorageError, i.e. the usual storage_error (500) envelope, whose msg names the
-# cause but never the path. It's recorded like any request (one line in the records).
+# cause but never the path. It's recorded like any request (one line in the records), so
+# frequent probes grow the records file (README, Deploying).
+# A reservation in a payment state this code doesn't know (start/end on that scooter are
+# refused) is counted as `unsupported` and makes `status` "degraded", still 200: the server
+# is up and every other scooter works, and restarting it wouldn't help; a human must look.
 @app.route('/health', methods=['GET'])
 def health():
 	db = init_db(get_db_path())
 	pending = sum(1 for scooter in db if (scooter.reservation or {}).get('payment_state') == 'payment_pending')
-	body = {'status': 'ok', 'db': {'readable': True, 'scooters': len(db),
-	                               'reserved': sum(1 for scooter in db if scooter.is_reserved),
-	                               'payment_pending': pending}}
-	records.note('health', 'ok', **body['db'])
+	unsupported = sum(1 for scooter in db if not is_supported_reservation(scooter.reservation))
+	body = {'status': 'degraded' if unsupported else 'ok',
+	        'db': {'readable': True, 'scooters': len(db),
+	               'reserved': sum(1 for scooter in db if scooter.is_reserved),
+	               'payment_pending': pending, 'unsupported': unsupported}}
+	records.note('health', body['status'], **body['db'])
 	return json.dumps(body), HTTPStatus.OK.value, {'Content-Type':'application/json'}
 
 

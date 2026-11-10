@@ -254,14 +254,16 @@ SCOOTER_DB_PATH="$SCRATCH_DB" SCOOTER_RECORDS_PATH="$(mktemp -d)/records.jsonl" 
 `HOST` is a common name. zsh and bash don't export it by default, but some shells (e.g.
 tcsh) and CI images do. If `make run` binds somewhere unexpected, check `env | grep HOST`.
 - Production-style server: the Procfile (PLAN PR 19) runs
-  `gunicorn --bind 0.0.0.0:$PORT --workers ${WEB_CONCURRENCY:-2} --timeout 20 --graceful-timeout 25 --no-control-socket app:app`.
+  `WEB_CONCURRENCY=${WEB_CONCURRENCY:-2} gunicorn --bind 0.0.0.0:$PORT --timeout 20 --graceful-timeout 25 --no-control-socket app:app`.
   `0.0.0.0` means every network interface, so for local use bind to localhost instead:
-  `.venv/bin/gunicorn --bind 127.0.0.1:8000 --workers 2 --timeout 20 --graceful-timeout 25 --no-control-socket app:app`.
+  `WEB_CONCURRENCY=2 .venv/bin/gunicorn --bind 127.0.0.1:8000 --timeout 20 --graceful-timeout 25 --no-control-socket app:app`.
   (A bare `gunicorn app:app` binds `127.0.0.1:8000`, or `0.0.0.0:$PORT` if `PORT` is set.)
   Without `--no-control-socket`, gunicorn 26 creates a control socket at
   `~/.gunicorn/gunicorn.ctl`, outside the repo, and the Claude Code sandbox blocks that
-  write (see Agent boundaries). An **empty** `WEB_CONCURRENCY` makes gunicorn 26 fail at
-  startup (`int('')`); unset it instead.
+  write (see Agent boundaries). gunicorn reads `WEB_CONCURRENCY` itself when it loads its
+  config, so an **empty** value makes gunicorn 26 fail at startup (`int('')`) whatever
+  `--workers` says. That's why the Procfile sets it as an env prefix rather than passing
+  `--workers ${WEB_CONCURRENCY:-2}` (AI_NOTES #46).
   - Keep gunicorn's `--timeout` (the Procfile's 20 s) longer than `SCOOTER_DB_LOCK_TIMEOUT`
     plus the slowest payment call. Otherwise a worker killed mid-request returns gunicorn's
     HTML 500 instead of our JSON (see Concurrency). `tests/test_deploy.py` checks the
@@ -1176,7 +1178,8 @@ the evidence to use when debugging. Read the records before reading code.
   produced.
 - **Querying:** use the records CLI (below). jq is the fallback.
 - **Not done yet:** there's no log rotation (future work). The file grows until you move
-  it aside.
+  it aside. `/health` is recorded too (deliberately: exactly one record per request), so a
+  frequent health probe adds to it (README.md, "Deploying").
 
 ### Schema (`schema: 1`)
 
@@ -1221,7 +1224,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: "reserved" \| "payment_pending"}` for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, with `readable`, `scooters`, `reserved` and `payment_pending`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; `acquired` also has `acquired_at`, UTC with microseconds, when this request got the lock, i.e. the order in which mutating requests took effect (PLAN PR 11c); mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment_fault_override` (`applied`/`ignored`/`rejected`, only when an `X-Payment-Fault` header was sent), `end` (`allowed`, `refused`, or `retry` with the stored and requested coordinates), `payment` (`pending` with the end location and amount saved by phase 1, `requested` with distance, cost, idempotency key and end location, then `ok`/`failed` with `gateway_outcome`, `txn_id`, `attempt`, the `idempotency_key` and `reservation_id` the gateway actually charged under, `fault` (why that outcome) and `simulator` (ground truth: did this call take money); see Payments & fault injection), `reservation` (`created`/`cleared` with the `reservation_id`, `payment_pending` with the attempt count, `payment_abandoned` on a conflict, or `unsupported` with the unknown `payment_state`; see Database schema), `balance` (`recorded`, on a decline), `db_write` (`ok`/`failed`/`refused`), `search` (`matches`) and `filter` (`available`, `listed`), both with `unavailable` (`{id: "reserved" \| "payment_pending"}` for the reserved scooters, at most 50, always including any that was listed; PR #24 review), `health` (`ok`, or `degraded` when a reservation is in an unknown payment state, with `readable`, `scooters`, `reserved`, `payment_pending` and `unsupported`; `/health` only, PLAN PR 19), and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup, in the full persisted form (with `reservation` and any unknown fields; see Database schema). Records written before PLAN PR 12 have no `reservation` key. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
