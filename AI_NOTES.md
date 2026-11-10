@@ -315,3 +315,32 @@ strongest entries.
   `test_no_rule_ends_in_colon_star` guards against regressions. This is the first catch
   made by the behavioural tests themselves, before review.
 
+### 17. Text-matched deny rules kept leaking, one spelling at a time
+- **Where:** the `git push` and `gh api` deny rules across PRs #7 and #8.
+- **What the AI claimed:** each round of fixes presented the deny list as covering the
+  dangerous spellings, first "every spelling we know" and then "whole-token quotes are
+  caught".
+- **Reality:** every review found another variant that got through. In turn these were:
+  - `--mirror`, `--all`, `--prune` and git's abbreviations (#15)
+  - `--method=DELETE` (#14)
+  - three-letter short-flag clusters such as `-fqu` (PR #8)
+  - quoting and escaping of short flags (`'-f'`, `"-uf"`, `-"f"`, `-\f`) and a tab
+    instead of a space
+
+  A rule matches command *text*, and the shell offers unboundedly many texts for the same
+  argv. Each fix covered the spellings someone had thought of, and the next reviewer found
+  one nobody had.
+- **How it was caught:** the reviewer's adversarial probes in each round. The last ones
+  were the quoted short flags in PR #8.
+- **What changed:** no more rules for this class. The remaining gaps are pinned as
+  "known gap" tests (expected `allow`) and written up honestly in AGENTS.md. Lesson:
+  enforce at the layer that sees the real effect, not the text.
+  - **Branch protection (H2):** the server rejects a force-push or a push to `master`
+    however it was spelled.
+  - **The OS sandbox:** it limits what any process can write or reach.
+
+  Deny rules are a cheap first line against the usual spelling. Don't extend them to chase
+  completeness, and don't present them as a boundary. This matters more because the
+  sandbox itself was then observed **not** running in the agents' subagent sessions, which
+  is unverified and with the human.
+
