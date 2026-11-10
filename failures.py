@@ -57,4 +57,12 @@ class FailureKind(StrEnum):
 
 
 class StorageError(Exception):
-    """Raised when the scooter database can't be read or written."""
+    """Raised when the scooter database can't be read, parsed, validated or written.
+
+    `str(error)` is safe to send to clients (no path, no file contents). `path` is for the
+    server log only; the original exception is chained as `__cause__` when there is one.
+    """
+
+    def __init__(self, message, path=None):
+        super().__init__(message)
+        self.path = path

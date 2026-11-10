@@ -29,7 +29,9 @@ def error_response(kind, msg, status=None):
 
 @app.errorhandler(StorageError)
 def handle_storage_error(e):
-	app.logger.error('storage error: %s', e)
+	# The log gets the DB path and the original exception (with its traceback); the
+	# response stays path-free.
+	app.logger.error('storage error: %s (db=%s)', e, e.path, exc_info=e.__cause__)
 	return error_response(FailureKind.STORAGE_ERROR, f'Error 500 - {e}')
 
 @app.errorhandler(HTTPException)
@@ -183,9 +185,12 @@ def end_reservation():
 			else:
 				# the payment failed: the reservation is NOT ended (unchanged behaviour; PLAN PRs 13/14
 				# define decline/timeout handling). Use the gateway's msg/code when it gives them.
+				code = payment_response.get('code')
+				if not (isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599):
+					code = None  # a failed payment never carries a non-error status: fall back to 502
 				return error_response(FailureKind.PAYMENT_FAILED,
 					payment_response.get('msg', 'Error 502 - Payment failed; the reservation was not ended.'),
-					payment_response.get('code'))
+					code)
 		else:
 			# the scooter is not currently reserved
 			return error_response(FailureKind.NO_ACTIVE_RESERVATION, f'Error 422 - No reservation for scooter {scooter_id_to_end} presently exists.')
@@ -233,20 +238,50 @@ def init_db():
 		with open(path, 'r') as db_file:
 			db_json = db_file.read()
 		db_list = json.loads(db_json)
-		# populate Scooter objects for easier access later
-		db = []
-		for scooter in db_list:
-			scooter_obj = Scooter(	scooter['id'], 
-									scooter['lat'], 
-									scooter['lng'], 
-									scooter['is_reserved']
-								 )
-			db.append(scooter_obj)
 	except OSError as e:
-		raise StorageError(f'The scooter database could not be read ({type(e).__name__}).') from e
-	except (ValueError, KeyError, TypeError) as e:
-		raise StorageError(f'The scooter database is corrupt ({type(e).__name__}).') from e
+		raise StorageError(f'The scooter database could not be read ({type(e).__name__}).', path) from e
+	except ValueError as e:
+		raise StorageError(f'The scooter database is corrupt ({type(e).__name__}).', path) from e
+	problem = find_db_shape_problem(db_list)
+	if problem:
+		raise StorageError(f'The scooter database is corrupt ({problem}).', path)
+	# populate Scooter objects for easier access later
+	db = []
+	for scooter in db_list:
+		scooter_obj = Scooter(	scooter['id'], 
+								scooter['lat'], 
+								scooter['lng'], 
+								scooter['is_reserved']
+							 )
+		db.append(scooter_obj)
 	return db
+
+
+DB_FIELDS = { 'id', 'lat', 'lng', 'is_reserved' }
+
+def _is_number(value):
+	# bool is an int subclass in Python, so reject it explicitly; NaN/inf aren't coordinates.
+	return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float('inf')
+
+def find_db_shape_problem(db_list):
+	# Returns a short, client-safe description of the first shape problem, or None.
+	if not isinstance(db_list, list):
+		return f'top level is {type(db_list).__name__}, not a list'
+	for i, scooter in enumerate(db_list):
+		if not isinstance(scooter, dict):
+			return f'entry {i} is {type(scooter).__name__}, not an object'
+		missing = DB_FIELDS - set(scooter)
+		if missing:
+			# Extra fields are tolerated (forward compatibility, e.g. PLAN PR 12's reservation state).
+			return f'entry {i} is missing {sorted(missing)}'
+		if not isinstance(scooter['id'], str):
+			return f'entry {i}: id is {type(scooter["id"]).__name__}, not a string'
+		for field in ('lat', 'lng'):
+			if not _is_number(scooter[field]):
+				return f'entry {i}: {field} is not a finite number'
+		if not isinstance(scooter['is_reserved'], bool):
+			return f'entry {i}: is_reserved is {type(scooter["is_reserved"]).__name__}, not a boolean'
+	return None
 	
 	
 def get_scooter_with_id(search_id, db):
@@ -266,7 +301,7 @@ def write_db(db):
 		with open(get_db_path(), 'w') as db_file:
 			db_file.write(db_json)
 	except OSError as e:
-		raise StorageError(f'The scooter database could not be written ({type(e).__name__}).') from e
+		raise StorageError(f'The scooter database could not be written ({type(e).__name__}).', get_db_path()) from e
 	return True
 		
 # class scooter for internal use

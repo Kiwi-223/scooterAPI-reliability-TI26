@@ -109,7 +109,7 @@ make test                          # the single command: runs setup if needed, t
 make test ARGS="-k search -x"      # pass any pytest options through ARGS
 ```
 
-The result should be all passed plus 4 `xfailed` (see "Known behaviour" below). CI runs the
+The result should be all passed plus 5 `xfailed` (see "Known behaviour" below). CI runs the
 same command (see CI below).
 
 - **Layout:** tests live in `tests/`, and the pytest config is `pytest.ini`.
@@ -249,6 +249,8 @@ ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
   the README says it's a string *(xfail, PLAN PR 13)*.
 - The DB read/write isn't locked, and the write isn't atomic, so concurrent requests can
   lose updates (PLAN PR 11).
+- With an unwritable DB, `/reservation/end` charges the gateway first and only then fails
+  to save (`storage_error`). The rider pays for a ride that didn't end *(xfail, PLAN PR 14)*.
 
 ## Failure kinds
 
@@ -273,10 +275,10 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `scooter_not_found` | 422 | No scooter has the given id (ids are matched exactly; `18 ` isn't `18`). |
 | `scooter_already_reserved` | 422 | Start requested for a scooter that's already reserved. |
 | `no_active_reservation` | 422 | End requested for a scooter that isn't reserved. |
-| `payment_failed` | 502 | The payment gateway reported a failure. The ride is **not** ended and the scooter stays reserved. A gateway-supplied `msg`/`code` is passed through. PLAN PRs 13/14 add finer payment kinds. |
+| `payment_failed` | 502 | The payment gateway reported a failure. The ride is **not** ended and the scooter stays reserved. A gateway-supplied `msg` is passed through, and so is its `code` if it's 400–599 (anything else becomes 502). PLAN PRs 13/14 add finer payment kinds. |
 | `route_not_found` | 404 | No endpoint at that path. |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
-| `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable. The msg names the cause, e.g. `(FileNotFoundError)`. |
+| `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable, or has the wrong shape: the top level must be a list of objects, each with a string `id`, finite-number `lat`/`lng` and a boolean `is_reserved` (extra fields are allowed). The msg names the cause without a path, e.g. `(FileNotFoundError)` or `(entry 3: lat is not a finite number)`. The **server log** line `storage error: … (db=<path>)` carries the path and the original exception's traceback. |
 | `internal_error` | 500 | Anything else, i.e. a bug, including `abort(500)`. The msg is generic; the **traceback is in the server log** (`unhandled exception`). Any other HTTP error raised by the framework (unreachable today) also gets this kind but keeps its own status. |
 
 - **How it's wired (Flask 3):** a handler for `StorageError`, one for `HTTPException`

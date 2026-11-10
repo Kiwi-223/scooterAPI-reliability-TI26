@@ -169,6 +169,60 @@ def test_corrupt_db_is_storage_error_on_every_endpoint(client, db_path, content,
     assert body["msg"].startswith("Error 500 - The scooter database is corrupt")
 
 
+def test_storage_error_log_has_path_and_cause_but_response_does_not(client, monkeypatch, tmp_path, caplog):
+    missing = tmp_path / "nowhere" / "scooters.json"
+    monkeypatch.setenv("SCOOTER_DB_PATH", str(missing))
+    body = assert_envelope(client.get("/view_all_available"), FailureKind.STORAGE_ERROR)
+    assert str(missing) not in body["msg"] and "nowhere" not in body["msg"]
+    record = next(r for r in caplog.records if r.getMessage().startswith("storage error:"))
+    assert f"(db={missing})" in record.getMessage()
+    assert record.exc_info and isinstance(record.exc_info[1], FileNotFoundError)
+    assert "Traceback" in caplog.text and "FileNotFoundError" in caplog.text
+
+
+_GOOD = {"id": "1", "lat": 1.5, "lng": 2, "is_reserved": False}
+
+
+def _entry(**changes):
+    entry = dict(_GOOD, **changes)
+    return [{k: v for k, v in entry.items() if v is not ...}]
+
+
+@pytest.mark.parametrize("data,why", [
+    ({}, "top level is dict"),
+    ([], None),                                                    # empty list is a valid, empty DB
+    ([1], "entry 0 is int"),
+    (_entry(id=1), "id is int"),
+    (_entry(lat="x"), "lat is not a finite number"),
+    (_entry(lng=None), "lng is not a finite number"),
+    (_entry(lat=True), "lat is not a finite number"),              # bool is not a coordinate
+    (_entry(is_reserved="yes"), "is_reserved is str"),
+    (_entry(is_reserved=1), "is_reserved is int"),
+    (_entry(is_reserved=...), "missing ['is_reserved']"),
+    (_entry(extra="tolerated"), None),                             # extra fields are fine
+])
+def test_db_shape_is_validated(client, db_path, data, why):
+    db_path.write_text(json.dumps(data))
+    resp = client.get("/view_all_available")
+    if why is None:
+        assert resp.status_code == 200
+    else:
+        body = assert_envelope(resp, FailureKind.STORAGE_ERROR)
+        assert body["msg"].startswith("Error 500 - The scooter database is corrupt (") and why in body["msg"]
+
+
+def test_non_finite_coordinate_in_db_is_storage_error(client, db_path):
+    db_path.write_text('[{"id": "1", "lat": NaN, "lng": 0, "is_reserved": false}]')  # json accepts NaN
+    body = assert_envelope(client.get("/search?lat=0&lng=0&radius=1"), FailureKind.STORAGE_ERROR)
+    assert "lat is not a finite number" in body["msg"]
+
+
+def test_bad_lat_in_db_is_storage_error_not_internal_error(client, db_path):
+    # Before validation this crashed inside geopy and was reported as internal_error.
+    db_path.write_text(json.dumps(_entry(lat="x")))
+    assert_envelope(client.get("/search?lat=0&lng=0&radius=1"), FailureKind.STORAGE_ERROR)
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can write a read-only file")
 def test_unwritable_db_is_storage_error(client, db_path, read_db):
     before = db_path.read_text()
@@ -212,6 +266,17 @@ def test_gateway_supplied_msg_and_code_are_passed_through(client, monkeypatch):
     client.get("/reservation/start?id=18")
     body = assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), FailureKind.PAYMENT_FAILED, status=422)
     assert body["msg"] == "Error 422 - Card declined."
+
+
+@pytest.mark.parametrize("code,expected", [
+    (422, 422), (503, 503), (599, 599),          # real error codes pass through
+    (200, 502), (302, 502), (399, 502), (600, 502), (0, 502), (-1, 502),
+    ("422", 502), (True, 502), (None, 502), (422.0, 502),
+])
+def test_gateway_code_is_clamped_to_an_error_status(client, monkeypatch, code, expected):
+    monkeypatch.setattr(app_module, "payment_gateway", lambda cost: {"status": False, "code": code})
+    client.get("/reservation/start?id=18")
+    assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), FailureKind.PAYMENT_FAILED, status=expected)
 
 
 def test_error_bodies_are_plain_json_objects(client):
