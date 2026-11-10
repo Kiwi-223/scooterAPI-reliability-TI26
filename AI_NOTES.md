@@ -244,3 +244,74 @@ strongest entries.
   through shell expansion. That matters more here because the denied commands (`rm -rf`)
   and the allowed ones (`make clean`) were sitting in that very text.
 
+### 14. `gh api *` allowed, with a deny list "covering the dangerous calls"
+- **Where:** `.claude/settings.json` and AGENTS.md, PR #7 commit `c12c17c` (the H10 update).
+- **What the AI claimed:** allowing `Bash(gh api *)` was fine, because deny rules for
+  `DELETE`, `*protection*` and `*rulesets*` covered the dangerous calls. The only listed
+  bypasses were exotic ones (`--input`, GraphQL, a URL in a variable).
+- **Reality:** the *ordinary* spellings of API writes were all auto-approved, unsandboxed,
+  using the owner's admin token:
+  - `gh api -X PATCH …/git/refs/heads/master -F force=true` (force-moves `master`)
+  - `gh api …/merges -f base=master …`, where `-f` alone makes it a POST (merges into
+    `master` without a PR)
+  - `PUT …/contents/…` (a direct commit) and `PUT …/pulls/N/merge` (a non-squash merge)
+  - `PATCH repos/O/R` (visibility, default branch)
+
+  `--method=DELETE` also slipped past all four DELETE deny rules. And none of this was even
+  in the owner's H10 list (push, PR creation, merge, comment).
+- **How it was caught:** the reviewer simulated 37 commands against the settings using the
+  documented matching rules.
+- **What changed:**
+  - `gh api` **reads** stay allowed. Every write spelling (`-X`/`--method` anything,
+    `-f`/`-F`/`--field`/`--raw-field`, `--input`) is now an `ask` rule, which beats the
+    allow.
+  - Any `gh api` command containing `DELETE` is denied.
+  - `tests/test_settings_policy.py` runs these commands through a matcher and checks the
+    outcome.
+
+  Lesson: enumerate the tool's write and danger flags, and test the *behaviour* of the rule
+  set on real command lines, not the presence of rule strings.
+
+### 15. "Force-push denied in every spelling we know" missed `--mirror`
+- **Where:** AGENTS.md "Denied" row and the push deny rules, PR #7 commit `c12c17c`.
+- **What the AI claimed:** force-pushes and pushes to `master` were denied "in every
+  spelling we know".
+- **Reality:**
+  - `git push --mirror origin` force-updates every remote ref, `master` included, and
+    deletes the other agents' branches.
+  - `git push --all origin` pushes local `master`.
+  - `git push --prune …` deletes remote branches.
+
+  None of them contains `--force`, `+` or `master`, so all three were allowed, unsandboxed,
+  with no prompt. The writer had never read `git push -h`. That listing also shows
+  `--branches`, `--delete`/`-d` and `--receive-pack`/`--exec` (which run a program). Git
+  also accepts unique abbreviations (`--mirr`), and `'HEAD:master'` in quotes defeated the
+  `*:master` rule.
+- **How it was caught:** the reviewer's simulation of `--mirror`, `--all` and `--prune`.
+- **What changed:**
+  - Every dangerous flag from `git push -h` (git 2.54) is denied by its shortest unique
+    prefix, anywhere in the command.
+  - `-f`/`-d` and their two-letter clusters are denied, as are `+`, `:branch` and `refs/`
+    refspecs and any push mentioning `master`.
+  - Only the `git push [-u|-q] origin stage-…` shape is pre-approved.
+  - AGENTS.md now lists what still isn't caught: 3+ letter clusters, quote-split
+    spellings, aliases and scripts.
+  - The behaviour tests include the plain, abbreviated and quoted spellings.
+
+  Lesson: same as #14. Start from the tool's full option list, not from the spellings you
+  remember.
+
+### 16. A deny rule ending in `:*` would never have matched a colon
+- **Where:** the writer's first fix for #15 (not pushed): `Bash(git push* :*)`, meant to
+  deny `git push origin :branch` (delete a remote branch).
+- **What the AI assumed:** that `:*` at the end of a rule is a literal colon followed by a
+  wildcard.
+- **Reality:** the docs define a trailing `:*` as an alias for ` *`. So the rule really
+  meant `git push*  *` (two spaces) and would never catch a `:branch` refspec.
+- **How it was caught:** the new behavioural tests. The matcher implements the documented
+  `:*` rule, and the `git push origin :stage-6/x` rows came back `default` instead of
+  `deny`.
+- **What changed:** those rules now end in `:**`, which isn't the special suffix, and
+  `test_no_rule_ends_in_colon_star` guards against regressions. This is the first catch
+  made by the behavioural tests themselves, before review.
+

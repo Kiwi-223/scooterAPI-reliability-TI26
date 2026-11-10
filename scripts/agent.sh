@@ -46,8 +46,11 @@ cmd=(claude -p "$TASK"
   --max-budget-usd "$BUDGET_USD"
   --max-turns "$MAX_TURNS"
   # Edits inside the repo are accepted; any call that would need a human prompt is denied
-  # (nobody is watching), so `ask` rules in .claude/settings.json (git push, gh pr create, ...)
-  # become hard denials in this mode.
+  # (nobody is watching), so `ask` rules in .claude/settings.json (gh api writes, edits to
+  # .claude/ and .github/, unsandboxed retries, destructive git) become hard denials here.
+  # `git push` and `gh pr create/merge/...` are project *allow* rules, but project allow rules
+  # are not applied in -p mode and they are not re-granted below, so a headless run cannot
+  # push or open/merge PRs either: it leaves local commits for a normal session.
   --permission-mode acceptEdits
   --permission-prompts none
   # Project allow rules are not applied in -p (the workspace is never "trusted" there), so

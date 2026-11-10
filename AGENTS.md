@@ -270,16 +270,24 @@ PLAN PR 10.
 > do I want human intervention."
 
 So agents **act autonomously within the rules below**: branch, commit, push feature
-branches, open, comment on, review and squash-merge PRs, and edit code, `Makefile`,
-`requirements*` and `scripts/`. They **escalate to a human only** in two cases:
+branches, open, comment on, review and squash-merge PRs, read anything through `gh api`,
+and edit code, `Makefile`, `requirements*` and `scripts/`. They **escalate to a human
+only** in two cases:
 
 1. **The docs don't settle a decision.** The docs are README.md, ACTIVITY.md, PLAN.md
    (including its Human decisions table) and this file.
 2. **The writer and the reviewer disagree** on the solution.
 
 Escalating means stopping and asking the human in chat, and saying which document left the
-question open or what the two positions are. The few prompts that remain (below) are for
-changes to the guardrails themselves, unsandboxed commands and destructive local git.
+question open or what the two positions are.
+
+The few prompts that remain (below) are for things the policy doesn't cover:
+- changes to the guardrails themselves
+- **GitHub API writes** (`gh api` with `-X`/`--method`, `-f`/`-F`/`--field`/`--raw-field`,
+  `--input`). The owner's list is push, PR creation, merge and comment, and API writes
+  aren't on it.
+- unsandboxed commands
+- destructive local git
 
 The boundaries live in three places:
 
@@ -290,7 +298,9 @@ The boundaries live in three places:
   runs.
 - **GitHub settings that only a human should change:** branch protection (H2). Agents
   are denied the `gh api` calls that would change it, but that's a text-match rule; see
-  below.
+  below. To **check** whether it's on, use this (allowed):
+  `gh api repos/Kiwi-223/scooterAPI-reliability-TI26/branches/master --jq .protected`.
+  The `…/branches/master/protection` endpoint itself is denied, even for reads.
 
 The settings use only keys documented at <https://code.claude.com/docs> (settings
 reference, permissions, sandboxing) for Claude Code 2.1.310.
@@ -306,13 +316,25 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
   - a wrong type or enum value
   - a permission rule that doesn't fit the rule pattern, such as an unknown tool name or
     an unbalanced parenthesis
-- **Tests:** `tests/test_settings_schema.py` plants each of those mistakes and checks that
-  they're rejected. It also pins the policy itself:
-  - every required deny rule is present
-  - `.claude/**` and `.github/**` edits, unsandboxed retries and destructive git still ask
-  - the sandbox and fail-closed settings are on and bypass mode is off
-
-  So `make test` fails if an edit loosens these.
+- **Schema tests:** `tests/test_settings_schema.py` plants each of those mistakes and
+  checks that they're rejected.
+- **Behaviour tests:** `tests/test_settings_policy.py` tests what the rules *do*, not the
+  rule strings.
+  - **Matcher:** a small matcher implements the documented rule semantics: `*` matches
+    anything including spaces; a trailing ` *` also matches the bare command; a trailing
+    `:*` means ` *`; deny > ask > allow; and compound commands are split into parts.
+    Tests check it against the docs' own examples.
+  - **Expected outcomes:** about 100 example commands, each with its expected outcome.
+    - **allow:** the normal workflow.
+    - **deny:** mirror/all/prune/delete/force pushes in plain, abbreviated and quoted
+      spellings, pushes to `master`, and branch-protection and DELETE API calls.
+    - **ask:** API writes, guardrail edits, destructive git.
+    - **default:** unlisted commands.
+  - **Pinned:** `excludedCommands` and `allowedDomains` exactly (so widening either one
+    fails a test), the sandbox and bypass settings, the guardrail asks and the secret
+    reads. **Add a row whenever you change a rule.**
+  - **Limits:** the matcher doesn't model wrapper stripping, the built-in read-only set
+    or quote-aware splitting.
 - **`claude doctor` is not a validator.** It reports malformed JSON, wrong value types and
   some rule errors. It stays **silent on unknown keys** (for example a misspelled sandbox
   key) and on many malformed rules (AI_NOTES #11).
@@ -358,9 +380,10 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 | **Secrets** unreadable: `.env*`, `*.pem`, `*.key`, `~/.ssh`, `~/.aws`, `~/.netrc`, `~/.config/gh`, `~/.git-credentials` | `Read(...)` deny rules, which Claude Code also feeds into the sandbox's `denyRead` | Enforced for the Read tool **and** OS-enforced for sandboxed commands. It doesn't cover the excluded `gh` / `git push` commands, which need their credentials. |
 | **Unsandboxed retry** (`dangerouslyDisableSandbox`) needs a human | ask rule `Bash(dangerouslyDisableSandbox:true)` | This prompt also appears in auto and bypass modes. Headless (`make agent`) can't answer it, so the retry is denied. |
 | **No bypass mode** | `permissions.disableBypassPermissionsMode: "disable"` | `--dangerously-skip-permissions` is rejected in this repo. |
-| **Allowed without a prompt** (escalation policy): `git push` of branches, `gh pr create/comment/edit/review`, `gh pr merge --squash`, `gh api`, `git -C <path> worktree/fetch/status/log/diff`, edits to `Makefile`, `requirements*` and `scripts/**` | `allow` rules | Deny rules below still win over these. Other merge styles (`--merge`, `--rebase`) and `gh pr close` have no allow rule, so they fall back to the session's permission mode. |
-| **Asks first** before editing `.claude/**` (an agent can't loosen its own boundaries) or `.github/**` (CI integrity), before any unsandboxed retry, and before `git -c`, `git reset --hard`, `git clean` and `git branch -D` | `ask` rules | Text match only. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('.github/x','w')"`. `.claude/settings*.json` is **also** write-protected by the sandbox, which is OS-enforced. |
-| **Denied:** force-push (every spelling we know), push to `master`, `git -C … push`, `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `gh api` calls that touch `*protection*` / `*rulesets*` or use `DELETE`, `gh auth *` (which would print the token), `rm -rf` (common spellings) | `deny` rules | Text match only, **defence in depth, bypassable.** A push to `master` is caught as `git push <remote> master` and `git push <remote> <src>:master`. It isn't caught as a plain `git push` while `master` is checked out, or through an alias or a script. The `gh api` denies don't catch a request whose body or path is built indirectly, such as `gh api --input file.json`, a `graphql` mutation, or the URL in a variable. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
+| **Allowed without a prompt** (escalation policy): pushes of the shape `git push [-u\|-q\|--set-upstream] origin stage-…`; `gh pr create/comment/edit/review`; `gh pr merge --squash`; `gh api` **reads**; edits to `Makefile`, `requirements*` and `scripts/**` | `allow` rules | Deny and ask rules below still win over these. Any other push shape (a bare `git push`, `git push origin HEAD`, other branch prefixes), other merge styles (`--merge`, `--rebase`) and `gh pr close` have no allow rule, so the session's permission mode decides (Manual prompts; auto mode asks the classifier, not a human). `git -C <path> …` has no allow rule either: it isn't excluded, so it runs **sandboxed** and the sandbox auto-approves it. |
+| **Asks first:** `gh api` writes (`-X`/`--method` anything, `-f`/`-F` incl. `--field`/`--raw-field`, `--input`), edits to `.claude/**` (an agent can't loosen its own boundaries) or `.github/**` (CI integrity), any unsandboxed retry, and `git -c`, `git reset --hard`, `git clean`, `git branch -D` | `ask` rules | Text match only. File-edit asks cover Claude's file tools and recognised shell writes (`> file`, `sed`, `tee`), but not, for example, `python -c "open('.github/x','w')"`. `.claude/settings*.json` is **also** write-protected by the sandbox, which is OS-enforced. |
+| **Denied (`git push`):** every dangerous flag in `git push -h` (git 2.54), matched anywhere in the command, including git's unique-prefix abbreviations: `--force`/`--force-with-lease`/`--force-if-includes` (`--for…`), `--mirror` (`--mi…`), `--all` (`--al…`), `--branches` (`--br…`), `--prune` (`--pru…`), `--delete` (`--de…`), `--receive-pack`/`--exec` (they run a program). Also `-f` / `-d` alone or in two-letter clusters with `u q v n` (e.g. `-uf`), a `+` refspec, a `:branch` delete refspec, any `refs/…` refspec, **any mention of `master`**, and `git -C … push` | `deny` rules | Text match only, **defence in depth, bypassable.** Not caught: a plain `git push` / `git push origin HEAD` while `master` is checked out (no allow rule, so the mode decides); short-flag clusters of 3+ letters (`-uqf`); spellings split by shell quoting, such as `--mi"rror"`, `-"-mirror"` or `"mas"ter`, because quoting changes the text the rule sees (whole-token quotes like `'HEAD:master'` *are* caught); aliases, scripts and `sh -c`. Side effect: a branch whose name contains `master` can't be pushed. |
+| **Denied (other):** `gh pr merge --admin`, `gh repo delete`, `gh release delete`, `gh api` calls touching `*protection*` / `*rulesets*` or containing `DELETE` (any of `-X DELETE`, `-XDELETE`, `--method DELETE`, `--method=DELETE`), `gh auth *` (would print the token), `rm -rf` (common spellings) | `deny` rules | Text match only. A lowercase `-X delete` is still an API write, so it asks rather than being denied. `rm -rf` isn't caught as `/bin/rm -rf` or `find -delete`. |
 | **`master` can't be pushed or force-pushed, and merges need green CI** | GitHub branch protection: require PRs, require the `test` check, block force-push | **Not enabled.** It's a human decision (H2), and agents are denied the API calls that change it. With merges automated, this is **the** control on `master`. Turn it on before relying on autonomous merges. |
 | **Spend and time caps** for headless runs | `make agent` → `scripts/agent.sh` | `--max-budget-usd` is a client-side estimate, so spend can pass it a little. The wall clock is enforced by the script's watchdog. Interactive sessions have no cap from this repo. |
 
@@ -370,16 +393,19 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
   The sandbox applies to child processes, so Python goes through the same proxy and
   `denyRead`.
   - **Still open:** allowlisted hosts, and anything that runs outside the sandbox:
-    the excluded `gh *` / `git push *` (now allowed without a prompt), an approved
-    unsandboxed retry, Claude's WebFetch tool, hooks and MCP servers.
+    the excluded `gh *` / `git push *` (feature-branch pushes and `gh api` reads are
+    allowed without a prompt), an approved unsandboxed retry, Claude's WebFetch tool,
+    hooks and MCP servers.
   - **Stricter option:** drop `github.com` / `api.github.com` from `allowedDomains` and
     also exclude `git fetch *` / `git pull *`. Then only excluded, permission-checked
     commands can reach GitHub.
 - **`git push origin HEAD:master`: caught only by text matching.**
-  - The deny rules match it, and `git -C … push` is denied outright. Pushes are otherwise
-    allowed without a prompt (escalation policy), so no human sees them.
-  - **Still open:** a script, an alias, or a plain `git push` while `master` is checked
-    out.
+  - The deny rules match it (any push mentioning `master`, quoted or not), and
+    `git -C … push` is denied outright. Only the `git push … origin stage-…` shape is
+    pre-approved; other shapes fall to the permission mode.
+  - **Still open:** a script, an alias, or quote-split spellings (`"mas"ter`). A plain
+    `git push` while `master` is checked out isn't pre-approved, but auto mode's classifier
+    (not a human) decides it.
   - **The real fix is branch protection (H2).**
 - **Edit the `Makefile`, then run `make`: allowed by policy, contained by the sandbox.**
   - Editing `Makefile`, `requirements*` and `scripts/**` is allowed, because later PRs
@@ -396,7 +422,7 @@ reference, permissions, sandboxing) for Claude Code 2.1.310.
 
 | Rule | Commands |
 |---|---|
-| **Allow** (no prompt) | `make help/setup/test/run/lock/check-settings/clean`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); `git push`; `git -C <path> worktree/fetch/status/log/diff`; `gh pr view/list/diff/checks/create/comment/edit/review`; `gh pr merge --squash`; `gh run list/view/watch`; `gh api`; edits to `Makefile`, `requirements*`, `scripts/**` |
+| **Allow** (no prompt) | `make help/setup/test/run/lock/check-settings/clean`; read-only `git` (`status`, `diff`, `log`, `show`, `rev-parse`, `fetch`); `git push [-u\|-q\|--set-upstream] origin stage-…`; `gh pr view/list/diff/checks/create/comment/edit/review`; `gh pr merge --squash`; `gh run list/view/watch`; `gh api` reads; edits to `Makefile`, `requirements*`, `scripts/**` |
 | **Ask** | everything in the "Asks first" row above |
 | **Deny** | the "Denied" row above, plus the secret reads |
 
@@ -413,13 +439,13 @@ dialog. The project allow rules only apply once you accept it.
 
 - **`gh *`:** on macOS, Go programs like `gh` can fail TLS verification under Seatbelt
   (documented limitation).
-- **`git push *`:** so it can use the keychain credential helper. Pushes are allowed
-  without a prompt. The force-push and push-to-`master` deny rules still apply.
+- **`git push *`:** so it can use the keychain credential helper. The `stage-…` push
+  shape is allowed without a prompt, and the push deny rules above still apply.
 
 Excluded commands run with your full access, subject only to the permission rules above.
-Because `gh *` is excluded **and** `gh api` is allowed, `gh api` can call any GitHub
-endpoint the owner's token can reach. The `gh api` deny rules cover the dangerous ones
-only by text.
+Because `gh *` is excluded, an approved `gh api` call can reach any GitHub endpoint the
+owner's token can reach. Reads are pre-approved. Writes ask, and protection, ruleset and
+`DELETE` calls are denied, all by text.
 
 **An exclusion applies only when the whole Bash call is that one command.** A loop, pipe,
 `cd`, redirect or `$(...)` keeps the call sandboxed, and then `gh` may fail TLS on macOS.
@@ -517,7 +543,9 @@ these:
   something else, report it or add it to the plan; don't fix it on the side. If the plan
   changes, edit PLAN.md in the same PR and add a Change log line.
 - **Branch:** start from a fresh `master` (`git checkout master && git pull`), then
-  `git checkout -b stage-<N>/<slug>`, where N is the PR number in PLAN.md's table.
+  `git checkout -b stage-<N>/<slug>`, where N is the PR number in PLAN.md's table. Push it
+  with `git push -u origin stage-<N>/<slug>`; that shape is pre-approved. A slug must not
+  contain `master`, because every push mentioning it is denied.
 - **Never commit to or push `master`, never force-push, and never deploy.**
 - **Merge only** after the reviewer's comment ends in `VERDICT: APPROVE` **and** CI is
   green. Use a squash merge (`gh pr merge <n> --squash --delete-branch --repo ...`).
