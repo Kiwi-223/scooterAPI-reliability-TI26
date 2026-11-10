@@ -200,8 +200,9 @@ def test_known_limitation_force_in_fourth_place_of_a_cluster_is_not_caught():
     assert decide("git push origin stage-7/x -uqvf") == "allow"
     assert decide("git push origin stage-7/x -uqv") == "allow"   # harmless cluster stays allowed
     assert decide("git push origin stage-7/x -4uf") == "allow"   # -4/-6 mixed in: also a gap
-    # Short-flag rules match raw text, so any quoting/escaping of the flag, or a tab before
-    # it, defeats them (AGENTS.md; AI_NOTES #17). git still sees `-f` in every case.
+    # Short-flag rules match raw text, so any quoting/escaping of the flag defeats them
+    # (AGENTS.md; AI_NOTES #17). git still sees `-f` in every case. The tab case is this
+    # matcher's simulation only: whether the real CLI normalises whitespace is unverified.
     assert decide("git push origin stage-7/x '-f'") == "allow"
     assert decide('git push origin stage-7/x "-uf"') == "allow"
     assert decide('git push origin stage-7/x -"f"') == "allow"
