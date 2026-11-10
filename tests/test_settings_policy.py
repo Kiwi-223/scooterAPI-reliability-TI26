@@ -249,11 +249,13 @@ def test_sandbox_fail_closed_and_no_bypass_mode():
 
 @pytest.mark.parametrize("rule", [
     "Edit(/.claude/**)", "Edit(/.github/**)", "Bash(dangerouslyDisableSandbox:true)",
+    "Edit(/.mcp.json)", "Edit(/mcp_server.py)",      # what the auto-approved MCP server runs (PR #23 review)
 ])
 def test_guardrail_edits_and_unsandboxed_retries_ask(rule):
     assert rule in PERM["ask"]
     assert rule not in PERM["allow"]
-    assert not any(r.startswith(("Edit(/.claude", "Edit(/.github")) for r in PERM["allow"])
+    assert not any(r.startswith(("Edit(/.claude", "Edit(/.github", "Edit(/.mcp", "Edit(/mcp_server")) for r in PERM["allow"])
+    assert not any(r in ("Edit", "Edit(*)", "Edit(/**)", "Write", "Write(*)") for r in PERM["allow"])
 
 
 @pytest.mark.parametrize("rule", [
@@ -269,3 +271,49 @@ def test_no_rule_ends_in_colon_star():
     # match a literal ':'. Rules that need a literal colon end in `:**` instead.
     offenders = [r for k in ("allow", "ask", "deny") for r in PERM[k] if r.endswith(":*)")]
     assert offenders == []
+
+
+# ---- MCP tools (PLAN PR 16): read-only tools allowed, action tools ask --------------------------
+
+def _mcp_rules(kind):
+    return {r for r in PERM[kind] if r.startswith("mcp__")}
+
+
+def test_mcp_server_is_enabled_for_fresh_sessions():
+    import mcp_server
+    assert SETTINGS["enabledMcpjsonServers"] == [mcp_server.NAME]
+    assert "enableAllProjectMcpServers" not in SETTINGS          # only this server, by name
+
+
+def test_every_read_only_mcp_tool_is_allowed_and_every_action_tool_asks():
+    import mcp_server
+    prefix = f"mcp__{mcp_server.NAME}__"
+    assert _mcp_rules("allow") == {prefix + t for t in mcp_server.READ_ONLY_TOOLS}
+    assert _mcp_rules("ask") == {prefix + t for t in mcp_server.ACTION_TOOLS}
+    assert _mcp_rules("deny") == set()
+    # no server-wide rule (mcp__scooter) that would allow the action tools too
+    assert not any(r in (f"mcp__{mcp_server.NAME}", f"mcp__{mcp_server.NAME}__*") for k in ("allow", "ask", "deny")
+                   for r in PERM[k])
+
+
+def test_the_mcp_rules_name_tools_the_server_really_has():
+    import anyio
+    from mcp import Client
+
+    import mcp_server
+
+    async def names():
+        async with Client(mcp_server.server) as client:
+            return {t.name for t in (await client.list_tools()).tools}
+    listed = anyio.run(names)
+    named = {r.split("__", 2)[2] for k in ("allow", "ask") for r in _mcp_rules(k)}
+    assert named == listed
+
+
+def test_mcp_json_is_write_denied_in_the_sandbox():
+    # PR #23 review: enabledMcpjsonServers approves the server by NAME, so whoever can rewrite
+    # .mcp.json picks the command that runs unsandboxed and unprompted next session. The
+    # sandbox already protects .mcp.json by default (a "protected path"); this makes it
+    # explicit, pinned and independent of the CLI version. Edits through Claude's file tools
+    # ask (test above).
+    assert SANDBOX["filesystem"] == {"denyWrite": ["./.mcp.json"]}

@@ -734,3 +734,36 @@ strongest entries.
   erases** (each kind of state, and what survives), not by the first symptom found; and
   test it with the *real* rollback (the whole file), not a narrower one that is easier to
   reason about.
+
+### 37. "Seeded, so deterministic" missed that the seed's other input was random
+- **Where:** PLAN PR 16, `tests/test_mcp_server.py` (the `replay_fault` test for a seeded fault).
+- **What the AI claimed:** a test with `PAYMENT_FAULT=random`, a fixed `PAYMENT_SEED` and
+  rate 1 is deterministic, so two ends of one ride give two faults and the second can be
+  replayed.
+- **Reality:** the draw is `sha256(seed, idempotency key, attempt)`, and the key is the
+  ride's uuid, new on every run. About one run in four, attempt 1 drew `decline`, which
+  **ends** the ride; the second end then never reached the gateway. It passed alone and
+  failed in the full suite.
+- **How it was caught:** the full-suite run failed once; re-reading the draw's inputs.
+- **What changed:** attempt 1 is forced (`error`, the ride stays pending), and only the
+  attempt under test is seeded (any of the four faults is fine for it). The test was then
+  run six times. Lesson: **a seed makes a draw reproducible only if every input to the
+  draw is fixed**; list the inputs before calling a test deterministic.
+
+### 38. A new auto-approval created an unguarded, unsandboxed entry point
+- **Where:** PLAN PR 16 (PR #23), `.claude/settings.json` `enabledMcpjsonServers: ["scooter"]`.
+- **What the AI claimed:** the MCP server was safe to auto-approve: its read-only tools only
+  read data files, and its action tools ask.
+- **Reality:** the approval is by *name*. Whatever command `.mcp.json` names under
+  `scooter` runs outside the sandbox with no prompt in the next session, and `.mcp.json`
+  had no ask rule or `denyWrite` of its own in this repo's policy. Editing one JSON file
+  would have turned the approval into arbitrary unsandboxed execution. The server's own
+  imports (`app.py` and friends) are the same class of risk, now an open human decision
+  (H11). Separately, `run_tests` passed `PYTEST_ADDOPTS` and `PYTHONPATH` through, so the
+  validated argv could be widened from the environment.
+- **How it was caught:** the adversarial review of PR #23.
+- **What changed:** ask rules for edits to `.mcp.json` and `mcp_server.py`, `.mcp.json` in
+  the sandbox `denyWrite`, policy tests for both, `PYTEST_*`/`PYTHON*` stripped from
+  `run_tests`, and the residual risk documented. Lesson: **every new auto-approval needs
+  its source file guarded**: when you approve something by name, path or pattern, ask who
+  can change what that name points to, and guard that too.

@@ -12,6 +12,10 @@ permission rules). This check fails on:
   - wrong value types and enum values
   - permission rules that don't match the schema's rule pattern (unknown tool name,
     unbalanced parentheses)
+  - MCP entries that don't match the checked-in `.mcp.json` (PLAN PR 16): an
+    `enabledMcpjsonServers` name or an `mcp__<server>__...` rule for a server `.mcp.json`
+    doesn't define, or a stdio server whose command doesn't exist. (Which *tools* exist is
+    checked by tests/test_settings_policy.py, which imports the server.)
 
 Schema: schemas/claude-code-settings.schema.json, vendored so CI needs no network.
   Source:  https://json.schemastore.org/claude-code-settings.json
@@ -29,6 +33,7 @@ from jsonschema import Draft7Validator
 REPO = Path(__file__).resolve().parent.parent
 SCHEMA_PATH = REPO / "schemas" / "claude-code-settings.schema.json"
 DEFAULT_TARGETS = [REPO / ".claude" / "settings.json"]
+MCP_JSON = REPO / ".mcp.json"
 
 
 def strict_schema():
@@ -48,10 +53,39 @@ def check(path, validator):
             for e in errors]
 
 
+def check_mcp(settings, mcp_config, base=REPO):
+    """Settings' MCP entries against a parsed .mcp.json -> list of problems."""
+    servers = (mcp_config or {}).get("mcpServers") or {}
+    problems = []
+    for name in settings.get("enabledMcpjsonServers") or []:
+        if name not in servers:
+            problems.append(f"enabledMcpjsonServers: {name!r} isn't defined in .mcp.json")
+    perms = settings.get("permissions") or {}
+    for kind in ("allow", "ask", "deny"):
+        for rule in perms.get(kind) or []:
+            if rule.startswith("mcp__"):
+                server = rule[len("mcp__"):].split("__", 1)[0]
+                if server not in servers:
+                    problems.append(f"permissions.{kind}: {rule!r} names server {server!r}, which .mcp.json doesn't define")
+    for name, server in servers.items():
+        command = server.get("command")
+        if server.get("type", "stdio") == "stdio" and command and "/" in command and not (base / command).exists():
+            problems.append(f".mcp.json: server {name!r} runs {command!r}, which doesn't exist (run make setup)")
+    return problems
+
+
 def main(argv):
     targets = argv or DEFAULT_TARGETS
     validator = Draft7Validator(strict_schema())
     problems = [msg for t in targets for msg in check(t, validator)]
+    if not argv:              # the repo's own settings: also cross-check .mcp.json
+        try:
+            mcp_config = json.loads(MCP_JSON.read_text())
+            settings = json.loads(DEFAULT_TARGETS[0].read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            problems.append(f"cannot read .mcp.json or settings for the MCP check: {exc}")
+        else:
+            problems += [f"{DEFAULT_TARGETS[0]}: {p}" for p in check_mcp(settings, mcp_config)]
     for msg in problems:
         print(msg, file=sys.stderr)
     if problems:

@@ -5,3 +5,4 @@
 jsonschema>=4.26.0   # make check-settings (scripts/check_settings.py)
 pip-tools>=7.6.2
 pytest>=9.2.0
+mcp>=2.3.0           # the agent tool server, mcp_server.py (PLAN PR 16): a dev/agent tool, not deployed
