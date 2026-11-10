@@ -54,6 +54,10 @@ class FailureKind(StrEnum):
                           "The endpoint exists but not for this HTTP method (all endpoints are GET).")
     STORAGE_ERROR = ("storage_error", HTTPStatus.INTERNAL_SERVER_ERROR,
                      "The scooter database file is missing, unreadable, corrupt or unwritable.")
+    # Retryable, unlike storage_error: another request held the DB lock for longer than
+    # SCOOTER_DB_LOCK_TIMEOUT. Nothing was read or written; retry after Retry-After.
+    STORAGE_BUSY = ("storage_busy", HTTPStatus.SERVICE_UNAVAILABLE,
+                    "The scooter database is locked by another request; nothing was changed, retry shortly.")
     INTERNAL_ERROR = ("internal_error", HTTPStatus.INTERNAL_SERVER_ERROR,
                       "Any other unexpected error (a bug); details are in the server log.")
 
@@ -68,3 +72,13 @@ class StorageError(Exception):
     def __init__(self, message, path=None):
         super().__init__(message)
         self.path = path
+
+
+class StorageBusy(Exception):
+    """Raised when the DB lock can't be acquired within SCOOTER_DB_LOCK_TIMEOUT."""
+
+    def __init__(self, message, path=None, waited_ms=None):
+        super().__init__(message)
+        self.path = path
+        self.waited_ms = waited_ms
+

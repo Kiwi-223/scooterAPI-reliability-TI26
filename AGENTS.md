@@ -59,6 +59,7 @@ before.
 | Variable | Default | Used by | Notes |
 |---|---|---|---|
 | `SCOOTER_RECORDS_PATH` | `data/records.jsonl` | `records.py`, once per request | Where request records are appended (see Request records). Relative to the cwd. The directory is created on demand. Read on every request, like `SCOOTER_DB_PATH`. |
+| `SCOOTER_DB_LOCK_TIMEOUT` | `5` | `app.py`, per mutating request | Seconds to wait for the DB lock before answering `storage_busy` (503). Unparseable values fall back to 5; negative values mean 0 (don't wait). |
 | `SCOOTER_DB_PATH` | `scooter_db.json` | `app.py` on every DB read/write, under both the dev server and gunicorn | Read on **every request**, so changing `os.environ` in a test takes effect without re-importing `app`. A relative path is resolved against the cwd. The file must already exist; the app doesn't create it. |
 | `HOST` | `localhost` | `python app.py` / `make run` only | gunicorn ignores it; use `--bind`. |
 | `PORT` | `8080` | `python app.py` / `make run` | Must be an integer. **gunicorn reads `PORT` too**: with no `--bind` it then listens on `0.0.0.0:$PORT` (see below). |
@@ -118,7 +119,7 @@ same command (see CI below).
   - `tests/seed_db.json` is the test-owned seed data: 5 scooters, and `33` starts reserved.
   - `tests/messages.py` holds the exact `msg` strings the API returns today.
   - Test files: `test_view_all.py`, `test_search.py`, `test_reservation.py`,
-    `test_failure_kinds.py`, `test_records.py`, `test_records_query.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
+    `test_failure_kinds.py`, `test_records.py`, `test_records_query.py`, `test_db_transactions.py`, `test_known_bugs.py`, plus `test_settings_schema.py` and
     `test_settings_policy.py` for the agent policy.
   - `messages.err(msg, kind)` builds the expected error body.
 - **Isolation:** the `db_path` fixture is autouse. It copies `tests/seed_db.json` into
@@ -210,6 +211,10 @@ every pull request and on every push to `master`.
   `{id, lat, lng, is_reserved}`. The app **rewrites it** whenever a reservation starts or
   ends, so any manual testing changes it. **Don't commit changes to it.** To restore it:
   `git restore scooter_db.json`.
+- **`scooter_db.json.lock`** (i.e. `<SCOOTER_DB_PATH>.lock`) is the DB's lock file. It's
+  empty and harmless, created on demand, and git-ignored (`*.lock`). A crashed write can
+  leave a `.scooter_db.json.*.tmp` next to the DB, also git-ignored; the DB itself stays
+  intact. See "Concurrency".
 - **Request records:** `data/records.jsonl` (or `SCOOTER_RECORDS_PATH`), one JSON line
   per request: what was asked, every decision, the scooter before and after, the DB write,
   the failure kind and the code version. They're git-ignored and survive restarts. See
@@ -222,8 +227,8 @@ every pull request and on every push to `master`.
 
 | Path | What it is |
 |---|---|
-| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `init_db`, `find_db_shape_problem`, `write_db`, `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
-| `failures.py` | The failure-kind registry (`FailureKind`) and `StorageError` (see Failure kinds). |
+| `app.py` | The whole app. It has the Flask routes (`/`, `/view_all_available`, `/search`, `/reservation/start`, `/reservation/end`), the error handlers and `error_response`, and helpers (`pay`, `payment_gateway`, `calculate_cost`, `db_transaction` (lock + read for mutating requests), `init_db`, `find_db_shape_problem`, `write_db` (atomic replace), `find_scooter` (lookup + record), `get_scooter_with_id`, `convert_db_to_dictlist`, `Scooter`). Every route notes its decisions in the request record. |
+| `failures.py` | The failure-kind registry (`FailureKind`), `StorageError` and `StorageBusy` (see Failure kinds). |
 | `records.py` | Request records: request ids, one JSON line per request (see Request records). |
 | `records_query.py` | Records query functions and CLI (`make records ARGS=…`, `python -m records_query`). |
 | `data/` | Default home of `records.jsonl`. Git-ignored except `.gitkeep`. |
@@ -253,12 +258,49 @@ ones marked *(xfail)* are pinned in `tests/test_known_bugs.py`.
   scooter still reserved, so a rider who never retries keeps it reserved. PLAN PRs 13/14
   define decline, timeout and reconcile behaviour (H3, H7). `txn_id` is an int, although
   the README says it's a string *(xfail, PLAN PR 13)*.
-- The DB read/write isn't locked, and the write isn't atomic, so concurrent requests can
-  lose updates (PLAN PR 11).
 - `lat`/`lng`/`radius` are parsed with Python's lenient `float()`, so `+5`, `1_000`,
   surrounding whitespace and Unicode digits (e.g. `٥`) are all accepted as numbers.
 - With an unwritable DB, `/reservation/end` charges the gateway first and only then fails
   to save (`storage_error`). The rider pays for a ride that didn't end *(xfail, PLAN PR 14)*.
+
+## Concurrency
+
+The JSON file DB is safe under threads, several gunicorn workers and separate processes
+(code: `db_transaction()` and `write_db()` in `app.py`).
+
+- **One transaction per mutating request.** `/reservation/start` and `/reservation/end` do
+  read → check → (pay →) write inside `with db_transaction() as txn:`. That holds an
+  exclusive `fcntl.flock` on the sidecar `<db>.lock` for the whole transaction, and
+  resolves the DB path once.
+  - `flock` locks belong to an open file description, so they exclude other threads as
+    well as other processes.
+  - **Why a sidecar lock file:** the write replaces the DB file (a new inode). A lock on
+    the DB file itself would stop covering the path after the first write, letting two
+    writers in at once.
+- **Atomic writes.** `write_db` writes a temp file in the same directory, flushes and
+  `fsync`s it, `os.replace`s it over the DB and `fsync`s the directory.
+  - A crash mid-write leaves the old DB intact, and the temp file is removed.
+  - The DB's permissions are kept, and a read-only DB is still refused (`storage_error`,
+    `PermissionError`).
+- **Lock-free reads.** `/view_all_available` and `/search` take no lock. `open()` sees
+  either the old or the new complete file, never a torn one, so readers never wait on
+  writers.
+- **No silent stalls.** Waiting for the lock is bounded by `SCOOTER_DB_LOCK_TIMEOUT`
+  (default 5 s).
+  - A timeout returns **`storage_busy` (503, `Retry-After: 1`)**, and nothing is read or
+    written.
+  - Every mutating request's record has a `db_lock` decision (`acquired`/`timeout`) with
+    `wait_ms` and `lock_path`, so contention shows up in the records.
+- **Known cost:** `/reservation/end` calls the payment gateway while holding the lock, so a
+  slow gateway delays every writer. PLAN PRs 13/14 persist `payment_pending` first and can
+  release the lock around the gateway call.
+- **Verified:**
+  - Threads: 8 threads racing to reserve one scooter → exactly one wins, every time.
+  - Processes: 6 processes racing → exactly one wins.
+  - 7 processes cycling start/end, 4 of them on the same scooter → no lost updates, no
+    `storage_error`/`storage_busy`, and `anomalies` clean.
+  - Readers racing writes on a 20,000-scooter DB never see a torn file.
+  - A live gunicorn `-w 4` hammer (see the PLAN PR 11 PR description).
 
 ## Request records
 
@@ -299,8 +341,9 @@ the evidence to use when debugging. Read the records before reading code.
  "method": "GET", "path": "/reservation/end", "params": {"id": "18", "lat": "23.01", "lng": "19.01"},
  "scooter_id": "18",
  "decisions": [
-   {"step": "db_read", "outcome": "ok", "detail": {"db_path": "scooter_db.json", "scooters": 5}},
    {"step": "params", "outcome": "ok", "detail": {"lat": 23.01, "lng": 19.01}},
+   {"step": "db_lock", "outcome": "acquired", "detail": {"lock_path": "scooter_db.json.lock", "wait_ms": 0.042}},
+   {"step": "db_read", "outcome": "ok", "detail": {"db_path": "scooter_db.json", "scooters": 5}},
    {"step": "lookup", "outcome": "found", "detail": {"id": "18"}},
    {"step": "end", "outcome": "allowed", "detail": {"reason": "scooter is reserved"}},
    {"step": "payment", "outcome": "requested", "detail": {"distance_m": 1509, "cost": 1509}},
@@ -324,7 +367,7 @@ the evidence to use when debugging. Read the records before reading code.
 | `request_id` | Same as the `X-Request-ID` response header. |
 | `method`, `path`, `params`, `params_truncated` | The request. `params` holds the query args as strings; a repeated key becomes a list. Values over 1024 chars are truncated with `...(truncated, N chars)`. Only the first 50 keys are kept, and `params_truncated` is `true` if there were more. |
 | `scooter_id` | The `id` param on `/reservation/*`, or `null`. |
-| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `db_write` (`ok`/`failed`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
+| `decisions` | An ordered list of `{step, outcome, detail}`. Steps: `request_id`, `params`, `db_lock` (`acquired`/`timeout`, with `wait_ms`; mutating requests only), `db_read` (`ok`/`failed`, with `db_path`), `lookup` (`found`/`not_found`), `reserve` / `end` (`allowed`/`refused`, with a reason), `payment` (`requested` with distance and cost, then `ok`/`failed` with the gateway's reply), `db_write` (`ok`/`failed`), `search`, `filter`, and `respond: error` (with the kind) for every failure. |
 | `scooter_before` | The scooter as read from the DB at lookup. |
 | `scooter_after` | **What's persisted after this request.** When the request wrote, it's this scooter's entry taken from the exact data `write_db` serialised to disk, not from the code's objects. When the request decided not to write (refused, payment failed) it equals `scooter_before`. It's `null` if the write failed or the request crashed, and also whenever the request neither wrote nor declared itself unchanged (e.g. a validation error, an unknown scooter, or a code path that forgot to record its outcome; the `anomalies` query flags the last case on `/reservation/*` successes). |
 | `scooter_in_memory` | What the route's in-memory scooter object looked like when it finished, i.e. what the code *believed*. **If `db_write.ok` is true and this differs from `scooter_after`, the code changed the scooter but didn't persist that change** (for example, `write_db` ran before the mutation). `null` if the route never got that far. |
@@ -457,6 +500,7 @@ Every error response is JSON with a human message and a **stable failure kind**:
 | `payment_failed` | 502 | The payment gateway reported a failure. The ride is **not** ended and the scooter stays reserved. A gateway-supplied `msg` is passed through, and so is its `code` if it's 400–599 (anything else becomes 502). PLAN PRs 13/14 add finer payment kinds. |
 | `route_not_found` | 404 | No endpoint at that path. |
 | `method_not_allowed` | 405 | Wrong HTTP method (every endpoint is GET); the `Allow` header is kept. |
+| `storage_busy` | 503 | A mutating request (`/reservation/*`) couldn't get the DB lock within `SCOOTER_DB_LOCK_TIMEOUT` (default 5 s), because another request held it. **Nothing was read or written**, so it's safe to retry; the response has `Retry-After: 1`. The record has a `db_lock: timeout` decision with `wait_ms`. A separate kind from `storage_error` because it's transient and retryable, and agents counting failures should see "contention" apart from "broken DB". |
 | `storage_error` | 500 | `scooter_db.json` (or `SCOOTER_DB_PATH`) is missing, unreadable, corrupt or unwritable, or has the wrong shape: the top level must be a list of objects, each with a string `id`, finite-number `lat`/`lng` and a boolean `is_reserved` (extra fields are allowed). The msg names the cause without a path, e.g. `(FileNotFoundError)` or `(entry 3: lat is not a finite number)`. The **server log** line `storage error: … (db=<path>)` carries the path and the original exception's traceback. |
 | `internal_error` | 500 | Anything else, i.e. a bug, including `abort(500)`. The msg is generic; the **traceback is in the server log** (`unhandled exception`). Any other HTTP error raised by the framework (unreachable today) also gets this kind but keeps its own status. |
 

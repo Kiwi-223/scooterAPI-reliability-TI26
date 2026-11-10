@@ -114,7 +114,7 @@ GET /reservation/start
 
 * **Code**: 422 <br />
   **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
-  Kinds: `missing_param`, `scooter_not_found`, `scooter_already_reserved`.
+  Kinds: `missing_param`, `scooter_not_found`, `scooter_already_reserved`, and `storage_busy` (503, retryable).
 
 
 ### End Reservation for a Scooter
@@ -147,7 +147,7 @@ GET /reservation/end
 
 * **Code**: 422 <br />
   **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
-  Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `no_active_reservation`.
+  Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `no_active_reservation`, and `storage_busy` (503, retryable).
 
 * **Code**: 502 (or the gateway's own code) <br />
   **Content**: the same envelope with kind `payment_failed`. The payment failed, the reservation was **not** ended and the scooter is still reserved.
@@ -180,5 +180,6 @@ never renamed; new ones may be added.
 | `route_not_found` | 404 | There's no endpoint at that path. |
 | `method_not_allowed` | 405 | All endpoints are `GET`. |
 | `storage_error` | 500 | The server couldn't read or write its database. |
+| `storage_busy` | 503 | The database was locked by another request for too long; nothing was changed. Retry after the `Retry-After` seconds (`/reservation/*` only). |
 | `internal_error` | 500 | Unexpected server error. |
 

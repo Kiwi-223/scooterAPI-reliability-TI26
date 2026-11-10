@@ -1,3 +1,5 @@
+from contextlib import contextmanager
+import fcntl, tempfile, time
 from flask import Flask, render_template, request, redirect, url_for, make_response
 from geopy.distance import distance as geodesic
 import json, math, os, werkzeug
@@ -5,7 +7,7 @@ from http import HTTPStatus
 from werkzeug.exceptions import HTTPException
 
 import records
-from failures import FailureKind, StorageError
+from failures import FailureKind, StorageBusy, StorageError
 
 app=Flask(__name__)
 records.init_app(app)	# request ids + one JSON line per request (records.py, AGENTS.md)
@@ -15,10 +17,18 @@ DEFAULT_DB_PATH = 'scooter_db.json'
 DEFAULT_HOST = 'localhost'
 DEFAULT_PORT = 8080
 
+DEFAULT_DB_LOCK_TIMEOUT = 5.0	# seconds a mutating request waits for the DB lock
+
 def get_db_path():
 	# Read on every call so a changed SCOOTER_DB_PATH takes effect without re-importing.
 	# A relative path is resolved against the current working directory, as before.
 	return os.environ.get('SCOOTER_DB_PATH') or DEFAULT_DB_PATH
+
+def get_db_lock_timeout():
+	try:
+		return max(0.0, float(os.environ.get('SCOOTER_DB_LOCK_TIMEOUT') or DEFAULT_DB_LOCK_TIMEOUT))
+	except ValueError:
+		return DEFAULT_DB_LOCK_TIMEOUT
 
 # ==================
 #  ERROR RESPONSES
@@ -37,6 +47,13 @@ def handle_storage_error(e):
 	app.logger.error('storage error: %s (db=%s)', e, e.path, exc_info=e.__cause__)
 	records.exception(e.__cause__ or e)
 	return error_response(FailureKind.STORAGE_ERROR, f'Error 500 - {e}')
+
+@app.errorhandler(StorageBusy)
+def handle_storage_busy(e):
+	app.logger.warning('storage busy: %s (lock=%s, waited_ms=%s)', e, e.path, e.waited_ms)
+	body, status, headers = error_response(FailureKind.STORAGE_BUSY, 'Error 503 - The scooter database is busy; nothing was changed. Retry shortly.')
+	headers['Retry-After'] = '1'
+	return body, status, headers
 
 @app.errorhandler(HTTPException)
 def handle_http_exception(e):
@@ -69,7 +86,7 @@ def home():
 	
 @app.route('/view_all_available')
 def view_all_available():
-	db = init_db()
+	db = init_db(get_db_path())	# lock-free read: writers replace the file atomically
 	available_scooters = [scooter for scooter in db if not scooter.is_reserved]
 	records.note('filter', 'ok', available=len(available_scooters))
 	available_scooters_dictlist = convert_db_to_dictlist(available_scooters)
@@ -110,7 +127,7 @@ def search():
 		return error_response(FailureKind.INVALID_RADIUS, 'Error 422 - Radius must be a finite number of metres that is 0 or more.')
 	records.note('params', 'ok', lat=search_lat, lng=search_lng, radius_m=search_radius)
 	
-	db = init_db()	# initialize db
+	db = init_db(get_db_path())	# lock-free read: writers replace the file atomically
 
 	search_results = []
 	for scooter in db:
@@ -138,30 +155,31 @@ def start_reservation():
 		return error_response(FailureKind.MISSING_PARAM, 'Error 422 - Please include all required parameters in search query')
 	records.scooter(scooter_id=reserve_id)
 
-	db = init_db()
-	
-	# try and find the scooter with specified id
-	scooter = find_scooter(reserve_id, db)
-	if scooter:
-		# reserve if possible
-		if not scooter.is_reserved:
-			# scooter can be reserved
-			records.note('reserve', 'allowed', reason='scooter is not reserved')
-			scooter.is_reserved = True
-			write_db(db)	# update db
-			records.scooter(in_memory=scooter.to_dict())
-			success = { 'msg': f'Scooter {reserve_id} was reserved successfully.' }
-			return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
+	# read, check and write under one exclusive lock (see db_transaction)
+	with db_transaction() as txn:
+		db = txn.db
+		# try and find the scooter with specified id
+		scooter = find_scooter(reserve_id, db)
+		if scooter:
+			# reserve if possible
+			if not scooter.is_reserved:
+				# scooter can be reserved
+				records.note('reserve', 'allowed', reason='scooter is not reserved')
+				scooter.is_reserved = True
+				write_db(db, txn.path)	# update db
+				records.scooter(in_memory=scooter.to_dict())
+				success = { 'msg': f'Scooter {reserve_id} was reserved successfully.' }
+				return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
 
+			else:
+				# the scooter is already reserved
+				records.note('reserve', 'refused', reason='scooter is already reserved')
+				records.scooter(in_memory=scooter.to_dict())
+				records.unchanged()
+				return error_response(FailureKind.SCOOTER_ALREADY_RESERVED, f'Error 422 - Scooter with id {reserve_id} is already reserved.')
 		else:
-			# the scooter is already reserved
-			records.note('reserve', 'refused', reason='scooter is already reserved')
-			records.scooter(in_memory=scooter.to_dict())
-			records.unchanged()
-			return error_response(FailureKind.SCOOTER_ALREADY_RESERVED, f'Error 422 - Scooter with id {reserve_id} is already reserved.')
-	else:
-		# no scooter with the reserve id was found
-		return error_response(FailureKind.SCOOTER_NOT_FOUND, f'Error 422 - No scooter with id {reserve_id} was found.')
+			# no scooter with the reserve id was found
+			return error_response(FailureKind.SCOOTER_NOT_FOUND, f'Error 422 - No scooter with id {reserve_id} was found.')
 
 
 # End a reservation
@@ -174,7 +192,6 @@ def end_reservation():
 		end_lat, end_lng = \
 			float(request.args['lat']), \
 			float(request.args['lng'])
-		db = init_db()
 	except werkzeug.exceptions.BadRequestKeyError:
 		# the required parameters are not present in the search query
 		return error_response(FailureKind.MISSING_PARAM, 'Error 422 - Please include all required parameters in search query')
@@ -188,49 +205,55 @@ def end_reservation():
 		return error_response(FailureKind.INVALID_COORDINATE, 'Error 422 - Longitude must be in the [-180, 180] range.')
 		
 	records.note('params', 'ok', lat=end_lat, lng=end_lng)
-	# try and find the scooter with specified id
-	scooter = find_scooter(scooter_id_to_end, db)
-	if scooter:
-		# end reservation if possible
-		if scooter.is_reserved:
-			# scooter is reserved and can be ended
-			records.note('end', 'allowed', reason='scooter is reserved')
+	# Validate first, then read, check, pay and write under one exclusive lock (see
+	# db_transaction). NOTE for PLAN PRs 13/14: the payment call happens while the lock is
+	# held, so a slow gateway delays every other writer; those PRs persist payment_pending
+	# and can release the lock around the gateway call.
+	with db_transaction() as txn:
+		db = txn.db
+		# try and find the scooter with specified id
+		scooter = find_scooter(scooter_id_to_end, db)
+		if scooter:
+			# end reservation if possible
+			if scooter.is_reserved:
+				# scooter is reserved and can be ended
+				records.note('end', 'allowed', reason='scooter is reserved')
 			
-			# initiate payment
-			payment_response = pay(scooter, end_lat, end_lng)
-			if payment_response['status']:
-				# the payment was completed successfully
+				# initiate payment
+				payment_response = pay(scooter, end_lat, end_lng)
+				if payment_response['status']:
+					# the payment was completed successfully
 				
-				# update scooter's reserved status and location
-				scooter.is_reserved = False
-				scooter.lat, scooter.lng = end_lat, end_lng
-				write_db(db)
-				records.scooter(in_memory=scooter.to_dict())
-				# construct successful response
-				success =	{	'msg': f'Payment for scooter {scooter_id_to_end} was made successfully and the reservation was ended.',
-								'txn_id': payment_response['txn_id']
-							}
-				return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
+					# update scooter's reserved status and location
+					scooter.is_reserved = False
+					scooter.lat, scooter.lng = end_lat, end_lng
+					write_db(db, txn.path)
+					records.scooter(in_memory=scooter.to_dict())
+					# construct successful response
+					success =	{	'msg': f'Payment for scooter {scooter_id_to_end} was made successfully and the reservation was ended.',
+									'txn_id': payment_response['txn_id']
+								}
+					return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
+				else:
+					# the payment failed: the reservation is NOT ended (unchanged behaviour; PLAN PRs 13/14
+					# define decline/timeout handling). Use the gateway's msg/code when it gives them.
+					records.scooter(in_memory=scooter.to_dict())	# expected: still reserved, not moved
+					records.unchanged()
+					code = payment_response.get('code')
+					if not (isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599):
+						code = None  # a failed payment never carries a non-error status: fall back to 502
+					return error_response(FailureKind.PAYMENT_FAILED,
+						payment_response.get('msg', 'Error 502 - Payment failed; the reservation was not ended.'),
+						code)
 			else:
-				# the payment failed: the reservation is NOT ended (unchanged behaviour; PLAN PRs 13/14
-				# define decline/timeout handling). Use the gateway's msg/code when it gives them.
-				records.scooter(in_memory=scooter.to_dict())	# expected: still reserved, not moved
+				# the scooter is not currently reserved
+				records.note('end', 'refused', reason='scooter is not reserved')
+				records.scooter(in_memory=scooter.to_dict())
 				records.unchanged()
-				code = payment_response.get('code')
-				if not (isinstance(code, int) and not isinstance(code, bool) and 400 <= code <= 599):
-					code = None  # a failed payment never carries a non-error status: fall back to 502
-				return error_response(FailureKind.PAYMENT_FAILED,
-					payment_response.get('msg', 'Error 502 - Payment failed; the reservation was not ended.'),
-					code)
+				return error_response(FailureKind.NO_ACTIVE_RESERVATION, f'Error 422 - No reservation for scooter {scooter_id_to_end} presently exists.')
 		else:
-			# the scooter is not currently reserved
-			records.note('end', 'refused', reason='scooter is not reserved')
-			records.scooter(in_memory=scooter.to_dict())
-			records.unchanged()
-			return error_response(FailureKind.NO_ACTIVE_RESERVATION, f'Error 422 - No reservation for scooter {scooter_id_to_end} presently exists.')
-	else:
-		# no scooter with the id was found
-		return error_response(FailureKind.SCOOTER_NOT_FOUND, f'Error 422 - No scooter with id {scooter_id_to_end} was found.')
+			# no scooter with the id was found
+			return error_response(FailureKind.SCOOTER_NOT_FOUND, f'Error 422 - No scooter with id {scooter_id_to_end} was found.')
 
 
 # ==================
@@ -267,11 +290,76 @@ def calculate_cost(distance):
 	return distance
 
 		
-def init_db():
+# ==================
+#  DB TRANSACTIONS
+# ==================
+#
+# Concurrency model (AGENTS.md "Concurrency"):
+# - Mutating requests run read -> check -> write inside db_transaction(), which holds an
+#   exclusive flock on a sidecar lock file `<db>.lock` for the whole transaction. flock locks
+#   belong to an open file description, so they exclude other threads (each opens its own
+#   descriptor) as well as other processes / gunicorn workers.
+# - The lock is on the sidecar, NOT on the DB file: write_db() replaces the DB with
+#   os.replace(), which gives the path a new inode. A lock held on the old DB inode would not
+#   stop a later request that opens the path (the new inode) and locks that, so two writers
+#   could run at once. The sidecar's inode never changes.
+# - Writes are atomic: temp file in the same directory, flush + fsync, os.replace over the
+#   DB, fsync the directory. A crash mid-write leaves the old DB intact.
+# - Reads (view, search) take no lock: open() sees either the old or the new complete file,
+#   never a half-written one, so readers never wait on writers.
+# - Waiting for the lock is bounded by SCOOTER_DB_LOCK_TIMEOUT (default 5 s); a timeout
+#   raises StorageBusy -> storage_busy (503, Retry-After: 1) and nothing is read or written.
+
+class DbTransaction:
+	def __init__(self, path, db):
+		self.path = path	# resolved once for the whole transaction
+		self.db = db
+
+def lock_path_for(db_path):
+	return db_path + '.lock'
+
+_LOCK_POLL_SECONDS = 0.005
+
+def acquire_db_lock(db_path, timeout):
+	# Returns the locked file descriptor; raises StorageBusy after `timeout` seconds.
+	lock_path = lock_path_for(db_path)
+	started = time.monotonic()
+	try:
+		fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+	except OSError as e:
+		records.note('db_lock', 'failed', lock_path=lock_path, error=type(e).__name__)
+		raise StorageError(f'The scooter database lock could not be opened ({type(e).__name__}).', lock_path) from e
+	while True:
+		try:
+			fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+			waited_ms = round((time.monotonic() - started) * 1000, 3)
+			records.note('db_lock', 'acquired', lock_path=lock_path, wait_ms=waited_ms)
+			return fd
+		except BlockingIOError:
+			waited = time.monotonic() - started
+			if waited >= timeout:
+				os.close(fd)
+				waited_ms = round(waited * 1000, 3)
+				records.note('db_lock', 'timeout', lock_path=lock_path, wait_ms=waited_ms, timeout_s=timeout)
+				raise StorageBusy(f'The scooter database lock was not acquired within {timeout} s.', lock_path, waited_ms) from None
+			time.sleep(_LOCK_POLL_SECONDS)
+
+@contextmanager
+def db_transaction():
+	path = get_db_path()
+	fd = acquire_db_lock(path, get_db_lock_timeout())
+	try:
+		yield DbTransaction(path, init_db(path))
+	finally:
+		fcntl.flock(fd, fcntl.LOCK_UN)
+		os.close(fd)
+
+
+def init_db(path=None):
 	# Any problem reading the DB becomes a StorageError -> storage_error (500), never a
 	# misleading validation error (a corrupt file raises ValueError, which end_reservation
 	# would otherwise report as "Lat/Lng values must be numbers").
-	path = get_db_path()
+	path = path or get_db_path()
 	try:
 		with open(path, 'r') as db_file:
 			db_json = db_file.read()
@@ -346,14 +434,43 @@ def get_scooter_with_id(search_id, db):
 		return None
 	
 
-def write_db(db):
+def _replace_atomically(path, data):
+	# temp file in the same directory (so os.replace is a same-filesystem rename), fsync it,
+	# rename it over the DB, then fsync the directory so the rename itself is durable.
+	if os.path.exists(path) and not os.access(path, os.W_OK):
+		# A read-only DB means "don't write". os.replace only needs the directory to be
+		# writable, so honour the file's permission explicitly.
+		raise PermissionError(f'{path} is read-only')
+	directory = os.path.dirname(os.path.abspath(path))
+	fd, tmp_path = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', suffix='.tmp', dir=directory)
+	try:
+		with os.fdopen(fd, 'w') as tmp_file:
+			tmp_file.write(data)
+			tmp_file.flush()
+			os.fsync(tmp_file.fileno())
+		if os.path.exists(path):
+			os.chmod(tmp_path, os.stat(path).st_mode & 0o7777)	# keep the DB's permissions
+		os.replace(tmp_path, path)
+	except BaseException:
+		try:
+			os.unlink(tmp_path)
+		except OSError:
+			pass
+		raise
+	dir_fd = os.open(directory, os.O_RDONLY)
+	try:
+		os.fsync(dir_fd)
+	finally:
+		os.close(dir_fd)
+
+
+def write_db(db, path=None):
 	# serialize Scooter objects 
 	db_list = convert_db_to_dictlist(db)
 	db_json = json.dumps(db_list)
-	path = get_db_path()
+	path = path or get_db_path()
 	try:
-		with open(path, 'w') as db_file:
-			db_file.write(db_json)
+		_replace_atomically(path, db_json)
 	except OSError as e:
 		records.db_write(False, type(e).__name__)
 		records.note('db_write', 'failed', db_path=path, error=type(e).__name__)

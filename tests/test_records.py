@@ -135,7 +135,7 @@ def test_start_success_records_the_transition(client, read_records):
     assert r["scooter_before"] == SEED["18"]
     assert r["scooter_after"] == r["scooter_in_memory"] == dict(SEED["18"], is_reserved=True)
     assert r["db_write"] == {"attempted": True, "ok": True, "error": None}
-    assert steps(r) == [("db_read", "ok"), ("lookup", "found"), ("reserve", "allowed"), ("db_write", "ok")]
+    assert steps(r) == [("db_lock", "acquired"), ("db_read", "ok"), ("lookup", "found"), ("reserve", "allowed"), ("db_write", "ok")]
 
 
 def test_start_already_reserved_records_no_change(client, read_records):
@@ -161,7 +161,7 @@ def test_end_success_records_payment_and_move(client, read_records):
     assert r["scooter_before"] == dict(SEED["18"], is_reserved=True)
     assert r["scooter_after"] == r["scooter_in_memory"] == {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False}
     assert r["db_write"]["ok"] is True and r["status"] == 200
-    assert steps(r) == [("db_read", "ok"), ("params", "ok"), ("lookup", "found"), ("end", "allowed"),
+    assert steps(r) == [("params", "ok"), ("db_lock", "acquired"), ("db_read", "ok"), ("lookup", "found"), ("end", "allowed"),
                         ("payment", "requested"), ("payment", "ok"), ("db_write", "ok")]
     payment = [d for d in r["decisions"] if d["step"] == "payment"]
     assert payment[0]["detail"]["cost"] == payment[0]["detail"]["distance_m"] > 0
@@ -395,13 +395,13 @@ import app
 resp = app.app.test_client().get("/reservation/end?id=18&lat=23.01&lng=19.01")
 print(resp.status_code)
 """
-_CORRECT_ORDER = """\t\t\t\tscooter.is_reserved = False
-\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
-\t\t\t\twrite_db(db)
+_CORRECT_ORDER = """\t\t\t\t\tscooter.is_reserved = False
+\t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
+\t\t\t\t\twrite_db(db, txn.path)
 """
-_BUGGY_ORDER = """\t\t\t\twrite_db(db)
-\t\t\t\tscooter.is_reserved = False
-\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
+_BUGGY_ORDER = """\t\t\t\t\twrite_db(db, txn.path)
+\t\t\t\t\tscooter.is_reserved = False
+\t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
 """
 
 
