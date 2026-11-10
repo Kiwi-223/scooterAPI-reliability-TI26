@@ -108,6 +108,9 @@ venv.bak/
 data/*
 !data/.gitkeep
 
+# make reset-local's backups (local state moved aside, never deleted)
+local-backups/
+
 # DB lock file and temp files left by an interrupted atomic write (app.py db_transaction/write_db)
 *.lock
 .*.tmp

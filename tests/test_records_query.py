@@ -821,3 +821,18 @@ def test_anomaly_charged_and_owed_across_records_and_keys():
     other = rec("c", 1, path="/reconcile", scooter="18", status=200, db_write=WROTE, scooter_before=TAKEN12,
                 decisions=[_d("balance", "recorded", reservation_id="another", amount=10)])
     assert "charged_and_owed" not in _types([charged, other])
+
+
+
+# ---- listed_unavailable (PR #24 review) -------------------------------------------------------
+
+@pytest.mark.parametrize("path,step,key", [("/view_all_available", "filter", "listed"), ("/search", "search", "matches")])
+def test_anomaly_listed_unavailable(path, step, key):
+    def listing(shown, unavailable):
+        return {"ts": "2026-11-10T00:00:00.000Z", "request_id": "v", "path": path, "status": 200, "scooter_id": None,
+                "decisions": [{"step": step, "outcome": "ok", "detail": {key: shown, "unavailable": unavailable}}]}
+    assert [a["type"] for a in rq.anomalies([listing(["15", "18"], {"18": "payment_pending"})])] == ["listed_unavailable"]
+    found = rq.anomalies([listing(["15", "18"], {"18": "payment_pending"})])[0]
+    assert found["detail"] == {"listed": {"18": "payment_pending"}, "step": step}
+    assert rq.anomalies([listing(["15"], {"18": "payment_pending", "33": "reserved"})]) == []
+    assert rq.anomalies([listing(["15"], None)]) == []                    # older records: count only

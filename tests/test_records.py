@@ -229,7 +229,8 @@ def test_search_records_params_and_matches(client, read_records):
     r = only_record(read_records)
     assert r["params"] == {"lat": "0", "lng": "0", "radius": "10"}
     assert r["decisions"][0] == {"step": "params", "outcome": "ok", "detail": {"lat": 0.0, "lng": 0.0, "radius_m": 10.0}}
-    assert r["decisions"][-1] == {"step": "search", "outcome": "ok", "detail": {"matches": ["14"]}}
+    assert r["decisions"][-1] == {"step": "search", "outcome": "ok",
+                                  "detail": {"matches": ["14"], "unavailable": {"33": "reserved"}}}
 
 
 def test_view_all_and_redirect(client, read_records):
@@ -237,7 +238,9 @@ def test_view_all_and_redirect(client, read_records):
     client.get("/view_all_available")
     redirect, view = read_records()
     assert (redirect["path"], redirect["status"]) == ("/", 302)
-    assert view["decisions"][-1] == {"step": "filter", "outcome": "ok", "detail": {"available": 4}}
+    assert view["decisions"][-1] == {"step": "filter", "outcome": "ok",
+                                     "detail": {"available": 4, "listed": ["15", "18", "9", "14"],
+                                                "unavailable": {"33": "reserved"}}}
 
 
 def test_repeated_params_are_kept_as_lists(client, read_records):

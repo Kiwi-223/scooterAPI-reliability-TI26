@@ -90,7 +90,7 @@ def home():
 def view_all_available():
 	db = init_db(get_db_path())	# lock-free read: writers replace the file atomically
 	available_scooters = [scooter for scooter in db if not scooter.is_reserved]
-	records.note('filter', 'ok', available=len(available_scooters))
+	records.note('filter', 'ok', available=len(available_scooters), **listing_detail(available_scooters, db))
 	available_scooters_dictlist = [scooter.to_public_dict() for scooter in available_scooters]
 	return json.dumps(available_scooters_dictlist), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# return a json-ified list of all the scooters with status 200
 
@@ -142,7 +142,8 @@ def search():
 									'lng':scooter.lng
 								  })
 			
-	records.note('search', 'ok', matches=[r['id'] for r in search_results])
+	matches = [r['id'] for r in search_results]
+	records.note('search', 'ok', matches=matches[:LISTING_CAP], unavailable=unavailable_reasons(db, matches))
 	return json.dumps(search_results), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# return json-ified search results list with status 200
 
 	
@@ -299,6 +300,27 @@ def end_reservation():
 # Fields a reservation carries while payment_state is payment_pending (set by begin_payment).
 PENDING_FIELDS = { 'end_lat', 'end_lng', 'distance_m', 'amount', 'payment_requested_at',
 	'payment_request_id', 'payment_attempts', 'last_payment_outcome' }
+
+# What a listing (view_all_available, search) showed, and which scooters it left out and why,
+# recorded independently of the filter itself (PR #24 review), so anomalies can flag a
+# reserved or payment_pending scooter that was listed. Capped: the DB may be large.
+LISTING_CAP = 50
+
+def unavailable_reasons(db, listed_ids=()):
+	# {id: 'reserved' | 'payment_pending' | <unknown state>} for the reserved scooters: every
+	# one that was listed (that's a bug, so never capped away), then the rest up to LISTING_CAP
+	listed_ids = set(listed_ids)
+	reasons = {}
+	for scooter in sorted((s for s in db if s.is_reserved), key=lambda s: s.id not in listed_ids):
+		if scooter.id not in listed_ids and len(reasons) >= LISTING_CAP:
+			break
+		state = (scooter.reservation or {}).get('payment_state')
+		reasons[scooter.id] = 'payment_pending' if state == 'payment_pending' else ('reserved' if state in (None, 'active') else str(state))
+	return reasons
+
+def listing_detail(listed, db):
+	ids = [scooter.id for scooter in listed]
+	return {'listed': ids[:LISTING_CAP], 'unavailable': unavailable_reasons(db, ids)}
 
 def begin_payment(scooter, end_lat, end_lng):
 	# active -> payment_pending: fix where the ride ends and what it costs, once. Retries and

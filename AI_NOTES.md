@@ -767,3 +767,97 @@ strongest entries.
   `run_tests`, and the residual risk documented. Lesson: **every new auto-approval needs
   its source file guarded**: when you approve something by name, path or pattern, ask who
   can change what that name points to, and guard that too.
+
+### 39. Durable state outside the DB quietly changed what "reset" means
+- **Where:** AGENTS.md's reset instructions (`git restore scooter_db.json`), across PLAN PRs
+  13, 15b and 15c; fixed in PLAN PR 17 (`make reset-local`).
+- **What the AI claimed:** `git restore scooter_db.json` resets local state. It was written
+  in "Where data lives", the Reversibility table and the known-behaviour notes, and it was
+  true when the DB was the only state.
+- **Reality:** PR 13 added the payments ledger and PR 15c made it a source of truth for
+  debts, while the request records were always durable. After that, restoring only the
+  DB is a **rollback**: reconcile rebuilds old debts from the ledger, and
+  `rollback-check` lists every past ride as erased. The instruction kept its old wording
+  through three PRs that each changed what it did.
+- **How it was caught:** PR #22's review: following the documented reset and then running
+  reconcile rebuilt balances from rides that "no longer existed".
+- **What changed:** `make reset-local` backs up and moves the DB, records, ledger and
+  scenario runs together, deleting nothing, and every reset instruction now points at it.
+  Lesson: **when you add durable state outside the DB, re-check every reset, restore and
+  "start fresh" instruction**, because each one silently changes meaning.
+
+### 40. The playbook's own "failing test" template failed on correct code
+- **Where:** PLAN PR 17, AGENTS.md "Debugging a symptom", step 6's test template.
+- **What the AI claimed:** a copy-pasteable template that fails on the buggy code and
+  passes once it's fixed. It checked `read_records()[-1]["scooter_after"]`.
+- **Reality:** the template had just made a `/view_all_available` request, which writes
+  its own record with no scooter. So the "last record" wasn't the end, and the test failed
+  with a `TypeError` on correct code. A cold agent copying it would have "reproduced" a bug
+  that wasn't there.
+- **How it was caught:** following the playbook literally in a fresh clone: plant, write
+  the template test, see it fail, revert the plant, see it **still** fail.
+- **What changed:** the template finds the record by the response's `X-Request-ID`, the
+  doc says why, and `tests/test_playbook.py` executes the template straight from AGENTS.md
+  against the real code, so it can't rot. Lesson: **run every snippet you document,
+  against both the broken and the fixed code**; "it fails on the bug" proves nothing until
+  it also passes without it.
+
+### 41. The documented "is everything consistent?" command was wrong on clean data
+- **Where:** PLAN PR 17, the playbook's step 4 (`tests/invariants.py` on a scenario's files)
+  and MCP `check_invariants(scenario=…)`.
+- **What the AI claimed:** the command answers "DB + ledger + records consistent?".
+- **Reality:** on every clean `rides` run it reported
+  `I3 charged under a key no reservation owned` for `legacy-33`. The CLI uses the current
+  DB as the "initial" one, the scenario ends 33's committed legacy ride, and no start
+  record exists for it. The scenario's own summary used the real initial DB and said 0,
+  so the two disagreed. A cold agent would have chased a double charge that didn't exist.
+- **How it was caught:** the PR #24 reviewer ran every documented step-4 command after a
+  clean scenario. I had tested the scenario's summary, not the commands I told readers to
+  run.
+- **What changed:** `started_keys` also counts reservations the records saw, but only
+  those older than the records (see #43: the first version, "every reservation a record
+  saw", was *not* right for live data: it hid a double charge). A test runs every
+  documented step-5 command (CLI and MCP) on every clean scenario. Lesson: **test the
+  commands the docs tell people to run, exactly as written**, not an internal equivalent.
+
+### 42. Scenarios gave false coverage, and the playbook order hid the strongest signal
+- **Where:** PLAN PR 17, `scenarios.py` and the playbook's step order.
+- **What the AI claimed:** the scenarios cover normal rides, each fault, retries,
+  reconcile and so on, so a planted bug shows up in their evidence.
+- **Reality:** the reviewer planted "view_all lists payment_pending scooters" and "the
+  reconcile attempt limit is `>` not `>=`". All 8 scenarios passed for both: none
+  checked a pending scooter's visibility, and the reconcile scenario only exercised the
+  age rule. The existing test suite failed on both immediately, with test names pointing
+  at the cause, but the playbook only mentioned `make test` after the fix.
+- **How it was caught:** the reviewer's two blind cold-agent dry runs.
+- **What changed:** the playbook runs `make test` first ("the fastest signal").
+  `payment-faults` asserts a pending scooter isn't listed or found, and `reconcile`
+  exercises N attempts (no N+1th call). Listings record what they showed and what was
+  unavailable, with a new `listed_unavailable` anomaly. Both reviewer plants are now
+  tests. Lesson: **a scenario only covers the expectations it states**: list the rules
+  (both terminal rules, every listing) and check each has an expectation, and put the
+  cheapest strong signal (the existing tests) first.
+
+### 43. Both agents loosened a checker and each claimed the other checks still covered it
+- **Where:** PLAN PR 17 (PR #24), `tests/invariants.py` `started_keys`.
+- **What the AIs claimed:**
+  - The reviewer's first fix for #41 was "count every reservation seen in the records' snapshots".
+  - The writer adopted it with a trade-off note: per-reservation I3 and `ledger-check`
+    would still catch double charges.
+- **Reality:** the app persists every key before charging under it (phase 1). So a bug that
+  invents a new key **and** reservation id on each failed attempt (F2) left its new key in
+  a snapshot, and the key counted as "owned". Its double charge then passed:
+  - I3 by key, because the key now looked owned;
+  - I3 by reservation, because each charge had a different reservation id;
+  - `ledger-check`, because each key equals its own reservation id.
+
+  Only the per-scooter `scooter_double_charge` anomaly, the suite and the scenarios still
+  caught it. The false positive had become a false negative, and the note claiming the
+  other checks covered it was wrong.
+- **How it was caught:** in the re-review, the reviewer planted two bugs aimed exactly at
+  the loosened case (a persisted foreign key that double-charges).
+- **What changed:** a snapshot's reservation counts only if it is older than the records,
+  meaning its `start_request_id` isn't a recorded start. F2 is now a planted-bug test, and
+  it's caught by the documented invariants command. Lesson: **when you loosen a checker,
+  plant a bug aimed exactly at the loosened case before claiming the other checks cover
+  it**, whoever proposed the loosening.

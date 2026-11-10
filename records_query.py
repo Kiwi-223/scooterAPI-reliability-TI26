@@ -415,6 +415,9 @@ def anomalies(records, since=None, db=None, db_path=None):
       record for it, or None), and the finding is `resolved` when the DB doesn't hold it
       (still_in_db false), or, with no DB, when a settled record exists. A resolved finding
       is a labelled historical flag; it doesn't make the CLI exit 1.
+    - listed_unavailable: /view_all_available's `filter` or /search's `search` decision
+      listed a scooter that the same decision records as unavailable (reserved or
+      payment_pending, from the DB it read): a listing filter bug (PR #24 review)
     - reconcile_not_settled: a /reconcile record (PLAN PR 15) says it ended the ride (status
       200, an action other than none, clear_paid_balance or rebuild_lost_balance) but scooter_after is still
       reserved; or it ended it unpaid (payment_unresolved) or declined (settle_declined*,
@@ -592,6 +595,15 @@ def anomalies(records, since=None, db=None, db_path=None):
                            for b in after_balances):
                     flag("reconcile_not_settled", {"reconcile": acted[0], "scooter_after": after,
                                                    "problem": f"ended without a {owed_reason} outstanding balance"})
+        for d in decisions:
+            # PR #24 review: a listing that showed a scooter it recorded as unavailable
+            if (d.get("step"), d.get("outcome")) in (("filter", "ok"), ("search", "ok")):
+                detail = d.get("detail") or {}
+                shown = detail.get("listed", detail.get("matches")) or []
+                unavailable = detail.get("unavailable") or {}
+                wrong = {sid: unavailable[sid] for sid in shown if isinstance(unavailable, dict) and sid in unavailable}
+                if wrong:
+                    flag("listed_unavailable", {"listed": wrong, "step": d.get("step")})
         if isinstance(after, dict) and "reservation" in after:
             reservation = after["reservation"]
             if (after.get("is_reserved") is True) != (reservation is not None):

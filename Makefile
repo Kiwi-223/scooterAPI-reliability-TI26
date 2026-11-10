@@ -12,7 +12,7 @@ PIP_COMPILE := CUSTOM_COMPILE_COMMAND="make lock" $(BIN)/pip-compile --quiet \
 	--allow-unsafe --generate-hashes --strip-extras
 
 .DEFAULT_GOAL := help
-.PHONY: help setup run test check-settings records payments reconcile lock agent clean
+.PHONY: help setup run test check-settings records payments reconcile scenario reset-local lock agent clean
 
 help: ## List available targets
 	@grep -E '^[a-z][a-zA-Z_-]*:.*## ' $(MAKEFILE_LIST) | \
@@ -42,6 +42,12 @@ records: $(STAMP) ## Query request records: make records ARGS="failure-counts --
 
 reconcile: $(STAMP) ## Settle stuck (payment_pending) rides: make reconcile [ARGS="--dry-run"] (see AGENTS.md)
 	@$(BIN)/python -m reconcile $(ARGS)
+
+scenario: $(STAMP) ## Reproduce realistic traffic on an isolated instance: make scenario NAME=rides (no NAME: list them)
+	@$(BIN)/python scenarios.py $(NAME) $(ARGS)
+
+reset-local: ## Back up and reset local state (DB from git, data/ moved aside; deletes nothing): [DRY_RUN=1]
+	@python3 scripts/reset_local.py $(if $(DRY_RUN),--dry-run)
 
 payments: $(STAMP) ## Inspect the payment gateway: make payments ARGS="lookup <key>" or ARGS="draw --seed S --key K --attempt N"
 	@$(BIN)/python -m payments $(ARGS)
