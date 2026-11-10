@@ -418,6 +418,10 @@ def anomalies(records, since=None, db=None, db_path=None):
     - charged_before_pending_persisted: a first-attempt end (it has a `payment: pending`
       decision) asked the gateway to charge before any `db_write: ok` after that decision.
       Phase 1 must be on disk before the charge (PLAN PR 14)
+    - pending_location_not_requested: a first-attempt end (it has a `payment: pending`
+      decision, which records the values read back from the reservation) stored an end
+      location other than the one its `params: ok` parsed (compared as floats). Retries
+      are exempt: they ignore their own coordinates by design (PLAN PR 20b)
     - pending_location_changed: a retry (`end: retry`) re-priced the ride (it has its own
       `payment: pending`), or charged a different end location or amount than the one
       stored when payment started (this record's retry decision, or any earlier record's
@@ -577,6 +581,27 @@ def anomalies(records, since=None, db=None, db_path=None):
                             for d in decisions[pending_at + 1:requested_at])
             if not persisted:
                 flag("charged_before_pending_persisted", {"payment_pending": pending, "payment_requested": requested})
+        # A first-attempt end (it has `payment: pending`) must store the location this request
+        # asked for (its `params: ok`, as the app parsed it). A retry has no pending decision:
+        # it ignores its own coordinates by design (PLAN PR 20b).
+        # Both the pending decision and the payment `requested` decision (read from the
+        # reservation) are checked, so records from code that logged its arguments still show it.
+        if path == "/reservation/end" and pending_at is not None:
+            _, params_ok = _decision(decisions, "params", "ok")
+            asked = _float_pair((params_ok or {}).get("lat"), (params_ok or {}).get("lng"))
+            for source, detail in (("payment_pending", pending), ("payment_requested", requested)):
+                if asked is None or detail is None:
+                    continue
+                stored_end = _float_pair(detail.get("end_lat"), detail.get("end_lng"))
+                if stored_end != asked:
+                    flag("pending_location_not_requested", {
+                        "summary": f"the request asked to end at ({asked[0]}, {asked[1]}), but phase 1 stored "
+                                   + ("an unparseable location" if stored_end is None
+                                      else f"({stored_end[0]}, {stored_end[1]})") + f" (per {source})",
+                        "requested": {"lat": asked[0], "lng": asked[1]},
+                        "stored": None if stored_end is None else {"lat": stored_end[0], "lng": stored_end[1]},
+                        "source": source, source: detail})
+                    break
         retry_at, retry = _decision(decisions, "end", "retry")
         if retry_at is not None and requested_at is not None:
             charged = _ride_values(requested, "cost")

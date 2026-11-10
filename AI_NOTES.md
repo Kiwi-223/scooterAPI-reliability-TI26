@@ -144,9 +144,9 @@ caught (with links), what changed, and a lesson that transfers beyond this repo.
 
 ## Tally, and how this log was checked
 
-Counted from the "Who was wrong" lines of all 48 entries; an entry naming two or three
+Counted from the "Who was wrong" lines of all 49 entries; an entry naming two or three
 agents counts for each of them.
-- **Writer: 42** (every entry except #1–#5 and #22). 6 of them are shared with the
+- **Writer: 43** (every entry except #1–#5 and #22). 6 of them are shared with the
   reviewer: #9, #28, #34, #38, #43, #44. #34 counts as shared because its line names the
   reviewer's #28 as part of the pattern.
 - **Reviewer: 7** (those 6, plus #22).
@@ -224,6 +224,7 @@ round count (#17), and status lines in #3–#5 that had gone stale.
 | 46 | A guard for an empty `WEB_CONCURRENCY` that couldn't help, because it was never tested against an empty value | Claims that outran the evidence |
 | 47 | A "read only this section" note one line above an import that loads the whole file | Claims that outran the evidence |
 | 48 | An agent-facing `jq` one-liner that had never been run as an agent copies it | Claims that outran the evidence |
+| 49 | The `payment: pending` decision recorded intent, not what was stored (#21 again) | Claims that outran the evidence |
 
 ## All entries, by theme
 
@@ -734,6 +735,29 @@ Something presented as checked, proven or true everywhere that was only checked 
   escaped pipes are reworded. A test fails on any code span in AGENTS.md that contains
   `\|`. Lesson: test documentation commands from the raw text the reader will copy, which
   is the same rule as #41, applied to markdown.
+
+#### 49. The `payment: pending` decision recorded intent, not what was stored (#21 again)
+- **Who was wrong:** writer.
+- **Where:** `begin_payment` in `app.py` (PLAN PR 14), found in PLAN PR 20a's review and
+  fixed in PLAN PR 20b.
+- **What the AI claimed:** the `payment: pending` decision is "the end location and amount
+  saved by phase 1" (AGENTS.md's records schema), so evidence about where a ride was set
+  to end.
+- **Reality:** it logged the *arguments* `begin_payment` was called with, not the values it
+  stored on the reservation. The reviewer planted `begin_payment` storing the end location
+  swapped. One record then contradicted itself (`pending` said 23.01, `requested`, which
+  reads the reservation, said 19.01), and `anomalies` reported **0**, because
+  `end_location_not_persisted` compares the scooter with the *stored* location, which was
+  consistently wrong. This is the same mistake as #21 (`scooter_after` recorded what the
+  code believed, not what was written), in a field added three PLAN PRs after #21's lesson.
+- **How it was caught:** the reviewer's planted bug in the [PR #27 review](https://github.com/Kiwi-223/scooterAPI-reliability-TI26/pull/27#issuecomment-6778934773) (MINOR 3).
+- **What changed:** `payment: pending` reads `end_lat`, `end_lng`, `distance_m` and `amount`
+  back from the reservation after storing them. New anomaly `pending_location_not_requested`
+  compares the stored location (per `pending` and `requested`) with the request's parsed
+  `lat`/`lng`; retries are exempt. The plant is kept as M11, and five mutations of the fix
+  and the rule each fail a test. Lesson: **every evidence field should read back what was
+  persisted**, and a lesson learned once (#21) needs checking against every new field,
+  not just the one it came from.
 
 ### Tests that passed for the wrong reason
 

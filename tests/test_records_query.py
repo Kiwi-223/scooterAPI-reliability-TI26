@@ -844,6 +844,40 @@ def test_anomaly_charged_and_owed_across_records_and_keys():
 
 
 
+# ---- pending_location_not_requested (PLAN PR 20b) ----------------------------------------------
+
+def _first_end(pending, requested=None, lat=23.01, lng=19.01):
+    decisions = [{"step": "params", "outcome": "ok", "detail": {"lat": lat, "lng": lng}},
+                 {"step": "payment", "outcome": "pending", "detail": pending},
+                 {"step": "db_write", "outcome": "ok", "detail": {}}]
+    if requested is not None:
+        decisions.append({"step": "payment", "outcome": "requested", "detail": requested})
+    return rec("e", 1, path="/reservation/end", scooter="18", status=504, decisions=decisions)
+
+
+def test_pending_location_not_requested():
+    ok = {"end_lat": 23.01, "end_lng": 19.01, "distance_m": 1, "amount": 1}
+    swapped = {"end_lat": 19.01, "end_lng": 23.01, "distance_m": 1, "amount": 1}
+    assert [a["type"] for a in rq.anomalies([_first_end(ok, ok)])] == []
+    assert [a["type"] for a in rq.anomalies([_first_end(ok, ok, lat="+23.010", lng=" 19.01 ")])] == []   # as floats
+    [found] = rq.anomalies([_first_end(swapped, swapped)])
+    assert found["type"] == "pending_location_not_requested" and found["detail"]["source"] == "payment_pending"
+    # records from code that logged its arguments in `pending`: `requested` (read back) still shows it
+    [old_style] = rq.anomalies([_first_end(ok, swapped)])
+    assert old_style["detail"]["source"] == "payment_requested"
+    assert old_style["detail"]["stored"] == {"lat": 19.01, "lng": 23.01}
+
+
+def test_a_retry_is_exempt_from_pending_location_not_requested():
+    # a retry has no `payment: pending`: it ends where the first request asked, whatever it sends
+    stored = {"end_lat": 23.01, "end_lng": 19.01, "distance_m": 1, "amount": 1, "cost": 1}
+    record = rec("r", 1, path="/reservation/end", scooter="18", status=504, decisions=[
+        {"step": "params", "outcome": "ok", "detail": {"lat": 5.0, "lng": 5.0}},
+        {"step": "end", "outcome": "retry", "detail": stored},
+        {"step": "payment", "outcome": "requested", "detail": stored}])
+    assert "pending_location_not_requested" not in {a["type"] for a in rq.anomalies([record])}
+
+
 # ---- listed_unavailable (PR #24 review) -------------------------------------------------------
 
 @pytest.mark.parametrize("path,step,key", [("/view_all_available", "filter", "listed"), ("/search", "search", "matches")])

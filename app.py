@@ -364,7 +364,12 @@ def begin_payment(scooter, end_lat, end_lng):
 									'payment_attempts': 0,
 									'last_payment_outcome': None
 							   })
-	records.note('payment', 'pending', end_lat=end_lat, end_lng=end_lng, distance_m=distance_ridden, amount=cost)
+	# Record what was STORED, read back from the reservation, not the arguments: evidence must
+	# say what was persisted (AI_NOTES #21, #49). A bug that stores the wrong values then shows
+	# up as a pending location that differs from the request's (anomaly pending_location_not_requested).
+	stored = scooter.reservation
+	records.note('payment', 'pending', end_lat=stored['end_lat'], end_lng=stored['end_lng'],
+		distance_m=stored['distance_m'], amount=stored['amount'])
 
 def pay(scooter):
 	# One gateway attempt for a payment_pending ride, with its stored location and amount.

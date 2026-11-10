@@ -149,7 +149,7 @@ def restore(d):
           "ending the restored ride elsewhere is a conflict, not a second ride",
           check=lambda b: b.get("ride_ended") is False, check_why="the body says the ride didn't end")
     d.expect_db("18", "after a conflict 18's ride is active again, payment fields dropped", reserved=True,
-                state="active", amount=None)
+                state="active", amount="<absent>")
     d.req("/reservation/end?id=18&lat=23.01&lng=19.01", 200, "ending it the same way returns the original charge")
     d.expect_ledger("still one charge: no double charge", charges=1)
     d.snapshot("before-9")
@@ -202,10 +202,12 @@ def found_ids(body):
 # rehearsal got "expected: 18 is free at (23.01, 19.01)" with no hint of where 18 really was).
 DB_FIELDS = {
     "reserved": lambda s: s["is_reserved"],
-    "state": lambda s: (s.get("reservation") or {}).get("payment_state"),
+    # None only when there's no reservation at all; a reservation without a state is "<missing>"
+    "state": lambda s: None if s.get("reservation") is None else s["reservation"].get("payment_state", "<missing>"),
     "at": lambda s: (s["lat"], s["lng"]),
     "balances": lambda s: [b["reason"] for b in open_balances(s)],          # open balances' reasons
-    "amount": lambda s: (s.get("reservation") or {}).get("amount"),          # set only while payment_pending
+    # set only while payment_pending; "<absent>" when the key isn't there (a null amount is not absent)
+    "amount": lambda s: (s.get("reservation") or {}).get("amount", "<absent>"),
 }
 LEDGER_FIELDS = {
     "charges": lambda entries: sum(bool(e.get("charged")) for e in entries),
@@ -227,7 +229,8 @@ def mismatch(fields, actual_of, want):
             shown = _fmt(got)
         except Exception as exc:               # the data has an unexpected shape
             got, shown = object(), f"<{type(exc).__name__}: {exc}>"
-        if got != wanted:
+        # exact: same value and same type, so reserved=False doesn't accept 0 (PR #27 review NIT 3)
+        if got != wanted or type(got) is not type(wanted):
             parts.append(f"expected {name}={_fmt(wanted)}, got {name}={shown}")
     return "; ".join(parts) or None
 
