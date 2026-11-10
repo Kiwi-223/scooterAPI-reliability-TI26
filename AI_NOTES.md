@@ -376,3 +376,20 @@ strongest entries.
   test the write path as well as the read path. A round trip (read, mutate, write, read)
   is the minimal honest check.
 
+### 20. Concurrency tests that pass without the lock they're meant to prove
+- **Where:** `tests/test_records.py`, first version (PLAN PR 9).
+- **What the AI claimed:** the threaded test (8 threads × 25 requests) and the
+  multi-process test (4 processes appending 70 KB lines) proved that records are written
+  "atomically under an exclusive `fcntl.flock`".
+- **Reality:** with the `flock` call deleted, both tests still passed. On macOS (and Linux)
+  a single `write()` to an `O_APPEND` file usually lands whole anyway, so the tests showed
+  that lines didn't interleave *in practice*. They didn't show that the lock is taken. The
+  lock is what still protects the line if a write is ever split, or if a future change
+  adds a second write per record.
+- **How it was caught:** the writer's own mutation run. "no flock" was the only mutation
+  out of 15 that survived.
+- **What changed:** `test_append_waits_for_the_exclusive_lock` holds the flock from the
+  test and checks that `append_line` blocks until it's released. Removing the lock now
+  fails it. Lesson: a stress test that "never saw a problem" isn't evidence that the
+  mechanism exists. Test the mechanism directly, and mutation-test the tests.
+

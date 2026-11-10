@@ -103,3 +103,7 @@ venv.bak/
 # Claude Code: personal overrides and agent worktrees (the shared .claude/settings.json is committed)
 .claude/settings.local.json
 .claude/worktrees/
+
+# Request records (records.py): local evidence, never committed. Keep the directory.
+data/*
+!data/.gitkeep

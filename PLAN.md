@@ -60,12 +60,12 @@ Status: ⬜ not started · 🟡 in progress / in review · ✅ merged · ⏸ blo
 | # | PR | Scope | Status |
 |---|---|---|---|
 | 7 | `feat`: stable failure kinds + JSON error envelope | A fixed registry of kinds with stable string ids (`missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `scooter_already_reserved`, `no_active_reservation`, `route_not_found`, `method_not_allowed`, `storage_error`, `internal_error`, …). **Every** error, including Flask's own 404/405/500 pages, returns JSON with `msg` (kept for README compatibility) and `"error": {"kind": ...}`. A test enumerates the registry and exercises every kind. Kinds are documented in AGENTS.md. | ✅ |
-| 8 | `fix`: validate `radius` | Reject negative, non-finite (`inf`, `nan`) or missing radius with a named kind (`invalid_radius`). | ✅ |
+| 8 | `fix`: validate `radius` | Reject a negative or non-finite (`inf`, `nan`) radius with a named kind (`invalid_radius`). A missing radius stays `missing_param`. | ✅ |
 
 ### Stage 3: Every request leaves a record (Outcome 1)
 | # | PR | Scope | Status |
 |---|---|---|---|
-| 9 | `feat`: persisted request records | Every request gets a `request_id`, returned as the `X-Request-ID` header. Each request appends one JSON line to `data/records.jsonl` (configurable path, git-ignored, survives restarts). A record holds: UTC ISO-8601 timestamp, git commit plus a `git_dirty` flag (a planted bug may be uncommitted), method, path, params, `scooter_id`, the decisions made, scooter state **before and after**, the DB write result, the payment result once Stage 4 lands, status, failure kind and duration. Each record is written atomically as a single line, so lines from several workers never interleave. Tests isolate the log. Log rotation is noted as future work. | ⬜ |
+| 9 | `feat`: persisted request records | Every request gets a `request_id`, returned as the `X-Request-ID` header. Each request appends one JSON line to `data/records.jsonl` (configurable path, git-ignored, survives restarts). A record holds: UTC ISO-8601 timestamp, git commit plus a `git_dirty` flag (a planted bug may be uncommitted), method, path, params, `scooter_id`, the decisions made, scooter state **before and after**, the DB write result, the payment result once Stage 4 lands, status, failure kind and duration. Each record is written atomically as a single line, so lines from several workers never interleave. Tests isolate the log. Log rotation is noted as future work. | ✅ |
 | 10 | `feat`: records query CLI | `python -m …records` / `make records ARGS=…` with recent failures, failure counts by kind since a time, scooter history and request trace. This is the fallback that works without MCP approval, and the MCP server in Stage 5 reuses the same module. | ⬜ |
 
 ### Stage 4: State stays consistent and payment can fail safely (Outcome 3)
@@ -138,3 +138,4 @@ These need a person. The agents use the default shown unless told otherwise.
   The policy is now tested by behaviour (`tests/test_settings_policy.py`). Docs hosts were added to the sandbox allowlist. H2 is now the control on `master`.
 - 2026-11-09: Added PR 6b. Short-flag clusters with `f`/`d` in their first three letters (e.g. `-fqu`, `-uqd`) are denied for `git push`. Clusters with `f`/`d` at the 4th letter or later are documented as a gap, covered only by H2 plus review.
 - 2026-11-09: PR 8 done. PR 12's scope gained three DB-validation gaps from the PR 7 review (#9): lat/lng ranges in the DB, extra fields dropped on write, and duplicate ids.
+- 2026-11-09: PR 9 done. Row 8's text corrected: a missing radius is `missing_param`, not `invalid_radius`, matching what shipped.
