@@ -59,7 +59,7 @@ def test_concurrent_writers_on_different_scooters_lose_no_updates(db_path, read_
         t.join()
     db = read_db()
     for sid in ["15", "18", "9", "14"]:
-        assert db[sid] == {"id": sid, "lat": 14.0, "lng": 14.0, "is_reserved": False}
+        assert db[sid] == {"id": sid, "lat": 14.0, "lng": 14.0, "is_reserved": False, "reservation": None}
     assert db["33"]["is_reserved"] is True
     assert rq.failure_counts(read_records()) == {}
 
@@ -125,7 +125,7 @@ def test_concurrent_cycles_across_processes(db_path, records_path, read_db, read
     outputs = _spawn(db_path, records_path, own + shared)
     db = read_db()
     for sid in ["15", "9", "14"]:                               # no lost updates
-        assert db[sid] == {"id": sid, "lat": 9.0, "lng": 9.0, "is_reserved": False}
+        assert db[sid] == {"id": sid, "lat": 9.0, "lng": 9.0, "is_reserved": False, "reservation": None}
     records = read_records()
     assert len(records) == 7 * 20
     assert rq.failure_counts(records).get("storage_error", 0) == 0
@@ -136,6 +136,10 @@ def test_concurrent_cycles_across_processes(db_path, records_path, read_db, read
     starts = sum(r["path"] == "/reservation/start" for r in hist)
     ends = sum(r["path"] == "/reservation/end" for r in hist)
     assert starts - ends == (1 if db["18"]["is_reserved"] else 0)
+    # Every successful start created its own reservation, even under contention.
+    started = [r["scooter_after"]["reservation"]["reservation_id"] for r in records
+               if r["path"] == "/reservation/start" and r["status"] == 200]
+    assert len(set(started)) == len(started) == sum(r["path"] == "/reservation/start" and r["status"] == 200 for r in records)
     # Every successful request's persisted after-state chains: replay them in lock order.
     by_lock = sorted((r for r in records if r["scooter_id"] == "18" and r["db_write"]["ok"]),
                      key=lambda r: r["ts"])

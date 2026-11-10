@@ -31,7 +31,11 @@ SHIPPED = {
     "internal_error": 500,
 }
 
-SEED_18_RESERVED = {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True}
+def seed_18_reserved(reservation_id, on_disk):
+    """Seed scooter 18, reserved by the start that returned reservation_id (checked against on_disk)."""
+    reservation = on_disk["reservation"]
+    assert isinstance(reservation, dict) and reservation["reservation_id"] == reservation_id
+    return {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True, "reservation": reservation}
 
 
 def failing_gateway(calls):
@@ -136,12 +140,14 @@ def test_unexpected_exception_is_json_500_in_both_modes(client, monkeypatch, rea
     # (AGENTS.md "Flask 3 gotcha"). The traceback still reaches the log.
     monkeypatch.setitem(app_module.app.config, "TESTING", testing)
     monkeypatch.setattr(app_module, "calculate_cost", _boom)
-    assert client.get("/reservation/start?id=18").status_code == 200
+    start = client.get("/reservation/start?id=18")
+    assert start.status_code == 200
+    reserved = read_db()["18"]
     body = assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), FailureKind.INTERNAL_ERROR)
     assert body["msg"] == "Error 500 - Internal server error."
     assert "planted bug" not in body["msg"]                 # no internals leak to clients
     assert "unhandled exception" in caplog.text and "RuntimeError: planted bug" in caplog.text
-    assert read_db()["18"] == SEED_18_RESERVED              # the crash didn't write anything
+    assert read_db()["18"] == reserved == seed_18_reserved(start.get_json()["reservation_id"], reserved)  # the crash didn't write anything
 
 
 @pytest.mark.parametrize("testing", [True, False])
@@ -256,11 +262,12 @@ def test_failed_payment_is_payment_failed_and_leaves_ride_open(client, monkeypat
     # define decline/timeout outcomes (H3/H7); they will update this test.
     calls = []
     monkeypatch.setattr(app_module, "payment_gateway", failing_gateway(calls))
-    before = read_db()
 
     start = client.get("/reservation/start?id=18")
-    assert start.status_code == 200 and start.get_json() == {"msg": reserved_ok("18")}
-    assert read_db()["18"] == SEED_18_RESERVED
+    reservation_id = start.get_json()["reservation_id"]
+    assert start.status_code == 200 and start.get_json() == {"msg": reserved_ok("18"), "reservation_id": reservation_id}
+    before = read_db()
+    assert before["18"] == seed_18_reserved(reservation_id, before["18"])
 
     resp = client.get("/reservation/end?id=18&lat=1&lng=1")
     assert len(calls) == 1, "the payment gateway must actually be called"
@@ -269,8 +276,7 @@ def test_failed_payment_is_payment_failed_and_leaves_ride_open(client, monkeypat
     assert body["msg"] != no_reservation("18") and "txn_id" not in body
 
     after = read_db()
-    assert after["18"] == SEED_18_RESERVED                   # still reserved, not moved
-    assert {k: v for k, v in after.items() if k != "18"} == {k: v for k, v in before.items() if k != "18"}
+    assert after == before                                   # still reserved (same reservation), not moved
 
 
 def test_gateway_supplied_msg_and_code_are_passed_through(client, monkeypatch):

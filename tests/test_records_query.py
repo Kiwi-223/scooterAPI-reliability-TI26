@@ -321,16 +321,17 @@ def test_cli_on_real_records(client, records_path, capsys):
     assert rq.anomalies(rq.read_records(records_path)) == []
 
 
-def test_anomalies_catch_a_lost_write_in_real_records(client, monkeypatch, records_path):
+def test_anomalies_catch_a_lost_write_in_real_records(client, monkeypatch, records_path, read_db):
     real = app_module.convert_db_to_dictlist
 
     def stale(db):                       # the end's change never reaches the file
         rows = real(db)
         for row in rows:
             if row["id"] == "18":
-                row.update(lat=23.0, lng=19.0, is_reserved=True)
+                row.update(lat=23.0, lng=19.0, is_reserved=True, reservation=reservation)
         return rows
     client.get("/reservation/start?id=18")
+    reservation = read_db()["18"]["reservation"]
     monkeypatch.setattr(app_module, "convert_db_to_dictlist", stale)
     client.get("/reservation/end?id=18&lat=23.01&lng=19.01")
     found = rq.anomalies(rq.read_records(records_path))
@@ -397,7 +398,9 @@ def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, record
         "/reservation/end?id=18&lat=23.01&lng=19.01",     # end
         "/reservation/start?id=18",                       # re-reserve after end
         "/reservation/start?id=18",                       # refused: already reserved
-        "/reservation/start?id=33",                       # refused: seed-reserved
+        "/reservation/start?id=33",                       # refused: seed-reserved (legacy reservation)
+        "/reservation/end?id=33&lat=24&lng=-28",          # end of a legacy reservation
+        "/reservation/start?id=33",                       # re-reserve after a legacy end
         "/reservation/end?id=15&lat=0&lng=0",             # refused: not reserved
         "/reservation/start?id=nope",                     # unknown scooter
         "/reservation/end?id=18&lat=+1e1&lng=٥",          # lenient float() coordinates
@@ -410,7 +413,7 @@ def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, record
     client.get("/reservation/end?id=18&lat=1&lng=1")      # failed payment: ride left open
     records = list(rq.read_records(records_path))
     assert len(records) == len(calls) + 1
-    assert [r["status"] for r in records] == [200, 200, 200, 422, 422, 422, 422, 200, 200, 200, 200, 404, 502]
+    assert [r["status"] for r in records] == [200, 200, 200, 422, 422, 200, 200, 422, 422, 200, 200, 200, 200, 404, 502]
     assert rq.anomalies(records) == []
 
 
@@ -427,10 +430,10 @@ def _stale_convert(monkeypatch, **forced):
 
 
 def test_real_planted_start_bug_is_flagged(client, monkeypatch, records_path):
-    _stale_convert(monkeypatch, is_reserved=False)        # start "succeeds" but writes it free
+    _stale_convert(monkeypatch, is_reserved=False, reservation=None)   # start "succeeds" but writes it free
     assert client.get("/reservation/start?id=18").status_code == 200
     found = rq.anomalies(rq.read_records(records_path))
-    assert {a["type"] for a in found} == {"start_left_free", "write_not_persisted"}
+    assert {a["type"] for a in found} == {"start_left_free", "write_not_persisted", "start_reservation_not_persisted"}
 
 
 def test_real_planted_end_location_bug_is_flagged(client, monkeypatch, records_path):
@@ -468,3 +471,46 @@ def test_start_rule_only_applies_to_successful_starts():
     failed = rec("x", 1, path="/reservation/start", scooter="18", status=500, kind="internal_error",
                  scooter_before=FREE, scooter_after=FREE, scooter_in_memory=FREE)
     assert rq.anomalies([failed]) == []
+
+
+# ---- reservation rules (PLAN PR 12) --------------------------------------------------------
+
+RES = {"reservation_id": "a" * 32, "started_at": "2026-11-09T12:00:00.000Z", "start_request_id": "x",
+       "payment_state": "active", "idempotency_key": "a" * 32}
+FREE12 = dict(FREE, reservation=None)                     # the post-PR-12 snapshot shape
+TAKEN12 = dict(TAKEN, reservation=RES)
+
+
+@pytest.mark.parametrize("after", [dict(FREE, reservation=RES), dict(TAKEN, reservation=None)])
+def test_anomaly_reservation_flag_mismatch(after):
+    record = rec("other", 1, path="/reservation/end", status=422, kind="no_active_reservation", scooter="18",
+                 scooter_before=after, scooter_after=after, scooter_in_memory=after)
+    found = rq.anomalies([record])
+    assert [a["type"] for a in found] == ["reservation_flag_mismatch"]
+    assert found[0]["detail"] == {"scooter_after": after}
+
+
+@pytest.mark.parametrize("reservation", [None, "x", dict(RES, start_request_id="someone-else"),
+                                         dict(RES, start_request_id=None)])
+def test_anomaly_start_reservation_not_persisted(reservation):
+    after = dict(TAKEN, reservation=reservation)
+    record = rec("x", 1, path="/reservation/start", scooter="18", db_write=WROTE,
+                 scooter_before=FREE12, scooter_after=after, scooter_in_memory=after)
+    types = [a["type"] for a in rq.anomalies([record])]
+    assert "start_reservation_not_persisted" in types
+    assert set(types) <= {"start_reservation_not_persisted", "reservation_flag_mismatch"}
+
+
+@pytest.mark.parametrize("record", [
+    rec("x", 1, path="/reservation/start", scooter="18", db_write=WROTE,
+        scooter_before=FREE12, scooter_after=TAKEN12, scooter_in_memory=TAKEN12),
+    rec("ok", 1, path="/reservation/end", scooter="18", db_write=WROTE,
+        scooter_before=TAKEN12, scooter_after=FREE12, scooter_in_memory=FREE12),
+    rec("refused", 1, path="/reservation/start", status=422, kind="scooter_already_reserved", scooter="18",
+        scooter_before=TAKEN12, scooter_after=TAKEN12, scooter_in_memory=TAKEN12),
+    # pre-PLAN PR 12 records have no "reservation" key and aren't judged by these rules
+    rec("old_start", 1, path="/reservation/start", scooter="18", db_write=WROTE,
+        scooter_before=FREE, scooter_after=TAKEN, scooter_in_memory=TAKEN),
+])
+def test_reservation_rules_have_no_false_positives(record):
+    assert rq.anomalies([record]) == []

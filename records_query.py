@@ -161,6 +161,13 @@ def anomalies(records, since=None):
     - start_left_free: /reservation/start returned 200 but scooter_after isn't reserved
     - end_location_not_persisted: /reservation/end returned 200 but scooter_after's lat/lng
       differ from the requested end coordinates (compared as floats)
+    - reservation_flag_mismatch: scooter_after breaks the DB invariant "is_reserved is true
+      exactly when reservation is set" (PLAN PR 12)
+    - start_reservation_not_persisted: /reservation/start returned 200 but scooter_after has
+      no reservation created by this request (its start_request_id isn't this request_id)
+
+    The two reservation rules only look at snapshots that have a "reservation" key: records
+    written before PLAN PR 12 have none, and aren't flagged for it.
 
     Deliberately not included: a cross-record continuity check (a scooter's scooter_before
     should equal its previous scooter_after). Concurrent workers, `git restore` of the DB
@@ -197,6 +204,13 @@ def anomalies(records, since=None):
             if wanted is not None and got != wanted:
                 flag("end_location_not_persisted", {"requested": {"lat": wanted[0], "lng": wanted[1]},
                                                     "scooter_after": after})
+        if isinstance(after, dict) and "reservation" in after:
+            reservation = after["reservation"]
+            if (after.get("is_reserved") is True) != (reservation is not None):
+                flag("reservation_flag_mismatch", {"scooter_after": after})
+            if path == "/reservation/start" and status == 200 and (
+                    not isinstance(reservation, dict) or reservation.get("start_request_id") != r.get("request_id")):
+                flag("start_reservation_not_persisted", {"scooter_after": after})
     return sorted(found, key=_ts_key)
 
 

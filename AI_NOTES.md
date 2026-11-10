@@ -451,3 +451,47 @@ strongest entries.
   not only the error counts. And when a verification script prints nothing, treat that
   as a failure.
 
+
+### 24. A replayed idempotency key was framed as a legacy-only problem
+- **Where:** PR #15 (PLAN PR 12). See the AGENTS.md "Database schema" section and the PLAN
+  change log.
+- **What the AI claimed:** the restore hazard was "a legacy key isn't unique over time":
+  after a `git restore`, ending scooter 33 reuses `legacy-33`. The note was written as a
+  property of synthesised `legacy-<id>` reservations, and PR 13 was told to "account for
+  `legacy-<id>` keys repeating".
+- **Reality:** restoring **any** DB snapshot replays **every** reservation in it, with the
+  same `reservation_id` and `idempotency_key`, uuid ones included. With PR 13's ledger, the
+  second end of a restored ride could find "already charged" and let the rider go free.
+  The hazard comes from restoring state, not from the legacy shape.
+- **How it was caught:** the reviewer started scooter 18 (a real uuid reservation), took a
+  snapshot of the DB, ended the ride, restored the snapshot and ended it again. The same
+  uuid `reservation_id` was cleared twice.
+- **What changed:**
+  - AGENTS.md and the change log now describe the general hazard.
+  - PLAN row 13 requires ledger hits to match the ride (scooter, reservation, amount),
+    treats anything else as a conflict, and adds a restore test.
+  - `test_a_restored_reservation_is_charged_again_not_ridden_free` pins today's behaviour
+    for both a uuid and a legacy reservation.
+  - Lesson: when a hazard turns up in one shape of data, check whether it applies to every
+    shape before scoping the note to the one where it was noticed.
+
+### 25. A one-off test failure was set aside as "probably flaky" without checking for outside writers
+- **Where:** PR #15 (PLAN PR 12), the writer's report of the review fixes.
+- **What the AI claimed:** one `make test` run failed once (its output had been cut to the
+  last line), 15 later runs were clean, and it was reported as "probably a timing-sensitive
+  test or another agent; I don't think it's this change", i.e. treated as a flake.
+- **Reality:** the reviewer reproduced the exact signature. Any other process that writes
+  the live `scooter_db.json` or `data/records.jsonl` during `make test` (a dev server in
+  the same checkout, `make run` plus `curl`, `git restore`, another agent) makes the autouse
+  guard fixtures fail exactly one test, chosen at random, with "… changed during this
+  test". The output was discarded, so this can't be confirmed, but it is the **likely**
+  cause: other agents work in this shared checkout.
+- **How it was caught:** in the re-review, the reviewer reproduced the single-error
+  signature with another process writing the shared files during `make test`.
+- **What changed:**
+  - AGENTS.md's Test section documents the cause and says not to run the server from the
+    same checkout during tests (use a scratch DB and records path, or another checkout).
+  - The writer now keeps full test logs (`> log 2>&1`) instead of `tail -1`.
+  - Lesson: a one-off failure followed by clean reruns is evidence about the environment,
+    not proof of a flaky test. Check what else touched the shared files before calling it
+    flaky, and never throw away the only failing output.

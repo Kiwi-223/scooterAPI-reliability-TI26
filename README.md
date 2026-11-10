@@ -107,7 +107,11 @@ GET /reservation/start
 #### Success Responses:
 
 * **Code**: 200 <br />
-  **Content**: JSON object with a `msg` property that gives a brief description of the successful operation.
+  **Content**: JSON object with a `msg` property that gives a brief description of the successful operation, and a `reservation_id` property (string) that identifies the reservation just started. Each start gets a new `reservation_id`.
+  ```json
+  {"msg": "Scooter 18 was reserved successfully.", "reservation_id": "f36f087baa0842929afe8d9eaf0e8598"}
+  ```
+  `reservation_id` was added later; clients that only read `msg` are unaffected.
 
 
 #### Error Responses:
@@ -179,7 +183,7 @@ never renamed; new ones may be added.
 | `payment_failed` | 502 | The payment failed; the reservation was not ended. |
 | `route_not_found` | 404 | There's no endpoint at that path. |
 | `method_not_allowed` | 405 | All endpoints are `GET`. |
-| `storage_error` | 500 | The server couldn't read or write its database. |
+| `storage_error` | 500 | The server couldn't read or write its database, or (start/end only) that scooter's reservation is in a state this server version can't handle. |
 | `storage_busy` | 503 | The database was locked by another request for too long; nothing was changed. Retry after the `Retry-After` seconds (`/reservation/*` only). |
 | `internal_error` | 500 | Unexpected server error. |
 
