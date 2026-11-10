@@ -392,7 +392,7 @@ def test_end_location_rule_skips_unparseable_params():
     assert rq.anomalies([_end(dict(FREE), lat="x")]) == []
 
 
-def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, records_path):
+def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, records_path, db_path):
     calls = [
         "/reservation/start?id=18",                       # start
         "/reservation/end?id=18&lat=23.01&lng=19.01",     # end
@@ -409,22 +409,31 @@ def test_no_false_positives_on_every_legitimate_flow(client, monkeypatch, record
     ]
     for url in calls:
         client.get(url)
-    # every payment outcome (PLAN PR 13); all but the last leave the ride open
+    # every payment outcome and the payment_pending flows (PLAN PRs 13/14)
     payment_calls = [
-        ("error", "/reservation/end?id=18&lat=1&lng=1"),                 # 502 payment_failed
-        ("decline", "/reservation/end?id=18&lat=1&lng=1"),               # 422 payment_declined
-        ("timeout_not_charged", "/reservation/end?id=18&lat=1&lng=1"),   # 504 payment_timeout
-        ("timeout_charged", "/reservation/end?id=18&lat=1&lng=1"),       # 504, but charged
-        ("none", "/reservation/end?id=18&lat=2&lng=2"),                  # 409 conflict: other amount
-        ("none", "/reservation/end?id=18&lat=1&lng=1"),                  # 200 already_charged: ends it
+        ("error", "/reservation/end?id=18&lat=1&lng=1", 502),                 # -> payment_pending
+        ("none", "/reservation/start?id=18", 422),                            # refused: payment pending
+        ("timeout_not_charged", "/reservation/end?id=18&lat=7&lng=7", 504),   # retry (stored location)
+        ("timeout_charged", "/reservation/end?id=18&lat=1&lng=1", 504),       # retry, charged
+        ("none", "/reservation/end?id=18&lat=2&lng=2", 200),                  # already_charged at (1, 1)
+        ("none", "/reservation/start?id=18", 200),
+        ("decline", "/reservation/end?id=18&lat=3&lng=3", 422),               # H3: ended, balance
+        ("none", "/reservation/start?id=18", 200),
+        ("none", "/reservation/end?id=18&lat=4&lng=4", 200),                  # plain success
     ]
-    for fault, url in payment_calls:
+    for fault, url, status in payment_calls:
         monkeypatch.setenv("PAYMENT_FAULT", fault)
-        client.get(url)
+        assert client.get(url).status_code == status, url
+    # a restored DB ended elsewhere: conflict, back to active
+    client.get("/reservation/start?id=18")
+    snapshot = db_path.read_bytes()
+    assert client.get("/reservation/end?id=18&lat=5&lng=5").status_code == 200
+    db_path.write_bytes(snapshot)
+    assert client.get("/reservation/end?id=18&lat=6&lng=6").status_code == 409
     records = list(rq.read_records(records_path))
-    assert len(records) == len(calls) + len(payment_calls)
+    assert len(records) == len(calls) + len(payment_calls) + 3
     assert [r["status"] for r in records] == [200, 200, 200, 422, 422, 200, 200, 422, 422, 200, 200, 200, 200, 404,
-                                              502, 422, 504, 504, 409, 200]
+                                              *[status for _, _, status in payment_calls], 200, 200, 409]
     assert rq.anomalies(records) == []
 
 
@@ -455,7 +464,7 @@ def test_real_planted_end_location_bug_is_flagged(client, monkeypatch, records_p
     assert {a["type"] for a in found} == {"end_location_not_persisted", "write_not_persisted"}
 
 
-_LOCATION_LINE = "\t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng\n"
+_LOCATION_LINE = "\tscooter.lat, scooter.lng = end_lat, end_lng\n"     # in finish_ride
 
 
 def test_real_planted_bug_that_never_moves_the_scooter_is_flagged(tmp_path, db_path, records_path):
@@ -466,7 +475,7 @@ def test_real_planted_bug_that_never_moves_the_scooter_is_flagged(tmp_path, db_p
     planted = tmp_path / "planted"
     planted.mkdir()
     (planted / "app.py").write_text(src.replace(_LOCATION_LINE, ""))
-    for name in ("records.py", "failures.py"):
+    for name in ("records.py", "failures.py", "payments.py"):
         (planted / name).write_text((REPO / name).read_text())
     script = ("import sys; sys.path.insert(0, sys.argv[1]); import app; c = app.app.test_client(); "
               "c.get('/reservation/start?id=18'); print(c.get('/reservation/end?id=18&lat=23.01&lng=19.01').status_code)")
@@ -529,7 +538,7 @@ def test_reservation_rules_have_no_false_positives(record):
 
 def test_scooter_history_shows_each_payment_outcome(client, monkeypatch, records_path, capsys):
     client.get("/reservation/start?id=18")
-    monkeypatch.setenv("PAYMENT_FAULT", "decline")
+    monkeypatch.setenv("PAYMENT_FAULT", "error")
     client.get("/reservation/end?id=18&lat=1&lng=1")
     monkeypatch.setenv("PAYMENT_FAULT", "none")
     client.get("/reservation/end?id=18&lat=1&lng=1")
@@ -537,6 +546,56 @@ def test_scooter_history_shows_each_payment_outcome(client, monkeypatch, records
     assert code == 0
     lines = [line for line in out.splitlines() if "before=" in line]
     assert ["payment=" in line for line in lines] == [False, True, True]
-    assert lines[1].endswith("payment=decline") and lines[2].endswith("payment=success")
+    assert lines[1].endswith("payment=error") and lines[2].endswith("payment=success")
     old = {"decisions": [{"step": "payment", "outcome": "ok", "detail": {"txn_id": 1}}]}   # pre-PR 13 record
     assert rq._payment(old) == "ok" and rq._payment({"decisions": []}) is None
+
+
+# ---- end-ride payment rules (PLAN PR 14) --------------------------------------------------------
+
+PENDING12 = dict(TAKEN, reservation=dict(RES, payment_state="payment_pending", end_lat=1.0, end_lng=1.0, amount=5))
+PAID = {"step": "payment", "outcome": "ok", "detail": {"gateway_outcome": "success", "txn_id": "t"}}
+
+
+def _write(outcome):
+    return {"step": "db_write", "outcome": outcome, "detail": {}}
+
+
+@pytest.mark.parametrize("decisions,flagged", [
+    ([PAID, _write("failed")], True),
+    ([PAID, _write("refused")], True),
+    ([_write("ok"), PAID, _write("failed")], True),                  # phase 1 ok, phase 2 lost
+    ([PAID, _write("ok")], False),
+    ([_write("failed")], False),                                      # failed before any charge
+    ([{"step": "payment", "outcome": "failed", "detail": {}}, _write("failed")], False),
+])
+def test_anomaly_charged_without_persisted_end(decisions, flagged):
+    record = rec("x", 1, path="/reservation/end", scooter="18", status=500, kind="storage_error",
+                 decisions=decisions, scooter_before=TAKEN12)
+    types = [a["type"] for a in rq.anomalies([record])]
+    assert ("charged_without_persisted_end" in types) is flagged
+
+
+BALANCE_FOR_RES = {"reservation_id": RES["reservation_id"], "amount": 5}
+
+
+@pytest.mark.parametrize("after,flagged", [
+    (dict(FREE12, outstanding_balances=[BALANCE_FOR_RES]), False),
+    (FREE12, True),                                                    # ended, but no balance
+    (dict(FREE12, outstanding_balances=[dict(BALANCE_FOR_RES, reservation_id="other")]), True),
+    (dict(TAKEN12, outstanding_balances=[BALANCE_FOR_RES]), True),     # balance, but still reserved
+])
+def test_anomaly_decline_not_settled(after, flagged):
+    record = rec("x", 1, path="/reservation/end", scooter="18", status=422, kind="payment_declined",
+                 db_write=WROTE, scooter_before=TAKEN12, scooter_after=after, scooter_in_memory=after)
+    types = [a["type"] for a in rq.anomalies([record])]
+    assert ("decline_not_settled" in types) is flagged
+
+
+@pytest.mark.parametrize("kind", ["payment_timeout", "payment_failed"])
+@pytest.mark.parametrize("after,flagged", [(PENDING12, False), (TAKEN12, True), (FREE12, True), (None, False)])
+def test_anomaly_failed_payment_not_pending(kind, after, flagged):
+    record = rec("x", 1, path="/reservation/end", scooter="18", status=504, kind=kind,
+                 db_write=WROTE, scooter_before=TAKEN12, scooter_after=after, scooter_in_memory=after)
+    types = [a["type"] for a in rq.anomalies([record])]
+    assert ("failed_payment_not_pending" in types) is flagged

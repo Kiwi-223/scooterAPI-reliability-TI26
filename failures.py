@@ -40,23 +40,26 @@ class FailureKind(StrEnum):
                                 "Start was requested for a scooter that is already reserved.")
     NO_ACTIVE_RESERVATION = ("no_active_reservation", HTTPStatus.UNPROCESSABLE_ENTITY,
                              "End was requested for a scooter that is not reserved.")
+    SCOOTER_PAYMENT_PENDING = ("scooter_payment_pending", HTTPStatus.UNPROCESSABLE_ENTITY,
+                               "Start was requested for a scooter whose last ride is waiting for payment "
+                               "(payment_pending); retry ending that ride, or wait for reconcile.")
 
-    # ---- payment (H7) ------------------------------------------------------------------
-    # Every payment failure leaves the ride open: the reservation is NOT ended and the
-    # scooter stays reserved. PLAN PR 14 changes what a decline/timeout/error does to the
-    # ride (payment_pending, H3's outstanding balance); the kinds stay.
+    # ---- payment (H3, H7; AGENTS.md "Payment state machine") ------------------------------
+    # Every payment failure body also says whether the ride ended (`ride_ended`).
     # Since PLAN PR 13 payment_failed means "the gateway reported an error" (outcome `error`,
     # or a ledger it can't read). Its id and status are unchanged.
     PAYMENT_FAILED = ("payment_failed", HTTPStatus.BAD_GATEWAY,
-                      "The payment gateway reported an error; the reservation was not ended.")
+                      "The payment gateway reported an error; the ride is payment_pending until a retry settles it.")
     PAYMENT_DECLINED = ("payment_declined", HTTPStatus.UNPROCESSABLE_ENTITY,
-                        "The payment was declined; the reservation was not ended (PLAN PR 14 applies H3).")
+                        "The payment was declined; the ride was ended and its cost recorded as an "
+                        "outstanding balance (H3). The body has ride_ended: true and outstanding_balance.")
     PAYMENT_TIMEOUT = ("payment_timeout", HTTPStatus.GATEWAY_TIMEOUT,
                        "The payment gateway timed out; the rider may or may not have been charged. "
-                       "The reservation was not ended; a retry is charged at most once.")
+                       "The ride is payment_pending; a retry settles it and is charged at most once.")
     PAYMENT_CONFLICT = ("payment_conflict", HTTPStatus.CONFLICT,
                         "The reservation's idempotency key already has a charge for a different ride "
-                        "(scooter, reservation or amount); nothing was charged and the reservation was not ended.")
+                        "(scooter, reservation, end location or amount); nothing was charged and the "
+                        "ride is open again (payment_state active).")
 
     # ---- framework / infrastructure ----------------------------------------------------
     ROUTE_NOT_FOUND = ("route_not_found", HTTPStatus.NOT_FOUND,

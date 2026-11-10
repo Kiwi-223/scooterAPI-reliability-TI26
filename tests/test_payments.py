@@ -33,6 +33,11 @@ def payment_decisions(record):
     return [d for d in record["decisions"] if d["step"] == "payment"]
 
 
+def requested(record):
+    [d] = [d for d in payment_decisions(record) if d["outcome"] == "requested"]
+    return d["detail"]
+
+
 # ---- every outcome, end to end ---------------------------------------------------------------
 
 def test_success_ends_the_ride_with_a_string_txn_id(client, read_db, read_ledger, read_records):
@@ -45,7 +50,7 @@ def test_success_ends_the_ride_with_a_string_txn_id(client, read_db, read_ledger
     assert (entry["idempotency_key"], entry["outcome"], entry["charged"], entry["txn_id"], entry["attempt"]) == \
         (key, "success", True, body["txn_id"], 1)
     assert (entry["scooter_id"], entry["reservation_id"], entry["end_lat"], entry["end_lng"]) == ("18", key, 1.0, 1.0)
-    assert entry["amount"] == payment_decisions(read_records()[-1])[0]["detail"]["cost"] > 0
+    assert entry["amount"] == requested(read_records()[-1])["cost"] > 0
     assert entry["request_id"] == read_records()[-1]["request_id"]
 
 
@@ -57,10 +62,12 @@ def test_success_ends_the_ride_with_a_string_txn_id(client, read_db, read_ledger
 ])
 def test_each_fault_end_to_end(client, monkeypatch, read_db, read_ledger, read_records, fault, kind, charged):
     key = start_18(client)
-    before = read_db()
     monkeypatch.setenv("PAYMENT_FAULT", fault)
-    assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), kind)
-    assert read_db() == before                                       # the ride stays open (PLAN PR 13)
+    body = assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), kind)
+    # PLAN PR 14: a decline ends the ride (H3); everything else leaves it payment_pending
+    after = read_db()["18"]
+    assert body["ride_ended"] is (fault == "decline")
+    assert (after["reservation"] is None) is (fault == "decline")
     [entry] = read_ledger()
     assert (entry["outcome"], entry["charged"], entry["idempotency_key"]) == (fault, charged, key)
     assert (entry["txn_id"] is not None) == charged
@@ -83,11 +90,11 @@ def test_a_retry_after_a_charged_timeout_settles_without_a_second_charge(client,
 
 def test_a_retry_after_an_uncharged_failure_is_a_new_attempt(client, monkeypatch, read_ledger):
     start_18(client)
-    monkeypatch.setenv("PAYMENT_FAULT", "decline")
+    monkeypatch.setenv("PAYMENT_FAULT", "error")
     client.get("/reservation/end?id=18&lat=1&lng=1")
     monkeypatch.setenv("PAYMENT_FAULT", "none")
     assert client.get("/reservation/end?id=18&lat=1&lng=1").status_code == 200
-    assert [(e["outcome"], e["attempt"], e["charged"]) for e in read_ledger()] == [("decline", 1, False), ("success", 2, True)]
+    assert [(e["outcome"], e["attempt"], e["charged"]) for e in read_ledger()] == [("error", 1, False), ("success", 2, True)]
 
 
 # ---- the ride-matching rule ----------------------------------------------------------------
@@ -109,14 +116,16 @@ def test_a_ledger_hit_for_another_ride_is_a_conflict_never_a_charge(change):
     assert [e["charged"] for e in payments.lookup("k1")] == [True, False, False]
 
 
-def test_conflict_through_the_api_leaves_the_ride_open(client, monkeypatch, read_db, read_ledger):
+def test_a_retry_from_elsewhere_after_a_charged_timeout_settles_at_the_stored_location(client, monkeypatch, read_db, read_ledger):
+    # PLAN PR 14: the first attempt fixed the end location and amount; a retry from another
+    # spot (GPS jitter) is the same ride, not a conflict.
     start_18(client)
     monkeypatch.setenv("PAYMENT_FAULT", "timeout_charged")
     client.get("/reservation/end?id=18&lat=1&lng=1")
-    before = read_db()
     monkeypatch.setenv("PAYMENT_FAULT", "none")
-    assert_envelope(client.get("/reservation/end?id=18&lat=5&lng=5"), FailureKind.PAYMENT_CONFLICT)
-    assert read_db() == before
+    body = client.get("/reservation/end?id=18&lat=5&lng=5").get_json()
+    assert body["txn_id"] == read_ledger()[0]["txn_id"]
+    assert (read_db()["18"]["lat"], read_db()["18"]["lng"]) == (1.0, 1.0)
     assert sum(e["charged"] for e in read_ledger()) == 1
 
 
@@ -287,13 +296,13 @@ def test_only_exactly_1_enables_the_header(client, monkeypatch, enabled):
 
 def test_the_header_forces_a_fault_when_enabled_and_beats_the_env(client, monkeypatch, read_records, read_ledger):
     monkeypatch.setenv("ENABLE_FAULT_INJECTION", "1")
-    monkeypatch.setenv("PAYMENT_FAULT", "error")
+    monkeypatch.setenv("PAYMENT_FAULT", "decline")
     start_18(client)
-    assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1", headers={"X-Payment-Fault": "decline"}),
-                    FailureKind.PAYMENT_DECLINED)
-    assert read_ledger()[0]["fault"] == {"source": "header", "mode": "decline"}
+    assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1", headers={"X-Payment-Fault": "error"}),
+                    FailureKind.PAYMENT_FAILED)
+    assert read_ledger()[0]["fault"] == {"source": "header", "mode": "error"}
     note = [d for d in read_records()[-1]["decisions"] if d["step"] == "payment_fault_override"]
-    assert note == [{"step": "payment_fault_override", "outcome": "applied", "detail": {"value": "decline"}}]
+    assert note == [{"step": "payment_fault_override", "outcome": "applied", "detail": {"value": "error"}}]
     # `none` through the header switches the env's fault off for this request
     assert client.get("/reservation/end?id=18&lat=1&lng=1", headers={"X-Payment-Fault": "none"}).status_code == 200
 
@@ -327,18 +336,21 @@ def test_a_bad_setting_fails_loudly_and_charges_nothing(client, monkeypatch, rea
     if name == "PAYMENT_FAULT_RATE":
         monkeypatch.setenv("PAYMENT_FAULT", "random")
     monkeypatch.setenv(name, value)
-    before = read_db()
     assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), FailureKind.INTERNAL_ERROR)
-    assert read_db() == before and read_ledger() == []
+    assert read_ledger() == [] and read_db()["18"]["reservation"]["payment_state"] == "payment_pending"
     assert "PaymentConfigError" in caplog.text and name in caplog.text
+    monkeypatch.setenv(name, "random" if name == "PAYMENT_FAULT" else "0")   # fixed config: it settles
+    monkeypatch.setenv("PAYMENT_FAULT_RATE", "0")
+    assert client.get("/reservation/end?id=18&lat=1&lng=1").status_code == 200
 
 
 def test_an_unreadable_ledger_fails_closed(client, ledger_path, read_db):
     start_18(client)
     ledger_path.write_text('{"idempotency_key": "x", "charged": true}\n{not json\n')
-    before_ledger, before_db = ledger_path.read_bytes(), read_db()
+    before_ledger = ledger_path.read_bytes()
     assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), FailureKind.PAYMENT_FAILED)
-    assert ledger_path.read_bytes() == before_ledger and read_db() == before_db
+    assert ledger_path.read_bytes() == before_ledger
+    assert read_db()["18"]["reservation"]["payment_state"] == "payment_pending"   # settleable later
 
 
 def test_timeouts_wait_only_the_configured_short_delay(monkeypatch):

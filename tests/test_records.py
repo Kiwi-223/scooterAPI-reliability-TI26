@@ -177,15 +177,20 @@ def test_end_success_records_payment_and_move(client, read_records):
     assert r["scooter_after"] == r["scooter_in_memory"] == \
         {"id": "18", "lat": 23.01, "lng": 19.01, "is_reserved": False, "reservation": None}
     assert r["db_write"]["ok"] is True and r["status"] == 200
+    # two-phase end (PLAN PR 14): persist payment_pending, charge, then persist the end
     assert steps(r) == [("params", "ok"), ("db_lock", "acquired"), ("db_read", "ok"), ("lookup", "found"), ("end", "allowed"),
-                        ("payment", "requested"), ("payment", "ok"), ("reservation", "cleared"), ("db_write", "ok")]
+                        ("payment", "pending"), ("db_write", "ok"), ("payment", "requested"), ("payment", "ok"),
+                        ("reservation", "cleared"), ("db_write", "ok")]
     cleared = [d for d in r["decisions"] if d["step"] == "reservation"][0]
     assert cleared["detail"] == {"reservation_id": r["scooter_before"]["reservation"]["reservation_id"], "legacy": False}
     payment = [d for d in r["decisions"] if d["step"] == "payment"]
     key = r["scooter_before"]["reservation"]["idempotency_key"]
-    assert payment[0]["detail"]["cost"] == payment[0]["detail"]["distance_m"] > 0
-    assert payment[0]["detail"]["idempotency_key"] == key
-    detail = payment[1]["detail"]
+    assert payment[0]["detail"] == {"end_lat": 23.01, "end_lng": 19.01, "distance_m": payment[0]["detail"]["amount"],
+                                    "amount": payment[0]["detail"]["amount"]}
+    assert payment[1]["detail"]["cost"] == payment[1]["detail"]["distance_m"] == payment[0]["detail"]["amount"] > 0
+    assert payment[1]["detail"]["idempotency_key"] == key
+    assert (payment[1]["detail"]["end_lat"], payment[1]["detail"]["end_lng"]) == (23.01, 19.01)
+    detail = payment[2]["detail"]
     assert re.fullmatch(r"[0-9a-f]{32}", detail["txn_id"])
     assert detail == {"gateway_outcome": "success", "txn_id": detail["txn_id"], "attempt": 1,
                       "fault": {"source": "env", "mode": "none"},
@@ -200,8 +205,13 @@ def test_end_payment_failed_records_ride_left_open(client, monkeypatch, read_rec
     assert ("payment", "failed") in steps(r)
     failed = [d["detail"] for d in r["decisions"] if d["step"] == "payment"][-1]
     assert (failed["gateway_outcome"], failed["txn_id"], failed["fault"]) == ("error", None, {"source": "env", "mode": "error"})
-    assert r["scooter_before"] == r["scooter_after"] == reserved_18(r["scooter_before"])
-    assert r["db_write"]["attempted"] is False
+    # the ride is left payment_pending (PLAN PR 14), at the requested location and amount
+    assert r["scooter_before"] == reserved_18(r["scooter_before"])
+    pending = r["scooter_after"]["reservation"]
+    assert r["scooter_after"] == r["scooter_in_memory"] == dict(r["scooter_before"], reservation=pending)
+    assert (pending["payment_state"], pending["end_lat"], pending["end_lng"], pending["payment_attempts"],
+            pending["last_payment_outcome"]) == ("payment_pending", 1.0, 1.0, 1, "error")
+    assert r["db_write"] == {"attempted": True, "ok": True, "error": None}
     assert r["error"]["kind"] == "payment_failed" and r["status"] == 502
 
 
@@ -421,15 +431,11 @@ import app
 resp = app.app.test_client().get("/reservation/end?id=18&lat=23.01&lng=19.01")
 print(resp.status_code)
 """
-_CORRECT_ORDER = """\t\t\t\t\tscooter.reservation = None
-\t\t\t\t\tscooter.is_reserved = False
-\t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
+_CORRECT_ORDER = """\t\t\t\t\tfinish_ride(scooter)
 \t\t\t\t\twrite_db(db, txn.path)
 """
 _BUGGY_ORDER = """\t\t\t\t\twrite_db(db, txn.path)
-\t\t\t\t\tscooter.reservation = None
-\t\t\t\t\tscooter.is_reserved = False
-\t\t\t\t\tscooter.lat, scooter.lng = end_lat, end_lng
+\t\t\t\t\tfinish_ride(scooter)
 """
 
 
@@ -443,7 +449,7 @@ def test_planted_write_ordering_bug_is_visible_in_the_record(tmp_path, db_path, 
     planted = tmp_path / "planted"
     planted.mkdir()
     (planted / "app.py").write_text(src.replace(_CORRECT_ORDER, _BUGGY_ORDER))
-    for name in ("records.py", "failures.py"):
+    for name in ("records.py", "failures.py", "payments.py"):
         (planted / name).write_text((REPO / name).read_text())
     data = json.loads(db_path.read_text())
     next(s for s in data if s["id"] == "18")["is_reserved"] = True
@@ -453,9 +459,13 @@ def test_planted_write_ordering_bug_is_visible_in_the_record(tmp_path, db_path, 
     out = subprocess.run([sys.executable, "-c", _PLANT, str(planted)], env=env, capture_output=True, text=True, check=True)
     assert out.stdout.strip() == "200"                                   # the bug "succeeds"
     on_disk = read_db()["18"]
-    # 18 was set reserved in a legacy-shaped seed, so it carries the synthesised legacy reservation
-    assert on_disk == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True,
-                       "reservation": dict(LEGACY_33, reservation_id="legacy-18", idempotency_key="legacy-18")}
+    # 18 was set reserved in a legacy-shaped seed, so it carries the synthesised legacy
+    # reservation; the buggy second write saved it still payment_pending (phase 1's state)
+    pending = on_disk["reservation"]
+    assert {k: pending[k] for k in LEGACY_33} == dict(LEGACY_33, reservation_id="legacy-18", idempotency_key="legacy-18",
+                                                      payment_state="payment_pending")
+    assert (pending["end_lat"], pending["end_lng"]) == (23.01, 19.01)
+    assert {k: on_disk[k] for k in ("id", "lat", "lng", "is_reserved")} == {"id": "18", "lat": 23.0, "lng": 19.0, "is_reserved": True}
     r = only_record(read_records)
     assert r["db_write"]["ok"] is True
     assert r["scooter_after"] == on_disk                                  # the truth on disk
