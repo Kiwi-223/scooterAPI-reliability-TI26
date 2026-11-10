@@ -118,7 +118,7 @@ GET /reservation/start
 
 * **Code**: 422 <br />
   **Content**: JSON object with a `msg` property that gives a brief description of the error trigger, and an `error` object whose `kind` is a stable failure id (see [Errors](#errors)).
-  Kinds: `missing_param`, `scooter_not_found`, `scooter_already_reserved`, and `storage_busy` (503, retryable).
+  Kinds: `missing_param`, `scooter_not_found`, `scooter_already_reserved`, `scooter_payment_pending` (the scooter's last ride is still waiting for its payment to settle), and `storage_busy` (503, retryable).
 
 
 ### End Reservation for a Scooter
@@ -154,8 +154,12 @@ GET /reservation/end
   Kinds: `missing_param`, `invalid_number`, `invalid_coordinate`, `scooter_not_found`, `no_active_reservation`, and `storage_busy` (503, retryable).
 
 * **Codes**: 422, 504, 502, 409 <br />
-  **Content**: the same envelope, with one of the payment kinds: `payment_declined` (422), `payment_timeout` (504), `payment_failed` (502) or `payment_conflict` (409). In every case the reservation was **not** ended and the scooter is still reserved.
-  Retrying an end is safe: each reservation is charged at most once. A retry after a charge that timed out ends the ride with that charge's `txn_id`.
+  **Content**: the same envelope, with one of the payment kinds, plus a boolean `ride_ended`:
+  - `payment_declined` (422): the payment was declined, but **the ride ended**: the scooter is free at the end location, nothing was charged, and the cost is recorded as an outstanding balance. The body adds `"ride_ended": true` and `"outstanding_balance": <amount>`. Don't retry.
+  - `payment_timeout` (504) or `payment_failed` (502): the ride is **waiting for payment** (`"ride_ended": false`), and the scooter stays reserved. **Retry** `/reservation/end` to settle it. A retry is charged at most once, and it ends the ride where the **first** request asked, with that first amount, whatever `lat`/`lng` the retry sends.
+  - `payment_conflict` (409): this reservation was already charged for a different ride; nothing was charged and the ride is still open (`"ride_ended": false`).
+
+  The extra body fields are additive: clients that read only `msg` and `error.kind` are unaffected.
 
 ## Errors
 
@@ -181,10 +185,11 @@ never renamed; new ones may be added.
 | `scooter_not_found` | 422 | No scooter has the given id. |
 | `scooter_already_reserved` | 422 | The scooter is already reserved. |
 | `no_active_reservation` | 422 | The scooter has no reservation to end. |
-| `payment_failed` | 502 | The payment gateway reported an error; the reservation was not ended. |
-| `payment_declined` | 422 | The payment was declined; the reservation was not ended. |
-| `payment_timeout` | 504 | The payment gateway timed out; the reservation was not ended. The rider may have been charged; a retry is never charged twice. |
-| `payment_conflict` | 409 | This reservation was already charged for a different ride (for example a different amount); nothing was charged and the reservation was not ended. |
+| `scooter_payment_pending` | 422 | The scooter's last ride is still waiting for payment to settle; it can't be reserved yet. |
+| `payment_failed` | 502 | The payment gateway reported an error; the ride is waiting for payment. Retry ending it. |
+| `payment_declined` | 422 | The payment was declined; the ride **ended** and its cost is recorded as an outstanding balance (`ride_ended: true`, `outstanding_balance`). |
+| `payment_timeout` | 504 | The payment gateway timed out; the ride is waiting for payment. Retry ending it; it's never charged twice. |
+| `payment_conflict` | 409 | This reservation was already charged for a different ride; nothing was charged and the ride is still open. |
 | `route_not_found` | 404 | There's no endpoint at that path. |
 | `method_not_allowed` | 405 | All endpoints are `GET`. |
 | `storage_error` | 500 | The server couldn't read or write its database, or (start/end only) that scooter's reservation is in a state this server version can't handle. |

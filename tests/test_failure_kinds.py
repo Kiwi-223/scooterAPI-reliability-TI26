@@ -23,6 +23,7 @@ SHIPPED = {
     "scooter_not_found": 422,
     "scooter_already_reserved": 422,
     "no_active_reservation": 422,
+    "scooter_payment_pending": 422,
     "payment_failed": 502,
     "payment_declined": 422,
     "payment_timeout": 504,
@@ -51,13 +52,23 @@ def _end_with_fault(fault):
 
 
 def _conflicting_end(c, mp, tmp):
-    # The first end is charged but times out, so the ride stays open; a retry from a
-    # different place asks for a different amount under the same idempotency key.
+    # A restored DB: the ride was ended and charged at (1, 1); the restored copy still shows it
+    # active, and is now ended at (2, 2): the key's charge is for a different ride.
     c.get("/reservation/start?id=18")
-    mp.setenv("PAYMENT_FAULT", "timeout_charged")
+    db = app_module.get_db_path()
+    with open(db) as f:
+        snapshot = f.read()
     c.get("/reservation/end?id=18&lat=1&lng=1")
-    mp.setenv("PAYMENT_FAULT", "none")
+    with open(db, "w") as f:
+        f.write(snapshot)
     return c.get("/reservation/end?id=18&lat=2&lng=2")
+
+
+def _start_while_payment_pending(c, mp, tmp):
+    c.get("/reservation/start?id=18")
+    mp.setenv("PAYMENT_FAULT", "error")
+    c.get("/reservation/end?id=18&lat=1&lng=1")        # -> payment_pending
+    return c.get("/reservation/start?id=18")
 
 
 def _hold_lock_and_start(c, mp, tmp):
@@ -82,6 +93,7 @@ TRIGGERS = {
     FailureKind.SCOOTER_NOT_FOUND: lambda c, mp, tmp: c.get("/reservation/start?id=nope"),
     FailureKind.SCOOTER_ALREADY_RESERVED: lambda c, mp, tmp: c.get("/reservation/start?id=33"),
     FailureKind.NO_ACTIVE_RESERVATION: lambda c, mp, tmp: c.get("/reservation/end?id=18&lat=0&lng=0"),
+    FailureKind.SCOOTER_PAYMENT_PENDING: _start_while_payment_pending,
     FailureKind.PAYMENT_FAILED: _end_with_fault("error"),
     FailureKind.PAYMENT_DECLINED: _end_with_fault("decline"),
     FailureKind.PAYMENT_TIMEOUT: _end_with_fault("timeout_not_charged"),
@@ -99,11 +111,20 @@ TRIGGERS = {
 }
 
 
+# Payment failures add top-level fields to the envelope (H7; PLAN PR 14).
+EXTRA_KEYS = {
+    FailureKind.PAYMENT_DECLINED: {"ride_ended", "outstanding_balance"},
+    FailureKind.PAYMENT_TIMEOUT: {"ride_ended"},
+    FailureKind.PAYMENT_FAILED: {"ride_ended"},
+    FailureKind.PAYMENT_CONFLICT: {"ride_ended"},
+}
+
+
 def assert_envelope(resp, kind, status=None):
     body = resp.get_json()
     assert resp.status_code == (status or kind.status), resp.get_data(as_text=True)
     assert resp.mimetype == "application/json"
-    assert set(body) == {"msg", "error"} and body["error"] == {"kind": kind.value}
+    assert set(body) == {"msg", "error"} | EXTRA_KEYS.get(kind, set()) and body["error"] == {"kind": kind.value}
     assert isinstance(body["msg"], str) and body["msg"]
     return body
 
@@ -270,32 +291,33 @@ def test_unwritable_db_is_storage_error(client, db_path, read_db):
 
 
 # ---- payment ----------------------------------------------------------------------------
-# Since PLAN PR 13 the gateway is payments.py (simulated, with a ledger); its outcomes are
-# tested in test_payments.py. Here: every payment failure kind leaves the ride open.
+# The gateway is payments.py (test_payments.py); the end-ride state machine is tested in
+# test_end_ride.py. Here: each payment failure's kind, msg and ride_ended flag.
 
-@pytest.mark.parametrize("fault,kind,msg", [
-    ("error", FailureKind.PAYMENT_FAILED, "Error 502 - Payment failed; the reservation was not ended."),
-    ("decline", FailureKind.PAYMENT_DECLINED, "Error 422 - The payment was declined; the reservation was not ended."),
-    ("timeout_not_charged", FailureKind.PAYMENT_TIMEOUT,
-     "Error 504 - The payment gateway timed out; the reservation was not ended. A retry is charged at most once."),
-    ("timeout_charged", FailureKind.PAYMENT_TIMEOUT,
-     "Error 504 - The payment gateway timed out; the reservation was not ended. A retry is charged at most once."),
+PENDING_MSG = "The ride is waiting for payment; retry ending it to settle (it is charged at most once)."
+
+
+@pytest.mark.parametrize("fault,kind,msg,ride_ended", [
+    ("error", FailureKind.PAYMENT_FAILED, "Error 502 - Payment failed. " + PENDING_MSG, False),
+    ("decline", FailureKind.PAYMENT_DECLINED,
+     "Error 422 - The payment was declined. The ride was ended and its cost is recorded as an outstanding balance.", True),
+    ("timeout_not_charged", FailureKind.PAYMENT_TIMEOUT, "Error 504 - The payment gateway timed out. " + PENDING_MSG, False),
+    ("timeout_charged", FailureKind.PAYMENT_TIMEOUT, "Error 504 - The payment gateway timed out. " + PENDING_MSG, False),
 ])
-def test_failed_payment_leaves_ride_open(client, monkeypatch, read_db, read_ledger, fault, kind, msg):
-    # PLAN PR 13 keeps today's contract for every failure: the ride is NOT ended and the
-    # scooter stays reserved and unmoved. PLAN PR 14 changes what happens to the ride.
+def test_each_payment_failure_says_whether_the_ride_ended(client, monkeypatch, read_db, read_ledger, fault, kind, msg, ride_ended):
     start = client.get("/reservation/start?id=18")
     reservation_id = start.get_json()["reservation_id"]
     assert start.status_code == 200 and start.get_json() == {"msg": reserved_ok("18"), "reservation_id": reservation_id}
-    before = read_db()
-    assert before["18"] == seed_18_reserved(reservation_id, before["18"])
-
     monkeypatch.setenv("PAYMENT_FAULT", fault)
     body = assert_envelope(client.get("/reservation/end?id=18&lat=1&lng=1"), kind)
-    assert body["msg"] == msg
+    assert body["msg"] == msg and body["ride_ended"] is ride_ended
     assert body["msg"] != no_reservation("18") and "txn_id" not in body
     assert [(e["idempotency_key"], e["outcome"]) for e in read_ledger()] == [(reservation_id, fault)]  # really called
-    assert read_db() == before                               # still reserved (same reservation), not moved
+    after = read_db()["18"]
+    if ride_ended:
+        assert after["reservation"] is None and body["outstanding_balance"] == after["outstanding_balances"][0]["amount"] > 0
+    else:
+        assert after["reservation"]["payment_state"] == "payment_pending" and after["is_reserved"] is True
 
 
 def test_error_bodies_are_plain_json_objects(client):

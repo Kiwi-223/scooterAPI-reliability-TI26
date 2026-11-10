@@ -35,9 +35,10 @@ def get_db_lock_timeout():
 #  ERROR RESPONSES
 # ==================
 
-def error_response(kind, msg, status=None):
+def error_response(kind, msg, status=None, extra=None):
 	# Every error response: {"msg": ..., "error": {"kind": <stable id>}} (see failures.py).
-	body = { 'msg': msg, 'error': { 'kind': kind.value } }
+	# `extra` adds top-level fields (payment failures add ride_ended / outstanding_balance, H7).
+	body = { 'msg': msg, 'error': { 'kind': kind.value }, **(extra or {}) }
 	records.failure(kind.value, msg)
 	return json.dumps(body), status or kind.status, {'Content-Type':'application/json'}
 
@@ -176,6 +177,12 @@ def start_reservation():
 							'reservation_id': scooter.reservation['reservation_id'] }
 				return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
 
+			elif scooter.reservation['payment_state'] == 'payment_pending':
+				# the last ride ended but its payment hasn't settled: not reservable yet
+				records.note('reserve', 'refused', reason='the last ride is waiting for payment')
+				records.scooter(in_memory=scooter.to_dict())
+				records.unchanged()
+				return error_response(FailureKind.SCOOTER_PAYMENT_PENDING, f'Error 422 - Scooter {reserve_id} cannot be reserved yet: its last ride is waiting for payment to settle.')
 			else:
 				# the scooter is already reserved
 				records.note('reserve', 'refused', reason='scooter is already reserved')
@@ -210,10 +217,16 @@ def end_reservation():
 		return error_response(FailureKind.INVALID_COORDINATE, 'Error 422 - Longitude must be in the [-180, 180] range.')
 		
 	records.note('params', 'ok', lat=end_lat, lng=end_lng)
-	# Validate first, then read, check, pay and write under one exclusive lock (see
-	# db_transaction). NOTE for PLAN PRs 13/14: the payment call happens while the lock is
-	# held, so a slow gateway delays every other writer; those PRs persist payment_pending
-	# and can release the lock around the gateway call.
+	# All-or-nothing end (PLAN PR 14; AGENTS.md "Payment state machine"). Validate first, then
+	# under one exclusive DB lock (see db_transaction):
+	#   phase 1: persist payment_pending with the end location and amount BEFORE charging, so a
+	#            crash or failed write after the charge leaves a ride that a retry can settle;
+	#   charge:  at most once per idempotency key (payments.py's ledger);
+	#   phase 2: persist the outcome (ended + paid, ended + outstanding balance, still pending,
+	#            or back to active on a conflict).
+	# The gateway call stays inside the lock: every transition of a scooter is serialised, so
+	# no concurrent start/end can interleave with a half-finished payment. The cost is that a
+	# slow gateway delays every writer (bounded here by PAYMENT_TIMEOUT_DELAY_MS).
 	with db_transaction() as txn:
 		db = txn.db
 		# try and find the scooter with specified id
@@ -222,34 +235,50 @@ def end_reservation():
 			refuse_unsupported_reservation(scooter, txn.path)
 			# end reservation if possible
 			if scooter.is_reserved:
-				# scooter is reserved and can be ended
-				records.note('end', 'allowed', reason='scooter is reserved')
-			
-				# initiate payment
-				payment_response = pay(scooter, end_lat, end_lng)
-				if payment_response.ok:
-					# the payment was completed successfully
-				
-					# close the reservation, then update scooter's reserved status and location
-					records.note('reservation', 'cleared', reservation_id=scooter.reservation['reservation_id'],
-						legacy=scooter.reservation.get('legacy', False))
-					scooter.reservation = None
-					scooter.is_reserved = False
-					scooter.lat, scooter.lng = end_lat, end_lng
+				if scooter.reservation['payment_state'] == 'active':
+					# scooter is reserved and can be ended: phase 1
+					records.note('end', 'allowed', reason='scooter is reserved')
+					begin_payment(scooter, end_lat, end_lng)
+					write_db(db, txn.path)
+				else:
+					# a retry of a ride whose payment is pending: it ends where it was first asked
+					# to, for the stored amount; this request's coordinates are not used
+					reservation = scooter.reservation
+					records.note('end', 'retry', reason='payment is pending', end_lat=reservation['end_lat'],
+						end_lng=reservation['end_lng'], amount=reservation['amount'], requested_lat=end_lat, requested_lng=end_lng)
+
+				# charge (at most once per idempotency key), then phase 2
+				payment_response = pay(scooter)
+				outcome = payment_response.outcome
+				if payment_response.ok or outcome == 'decline':
+					# the ride ends: paid, or (H3) declined with an outstanding balance
+					amount = scooter.reservation['amount']
+					if outcome == 'decline':
+						record_outstanding_balance(scooter)
+					finish_ride(scooter)
 					write_db(db, txn.path)
 					records.scooter(in_memory=scooter.to_dict())
+					if outcome == 'decline':
+						return payment_failure_response(outcome, ride_ended=True, outstanding_balance=amount)
 					# construct successful response
 					success =	{	'msg': f'Payment for scooter {scooter_id_to_end} was made successfully and the reservation was ended.',
 									'txn_id': payment_response.txn_id
 								}
 					return json.dumps(success), HTTPStatus.OK.value, {'Content-Type':'application/json'}	# respond with status 200
+				elif outcome == 'conflict':
+					# the key's charge is for a different ride (e.g. a restored DB ended elsewhere):
+					# nothing charged; back to an open ride, as before this request
+					abandon_payment(scooter)
+					write_db(db, txn.path)
+					records.scooter(in_memory=scooter.to_dict())
+					return payment_failure_response(outcome, ride_ended=False)
 				else:
-					# the payment didn't pay for the ride: the reservation is NOT ended (unchanged
-					# behaviour; PLAN PR 14 defines what decline/timeout/error do to the ride)
-					records.scooter(in_memory=scooter.to_dict())	# expected: still reserved, not moved
-					records.unchanged()
-					kind, msg = PAYMENT_FAILURES[payment_response.outcome]
-					return error_response(kind, msg)
+					# timeout or gateway error: the ride stays payment_pending until a retry (or
+					# PLAN PR 15's reconcile) settles it
+					note_payment_attempt(scooter, outcome)
+					write_db(db, txn.path)
+					records.scooter(in_memory=scooter.to_dict())
+					return payment_failure_response(outcome, ride_ended=False)
 			else:
 				# the scooter is not currently reserved
 				records.note('end', 'refused', reason='scooter is not reserved')
@@ -266,39 +295,97 @@ def end_reservation():
 # ==================
 
 
-def pay(scooter, end_lat, end_lng):
-	# Initialise the payment process
-	# construct location point tuples
-	old_location = (scooter.lat, scooter.lng)
-	new_location = (end_lat, end_lng)
-	# calculate distance between points, in metres
-	distance_ridden = geodesic(old_location, new_location).m
-	distance_ridden = round(distance_ridden)
-	# calculate cost (currently a dummy function that returns the distance as the cost)
+# ---- the end-ride payment state machine (AGENTS.md "Payment state machine") ------------
+# Fields a reservation carries while payment_state is payment_pending (set by begin_payment).
+PENDING_FIELDS = { 'end_lat', 'end_lng', 'distance_m', 'amount', 'payment_requested_at',
+	'payment_request_id', 'payment_attempts', 'last_payment_outcome' }
+
+def begin_payment(scooter, end_lat, end_lng):
+	# active -> payment_pending: fix where the ride ends and what it costs, once. Retries and
+	# reconcile reuse these values, so a retry from a slightly different spot is the same ride.
+	distance_ridden = round(geodesic((scooter.lat, scooter.lng), (end_lat, end_lng)).m)	# metres
 	cost = calculate_cost(distance_ridden)	# returns cost = distance for now
+	scooter.reservation.update({	'payment_state': 'payment_pending',
+									'end_lat': end_lat,
+									'end_lng': end_lng,
+									'distance_m': distance_ridden,
+									'amount': cost,
+									'payment_requested_at': utc_now_iso(),
+									'payment_request_id': records.current_request_id(),
+									'payment_attempts': 0,
+									'last_payment_outcome': None
+							   })
+	records.note('payment', 'pending', end_lat=end_lat, end_lng=end_lng, distance_m=distance_ridden, amount=cost)
+
+def pay(scooter):
+	# One gateway attempt for a payment_pending ride, with its stored location and amount.
 	reservation = scooter.reservation
-	records.note('payment', 'requested', distance_m=distance_ridden, cost=cost,
-		idempotency_key=reservation['idempotency_key'])
+	records.note('payment', 'requested', distance_m=reservation['distance_m'], cost=reservation['amount'],
+		idempotency_key=reservation['idempotency_key'], end_lat=reservation['end_lat'], end_lng=reservation['end_lng'])
 	# The simulated gateway (payments.py): at most one charge per idempotency key, and
 	# reproducible faults (AGENTS.md "Payments & fault injection").
 	override, override_note = payments.header_override(request.headers.get(payments.FAULT_HEADER))
 	if override_note:
 		records.note('payment_fault_override', override_note[0], **override_note[1])
 	payment_response = payments.charge(reservation['idempotency_key'], scooter.id, reservation['reservation_id'],
-		cost, end_lat=end_lat, end_lng=end_lng, request_id=records.current_request_id(), override=override)
+		reservation['amount'], end_lat=reservation['end_lat'], end_lng=reservation['end_lng'],
+		request_id=records.current_request_id(), override=override)
 	records.note('payment', 'ok' if payment_response.ok else 'failed', **payment_response.record_detail())
 	return payment_response
 
-# How each payment outcome that doesn't pay for the ride is answered (H7). In every case the
-# ride is NOT ended and the scooter stays reserved (PLAN PR 14 changes that for decline,
-# timeouts and errors).
+def note_payment_attempt(scooter, outcome):
+	# payment_pending stays payment_pending; remember how many attempts failed and how.
+	scooter.reservation['payment_attempts'] += 1
+	scooter.reservation['last_payment_outcome'] = outcome
+	records.note('reservation', 'payment_pending', reservation_id=scooter.reservation['reservation_id'],
+		attempts=scooter.reservation['payment_attempts'], last_outcome=outcome)
+
+def abandon_payment(scooter):
+	# payment_pending -> active (a conflict): drop what begin_payment set; nothing was charged.
+	for field in PENDING_FIELDS:
+		scooter.reservation.pop(field, None)
+	scooter.reservation['payment_state'] = 'active'
+	records.note('reservation', 'payment_abandoned', reservation_id=scooter.reservation['reservation_id'],
+		reason='the ledger has a charge for a different ride under this key')
+
+def record_outstanding_balance(scooter):
+	# H3: a definitive decline ends the ride without a charge; the debt is recorded in the DB,
+	# in the same atomic write that ends the ride (AGENTS.md "Database schema").
+	reservation = scooter.reservation
+	balance = {	'reservation_id': reservation['reservation_id'],
+				'idempotency_key': reservation['idempotency_key'],
+				'amount': reservation['amount'],
+				'end_lat': reservation['end_lat'],
+				'end_lng': reservation['end_lng'],
+				'ended_at': utc_now_iso(),
+				'reason': 'payment_declined'
+			  }
+	scooter.outstanding_balances = (scooter.outstanding_balances or []) + [balance]
+	records.note('balance', 'recorded', reservation_id=balance['reservation_id'], amount=balance['amount'])
+
+def finish_ride(scooter):
+	# payment_pending -> free: close the reservation and leave the scooter where the ride
+	# ended (the location stored by begin_payment, not the current request's).
+	reservation = scooter.reservation
+	end_lat, end_lng = reservation['end_lat'], reservation['end_lng']
+	records.note('reservation', 'cleared', reservation_id=reservation['reservation_id'],
+		legacy=reservation.get('legacy', False))
+	scooter.reservation = None
+	scooter.is_reserved = False
+	scooter.lat, scooter.lng = end_lat, end_lng
+
+# How each payment outcome that doesn't simply pay for the ride is answered (H7).
 PAYMENT_FAILURES = {
-	'decline': (FailureKind.PAYMENT_DECLINED, 'Error 422 - The payment was declined; the reservation was not ended.'),
-	'timeout_not_charged': (FailureKind.PAYMENT_TIMEOUT, 'Error 504 - The payment gateway timed out; the reservation was not ended. A retry is charged at most once.'),
-	'timeout_charged': (FailureKind.PAYMENT_TIMEOUT, 'Error 504 - The payment gateway timed out; the reservation was not ended. A retry is charged at most once.'),
-	'error': (FailureKind.PAYMENT_FAILED, 'Error 502 - Payment failed; the reservation was not ended.'),
+	'decline': (FailureKind.PAYMENT_DECLINED, 'Error 422 - The payment was declined. The ride was ended and its cost is recorded as an outstanding balance.'),
+	'timeout_not_charged': (FailureKind.PAYMENT_TIMEOUT, 'Error 504 - The payment gateway timed out. The ride is waiting for payment; retry ending it to settle (it is charged at most once).'),
+	'timeout_charged': (FailureKind.PAYMENT_TIMEOUT, 'Error 504 - The payment gateway timed out. The ride is waiting for payment; retry ending it to settle (it is charged at most once).'),
+	'error': (FailureKind.PAYMENT_FAILED, 'Error 502 - Payment failed. The ride is waiting for payment; retry ending it to settle (it is charged at most once).'),
 	'conflict': (FailureKind.PAYMENT_CONFLICT, 'Error 409 - This reservation already has a charge for a different ride; nothing was charged and the reservation was not ended.'),
 }
+
+def payment_failure_response(outcome, **extra):
+	kind, msg = PAYMENT_FAILURES[outcome]
+	return error_response(kind, msg, extra=extra)
 
 def calculate_cost(distance):
 	# TODO: Implement meaningful cost calculation in future
@@ -398,22 +485,25 @@ def init_db(path=None):
 								scooter['lng'], 
 								scooter['is_reserved'],
 								load_reservation(scooter),
-								{ key: value for key, value in scooter.items() if key not in SCOOTER_FIELDS }
+								{ key: value for key, value in scooter.items() if key not in SCOOTER_FIELDS },
+								scooter.get('outstanding_balances')
 							 )
 		db.append(scooter_obj)
 	return db
 
 
 DB_FIELDS = { 'id', 'lat', 'lng', 'is_reserved' }	# required in every entry
-SCOOTER_FIELDS = DB_FIELDS | { 'reservation' }		# known; any other field is kept as-is (Scooter.extra)
+SCOOTER_FIELDS = DB_FIELDS | { 'reservation', 'outstanding_balances' }	# known; any other field is kept as-is (Scooter.extra)
 # A reservation object (AGENTS.md "Database schema"). Unknown keys inside it are kept as-is.
 RESERVATION_FIELDS = { 'reservation_id', 'started_at', 'start_request_id', 'payment_state', 'idempotency_key' }
-# The payment states this code knows how to handle. PLAN PRs 13-15 add more (payment_pending,
-# paid, outstanding_balance, ...). A reservation in a state this code doesn't know still loads
+# The payment states this code knows how to handle (AGENTS.md "Payment state machine"):
+# `active` (riding) and `payment_pending` (ended, waiting for payment; PLAN PR 14). Later PRs
+# may add more. A reservation in a state this code doesn't know still loads
 # (the scooter counts as reserved, and the rest of the API keeps working), but start/end on
 # that scooter are refused as storage_error rather than guessed at (ending it could charge
 # twice), and write_db refuses to change it. See AGENTS.md "Database schema".
-PAYMENT_STATES = { 'active' }
+PAYMENT_STATES = { 'active', 'payment_pending' }
+BALANCE_FIELDS = { 'reservation_id', 'idempotency_key', 'amount', 'end_lat', 'end_lng', 'ended_at', 'reason' }
 LAT_RANGE, LNG_RANGE = (-90, 90), (-180, 180)
 
 def _is_number(value):
@@ -440,6 +530,52 @@ def find_reservation_problem(reservation):
 		return 'reservation.payment_state is not a non-empty string'
 	if 'legacy' in reservation and not isinstance(reservation['legacy'], bool):
 		return 'reservation.legacy is not a boolean'
+	if reservation['payment_state'] == 'payment_pending':
+		missing = PENDING_FIELDS - set(reservation)
+		if missing:
+			return f'reservation is payment_pending but missing {sorted(missing)}'
+		problem = _find_location_amount_problem(reservation, 'reservation')
+		if problem:
+			return problem
+		attempts = reservation['payment_attempts']
+		if not (isinstance(attempts, int) and not isinstance(attempts, bool) and attempts >= 0):
+			return 'reservation.payment_attempts is not a whole number >= 0'
+		if reservation['last_payment_outcome'] is not None and not isinstance(reservation['last_payment_outcome'], str):
+			return 'reservation.last_payment_outcome is not a string or null'
+		for field in ('payment_requested_at', 'payment_request_id'):
+			if reservation[field] is not None and not isinstance(reservation[field], str):
+				return f'reservation.{field} is not a string or null'
+	elif reservation['payment_state'] == 'active':
+		present = PENDING_FIELDS & set(reservation)
+		if present:
+			return f'reservation is active but has payment fields {sorted(present)}'
+	return None
+
+def _find_location_amount_problem(obj, name):
+	for field, (low, high) in (('end_lat', LAT_RANGE), ('end_lng', LNG_RANGE)):
+		if not _is_number(obj[field]) or not low <= obj[field] <= high:
+			return f'{name}.{field} is not a number in [{low}, {high}]'
+	if not _is_number(obj['amount']) or obj['amount'] < 0:
+		return f'{name}.amount is not a finite number >= 0'
+	if 'distance_m' in obj and (not _is_number(obj['distance_m']) or obj['distance_m'] < 0):
+		return f'{name}.distance_m is not a finite number >= 0'
+	return None
+
+def find_balances_problem(balances):
+	if not isinstance(balances, list):
+		return f'outstanding_balances is {type(balances).__name__}, not a list'
+	for n, balance in enumerate(balances):
+		if not isinstance(balance, dict):
+			return f'outstanding_balances[{n}] is not an object'
+		missing = BALANCE_FIELDS - set(balance)
+		if missing:
+			return f'outstanding_balances[{n}] is missing {sorted(missing)}'
+		for field in ('reservation_id', 'idempotency_key', 'ended_at', 'reason'):
+			if not _is_nonempty_str(balance[field]):
+				return f'outstanding_balances[{n}].{field} is not a non-empty string'
+		problem = _find_location_amount_problem(balance, f'outstanding_balances[{n}]')
+		if problem:
+			return problem
 	return None
 
 def find_db_shape_problem(db_list):
@@ -482,6 +618,10 @@ def find_db_shape_problem(db_list):
 				problem = find_reservation_problem(reservation)
 				if problem:
 					return f'entry {i}: {problem}'
+		if 'outstanding_balances' in scooter:
+			problem = find_balances_problem(scooter['outstanding_balances'])
+			if problem:
+				return f'entry {i}: {problem}'
 		reservation = load_reservation(scooter)	# legacy entries count with their synthesised ids
 		if reservation is not None:
 			for field, seen in first_index_of_key.items():
@@ -648,7 +788,7 @@ class ScooterDb(list):
 
 # class scooter for internal use
 class Scooter:
-	def __init__(self, scooter_id, lat, lng, is_reserved, reservation=None, extra=None):
+	def __init__(self, scooter_id, lat, lng, is_reserved, reservation=None, extra=None, outstanding_balances=None):
 		self.id = scooter_id
 		self.lat = lat
 		self.lng = lng
@@ -656,6 +796,7 @@ class Scooter:
 		self.reservation = reservation	# dict while reserved, None while free (see RESERVATION_FIELDS)
 		self.loaded_reservation = copy.deepcopy(reservation)	# as read from the DB (write_db's guard)
 		self.extra = extra or {}		# unknown top-level DB fields, written back unchanged
+		self.outstanding_balances = outstanding_balances	# None (absent) or a list (H3 declines)
 	
 	def to_dict(self):
 		# The full persisted form: what write_db serialises and what request records show.
@@ -665,6 +806,8 @@ class Scooter:
 							'is_reserved':self.is_reserved,
 							'reservation':copy.deepcopy(self.reservation)
 					   }
+		if self.outstanding_balances is not None:
+			scooter_dict['outstanding_balances'] = copy.deepcopy(self.outstanding_balances)
 		for key, value in self.extra.items():
 			scooter_dict[key] = copy.deepcopy(value)
 		return scooter_dict

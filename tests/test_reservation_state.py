@@ -272,7 +272,7 @@ def test_invalid_db_is_storage_error_everywhere(client, db_path, data, why):
     _with("18", reservation=None),                              # mixed legacy/new entries
     _with("33", reservation=dict(LEGACY_33)),
     _with("33", reservation=dict(A_RESERVATION, gateway_ref="x")),   # unknown keys inside are kept
-    _with("33", reservation=_res(payment_state="payment_pending")),  # unknown state: loads (scoped below)
+    _with("33", reservation=_res(payment_state="refund_requested")),  # unknown state: loads (scoped below)
     _with2(("18", dict(is_reserved=True, reservation=A_RESERVATION)),
            ("33", dict(reservation=_res(reservation_id="b" * 32, idempotency_key="b" * 32)))),
 ])
@@ -316,9 +316,9 @@ def test_a_write_that_would_duplicate_a_reservation_id_is_refused(client, monkey
 
 # ---- a payment state this code doesn't know (e.g. after a rollback past PLAN PR 13+) ----------
 
-PENDING = dict(A_RESERVATION, payment_state="payment_pending", gateway_ref="g-9")
+PENDING = dict(A_RESERVATION, payment_state="refund_requested", gateway_ref="g-9")   # a state this code doesn't know
 UNSUPPORTED_MSG = ("Error 500 - The reservation for scooter 33 is in a payment state this server version "
-                   "does not handle (reservation.payment_state is not one of ['active']).")
+                   "does not handle (reservation.payment_state is not one of ['active', 'payment_pending']).")
 
 
 @pytest.fixture
@@ -347,13 +347,15 @@ def test_start_and_end_on_the_unknown_payment_state_scooter_are_refused(client, 
     assert read_ledger() == [] and pending_db.read_bytes() == before    # gateway never called, nothing written
     r = read_records()[-1]
     assert {"step": "reservation", "outcome": "unsupported",
-            "detail": {"reservation_id": "a" * 32, "payment_state": "payment_pending"}} in r["decisions"]
+            "detail": {"reservation_id": "a" * 32, "payment_state": "refund_requested"}} in r["decisions"]
     assert not any(d["step"] in ("payment", "reserve", "end") for d in r["decisions"])
     assert r["db_write"]["attempted"] is False
 
 
 def test_the_write_guard_never_changes_an_unknown_payment_state_reservation(client, monkeypatch, pending_db, read_records):
-    monkeypatch.setattr(app_module, "refuse_unsupported_reservation", lambda scooter, path: None)  # planted bug
+    def treat_as_active(scooter, path):                                # planted bug: guesses
+        scooter.reservation = dict(scooter.reservation, payment_state="active")
+    monkeypatch.setattr(app_module, "refuse_unsupported_reservation", treat_as_active)
     before = pending_db.read_bytes()
     assert_envelope(client.get("/reservation/end?id=33&lat=1&lng=1"), FailureKind.INTERNAL_ERROR)
     assert pending_db.read_bytes() == before
@@ -407,7 +409,10 @@ def test_a_restored_reservation_is_not_charged_twice_or_ridden_free(client, db_p
 
     db_path.write_bytes(snapshot)                                     # restore, then end elsewhere
     assert_envelope(client.get(f"/reservation/end?id={sid}&lat=2&lng=2"), FailureKind.PAYMENT_CONFLICT)
-    assert db_path.read_bytes() == snapshot                           # not ended, nothing written
+    # not ended, nothing charged: the ride is open (active) again, unmoved (PLAN PR 14)
+    [after] = [s for s in app_module.init_db(str(db_path)) if s.id == sid]
+    assert after.reservation["payment_state"] == "active" and after.reservation["idempotency_key"] == key
+    assert not app_module.PENDING_FIELDS & set(after.reservation) and after.is_reserved
 
     ledger = read_ledger()
     assert [e["outcome"] for e in ledger] == ["success", "already_charged", "conflict"]

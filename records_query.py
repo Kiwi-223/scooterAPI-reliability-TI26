@@ -142,8 +142,17 @@ def _float_pair(lat, lng):
         return None
 
 
-def _requested_end(params):
-    """The lat/lng an end request asked for, as the app parsed them (first value of each)."""
+def _requested_end(record):
+    """Where an end request's ride ended, as the app decided it. Since PLAN PR 14 that's the
+    location stored when payment started (the payment `requested` decision's end_lat/end_lng):
+    a retry of a payment_pending ride ends there, whatever the retry's own params say. Older
+    records fall back to the request's lat/lng params (first value of each)."""
+    for d in record.get("decisions") or []:
+        if isinstance(d, dict) and d.get("step") == "payment" and d.get("outcome") == "requested":
+            detail = d.get("detail") or {}
+            if "end_lat" in detail and "end_lng" in detail:
+                return _float_pair(detail["end_lat"], detail["end_lng"])
+    params = record.get("params")
     if not isinstance(params, dict):
         return None
     first = lambda v: v[0] if isinstance(v, list) and v else v
@@ -160,13 +169,22 @@ def anomalies(records, since=None):
     - end_left_reserved: /reservation/end returned 200 but scooter_after is still reserved
     - start_left_free: /reservation/start returned 200 but scooter_after isn't reserved
     - end_location_not_persisted: /reservation/end returned 200 but scooter_after's lat/lng
-      differ from the requested end coordinates (compared as floats)
+      differ from where the ride ended (the stored end location since PLAN PR 14, else the
+      requested coordinates; compared as floats)
     - reservation_flag_mismatch: scooter_after breaks the DB invariant "is_reserved is true
       exactly when reservation is set" (PLAN PR 12)
     - start_reservation_not_persisted: /reservation/start returned 200 but scooter_after has
       no reservation created by this request (its start_request_id isn't this request_id)
 
-    The two reservation rules only look at snapshots that have a "reservation" key: records
+    - charged_without_persisted_end: a payment came back ok (the ride is paid) but a later DB
+      write in the same request failed or was refused, so the ride is still payment_pending
+      on disk: a retry or reconcile settles it (PLAN PR 14)
+    - decline_not_settled: payment_declined, but scooter_after is still reserved or has no
+      outstanding balance for the reservation (H3: a decline ends the ride with a balance)
+    - failed_payment_not_pending: payment_timeout / payment_failed, but scooter_after's
+      reservation isn't payment_pending (the ride must stay settleable)
+
+    The reservation rules only look at snapshots that have a "reservation" key: records
     written before PLAN PR 12 have none, and aren't flagged for it.
 
     Deliberately not included: a cross-record continuity check (a scooter's scooter_before
@@ -199,11 +217,27 @@ def anomalies(records, since=None):
         if path == "/reservation/start" and status == 200 and isinstance(after, dict) and after.get("is_reserved") is not True:
             flag("start_left_free", {"scooter_after": after})
         if path == "/reservation/end" and status == 200 and isinstance(after, dict):
-            wanted = _requested_end(r.get("params"))
+            wanted = _requested_end(r)
             got = _float_pair(after.get("lat"), after.get("lng"))
             if wanted is not None and got != wanted:
                 flag("end_location_not_persisted", {"requested": {"lat": wanted[0], "lng": wanted[1]},
                                                     "scooter_after": after})
+        decisions = [d for d in r.get("decisions") or [] if isinstance(d, dict)]
+        paid_at = next((n for n, d in enumerate(decisions) if d.get("step") == "payment" and d.get("outcome") == "ok"), None)
+        if paid_at is not None:
+            lost = [d for d in decisions[paid_at + 1:] if d.get("step") == "db_write" and d.get("outcome") in ("failed", "refused")]
+            if lost:
+                flag("charged_without_persisted_end", {"payment": decisions[paid_at].get("detail"), "db_write": lost[0]})
+        kind = (r.get("error") or {}).get("kind")
+        if kind == "payment_declined" and isinstance(after, dict) and "reservation" in after:
+            before_res = (r.get("scooter_before") or {}).get("reservation") or {}
+            balances = after.get("outstanding_balances") or []
+            if after.get("reservation") is not None or not any(
+                    isinstance(b, dict) and b.get("reservation_id") == before_res.get("reservation_id") for b in balances):
+                flag("decline_not_settled", {"scooter_after": after})
+        if kind in ("payment_timeout", "payment_failed") and isinstance(after, dict) and "reservation" in after:
+            if (after.get("reservation") or {}).get("payment_state") != "payment_pending":
+                flag("failed_payment_not_pending", {"scooter_after": after})
         if isinstance(after, dict) and "reservation" in after:
             reservation = after["reservation"]
             if (after.get("is_reserved") is True) != (reservation is not None):
